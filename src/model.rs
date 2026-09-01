@@ -1,6 +1,5 @@
 //! UI state, loaded data, and pending actions.
 
-use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::api::models::*;
@@ -9,17 +8,13 @@ use crate::api::models::*;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Page {
     Home,
-    TopSongs,
     Search,
-    LikedSongs,
+    Favorites,
     Albums,
     Artists,
-    Podcasts,
-    Episodes,
-    Playlist(String),
-    Album(String),
-    Artist(String),
-    Show(String),
+    Playlist(MediaId),
+    Album(MediaId),
+    Artist(MediaId),
     Queue,
     Settings,
 }
@@ -28,17 +23,13 @@ impl Page {
     pub fn encode(&self) -> String {
         match self {
             Page::Home => "home".into(),
-            Page::TopSongs => "top-songs".into(),
             Page::Search => "search".into(),
-            Page::LikedSongs => "liked".into(),
+            Page::Favorites => "favorites".into(),
             Page::Albums => "albums".into(),
             Page::Artists => "artists".into(),
-            Page::Podcasts => "podcasts".into(),
-            Page::Episodes => "episodes".into(),
-            Page::Playlist(id) => format!("playlist:{id}"),
-            Page::Album(id) => format!("album:{id}"),
-            Page::Artist(id) => format!("artist:{id}"),
-            Page::Show(id) => format!("show:{id}"),
+            Page::Playlist(id) => format!("playlist|{}", id.uri()),
+            Page::Album(id) => format!("album|{}", id.uri()),
+            Page::Artist(id) => format!("artist|{}", id.uri()),
             Page::Queue => "queue".into(),
             Page::Settings => "settings".into(),
         }
@@ -47,39 +38,34 @@ impl Page {
     pub fn decode(text: &str) -> Option<Self> {
         Some(match text {
             "home" => Page::Home,
-            "top-songs" => Page::TopSongs,
             "search" => Page::Search,
-            "liked" => Page::LikedSongs,
+            // The old label is accepted as a harmless navigation preference;
+            // old provider media references still fail strict parsing below.
+            "favorites" | "liked" => Page::Favorites,
             "albums" => Page::Albums,
             "artists" => Page::Artists,
-            "podcasts" => Page::Podcasts,
-            "episodes" => Page::Episodes,
             "queue" => Page::Queue,
             "settings" => Page::Settings,
             other => {
-                let (kind, id) = other.split_once(':')?;
+                let (kind, encoded) = other.split_once('|')?;
+                let id = encoded.parse::<MediaId>().ok()?;
                 match kind {
-                    "playlist" => Page::Playlist(id.into()),
-                    "album" => Page::Album(id.into()),
-                    "artist" => Page::Artist(id.into()),
-                    "show" => Page::Show(id.into()),
+                    "playlist" if id.kind == MediaKind::Playlist => Page::Playlist(id),
+                    "album" if id.kind == MediaKind::Album => Page::Album(id),
+                    "artist" if id.kind == MediaKind::Artist => Page::Artist(id),
                     _ => return None,
                 }
             }
         })
     }
 
-    /// Opens whatever a Spotify URI points at.
+    /// Opens a canonical, server-scoped media reference.
     pub fn from_uri(uri: &str) -> Option<Self> {
-        let mut parts = uri.split(':');
-        let _ = parts.next()?;
-        let kind = parts.next()?;
-        let id = parts.next()?.to_string();
-        Some(match kind {
-            "playlist" => Page::Playlist(id),
-            "album" => Page::Album(id),
-            "artist" => Page::Artist(id),
-            "show" => Page::Show(id),
+        let id = uri.parse::<MediaId>().ok()?;
+        Some(match id.kind {
+            MediaKind::Playlist => Page::Playlist(id),
+            MediaKind::Album => Page::Album(id),
+            MediaKind::Artist => Page::Artist(id),
             _ => return None,
         })
     }
@@ -209,7 +195,7 @@ impl<T> PagedList<T> {
         }
         let next_offset = page.next_offset();
         self.items.extend(page.items);
-        self.total = Some(page.total);
+        self.total = page.total;
         self.next_offset = next_offset;
         self.loading = false;
         self.error = None;
@@ -275,72 +261,25 @@ pub enum RowPick {
     Range,
 }
 
-/// A cursor-paginated list (followed artists).
-#[derive(Clone, Debug)]
-pub struct CursorList<T> {
-    pub items: Vec<T>,
-    pub after: Option<String>,
-    pub loading: bool,
-    pub error: Option<String>,
-    pub loaded_once: bool,
-    pub complete: bool,
-}
-
-impl<T> Default for CursorList<T> {
-    fn default() -> Self {
-        Self {
-            items: Vec::new(),
-            after: None,
-            loading: false,
-            error: None,
-            loaded_once: false,
-            complete: false,
-        }
-    }
-}
-
-impl<T> CursorList<T> {
-    pub fn reset(&mut self) {
-        *self = Self::default();
-    }
-
-    pub fn can_load_more(&self) -> bool {
-        !self.loading && !self.complete
-    }
-}
-
 #[derive(Default)]
 pub struct Library {
     pub playlists: Loadable<Vec<Playlist>>,
-    pub playlists_next: Option<u32>,
-    pub liked: PagedList<SavedTrack>,
-    pub albums: PagedList<SavedAlbum>,
-    pub artists: CursorList<Artist>,
-    pub shows: PagedList<SavedShow>,
-    pub episodes: PagedList<SavedEpisode>,
+    pub favorite_songs: PagedList<Song>,
+    pub albums: PagedList<Album>,
+    pub artists: PagedList<Artist>,
     pub filter: String,
 }
 
 #[derive(Default)]
 pub struct HomeData {
+    pub recently_added: Loadable<Vec<Album>>,
     pub recently_played: Loadable<Vec<PlayHistory>>,
-    pub top_artists: Loadable<Vec<Artist>>,
-    /// The 20-track preview shown on Home.
-    pub top_tracks: Loadable<Vec<Track>>,
-    /// The separately loaded, complete ranking shown by the Top Songs page.
-    pub top_songs: Loadable<Vec<Track>>,
-    pub top_songs_loading: bool,
-    pub top_songs_complete: bool,
-    pub recommendations: Loadable<Vec<Track>>,
-    pub discover: HashMap<String, Loadable<Vec<Playlist>>>,
-    pub discover_pending: HashMap<String, Loadable<Vec<Playlist>>>,
+    pub frequent_albums: Loadable<Vec<Album>>,
+    pub random_songs: Loadable<Vec<Song>>,
     pub generation: u64,
-    pub top_songs_generation: u64,
     pub requested: bool,
     pub loaded_at: Option<Instant>,
 }
-
-pub const DISCOVER_TERMS: &[&str] = &["Discover Weekly", "Release Radar", "Daily Mix", "daylist"];
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SearchFilter {
@@ -350,19 +289,15 @@ pub enum SearchFilter {
     Artists,
     Albums,
     Playlists,
-    Podcasts,
-    Episodes,
 }
 
 impl SearchFilter {
-    pub const ALL: [SearchFilter; 7] = [
+    pub const ALL: [SearchFilter; 5] = [
         Self::All,
         Self::Songs,
         Self::Artists,
         Self::Albums,
         Self::Playlists,
-        Self::Podcasts,
-        Self::Episodes,
     ];
 
     pub fn label(self) -> &'static str {
@@ -372,8 +307,6 @@ impl SearchFilter {
             Self::Artists => "Artists",
             Self::Albums => "Albums",
             Self::Playlists => "Playlists",
-            Self::Podcasts => "Podcasts",
-            Self::Episodes => "Episodes",
         }
     }
 }
@@ -395,14 +328,6 @@ pub struct PlaylistPage {
     pub playlist: Loadable<Playlist>,
     pub items: PagedList<PlaylistItem>,
     pub filter: String,
-    /// Contributor IDs from loaded pages and a sample of the final page.
-    pub contributors: std::collections::BTreeSet<String>,
-    /// Whether contributors were sampled from the final page.
-    pub tail_checked: bool,
-    /// Whether the complete disk cache matches the live snapshot.
-    pub cache_complete: bool,
-    /// Items read from disk, waiting for the live snapshot to confirm.
-    pub pending_cache: Option<(String, Vec<PlaylistItem>)>,
 }
 
 #[derive(Default)]
@@ -411,52 +336,10 @@ pub struct AlbumPage {
     pub tracks: PagedList<Track>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum DiscographyFilter {
-    #[default]
-    All,
-    Albums,
-    Singles,
-    AppearsOn,
-}
-
-impl DiscographyFilter {
-    pub const ALL: [DiscographyFilter; 4] =
-        [Self::All, Self::Albums, Self::Singles, Self::AppearsOn];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::All => "All",
-            Self::Albums => "Albums",
-            Self::Singles => "Singles & EPs",
-            Self::AppearsOn => "Appears On",
-        }
-    }
-
-    pub fn groups(self) -> &'static str {
-        match self {
-            Self::All => "album,single,compilation",
-            Self::Albums => "album",
-            Self::Singles => "single",
-            Self::AppearsOn => "appears_on",
-        }
-    }
-}
-
 #[derive(Default)]
 pub struct ArtistPage {
     pub artist: Loadable<Artist>,
-    pub top_tracks: Loadable<Vec<Track>>,
-    pub albums: HashMap<String, PagedList<Album>>,
-    pub related: Loadable<Vec<Artist>>,
-    pub filter: DiscographyFilter,
-    pub show_all_top: bool,
-}
-
-#[derive(Default)]
-pub struct ShowPage {
-    pub show: Loadable<Show>,
-    pub episodes: PagedList<Episode>,
+    pub albums: PagedList<Album>,
 }
 
 /// A table's sort, chosen by clicking a column heading.
@@ -472,7 +355,6 @@ pub enum SortColumn {
     Album,
     Added,
     Duration,
-    AddedBy,
     /// The list's own order, for playing it reversed from the # heading.
     Index,
 }
@@ -480,40 +362,27 @@ pub enum SortColumn {
 /// Playback and action context for a track row.
 #[derive(Clone, Debug, PartialEq)]
 pub enum RowContext {
-    /// A Spotify context (playlist, album) that can be played from an offset.
+    /// An album or playlist played from the selected row.
     Context {
-        uri: String,
+        context: MediaId,
         /// The playlist id when the user owns it, enabling removal.
-        editable_playlist: Option<(String, Option<String>)>,
+        editable_playlist: Option<MediaId>,
     },
-    /// A loose list of tracks, played as a queue of URIs.
-    Uris(Vec<String>),
-    /// A Next up row. Playing it consumes that row and all rows before it.
-    Queue,
+    /// A loose list of songs shown in their exact play order.
+    Songs(Vec<Song>),
+    /// A Next up occurrence. Identity, rather than song ID, distinguishes
+    /// duplicate rows and lets the player consume exactly through this row.
+    Queue(crate::player::OccurrenceId),
     /// A sorted or filtered context view that plays the displayed rows.
-    View {
-        uris: Vec<String>,
-        context_uri: String,
-    },
+    View { songs: Vec<Song>, context: MediaId },
 }
 
 /// Track data held during a drag.
 #[derive(Clone, Debug)]
 pub struct DragTrack {
-    pub uri: String,
-    pub title: String,
-    /// Cover art for the drag preview.
-    pub image: Option<String>,
+    pub song: Song,
     /// Source playlist ID and row index for moves within an editable playlist.
-    pub from: Option<(String, u32)>,
-}
-
-/// Sidebar entry held during a drag.
-#[derive(Clone, Debug)]
-pub struct DragEntry {
-    pub uri: String,
-    pub title: String,
-    pub image: Option<String>,
+    pub from: Option<(MediaId, u32)>,
 }
 
 #[derive(Clone, Debug)]
@@ -521,22 +390,19 @@ pub enum Dialog {
     CreatePlaylist {
         name: String,
         public: bool,
-        add_uris: Vec<String>,
+        songs: Vec<Song>,
     },
     EditPlaylist {
-        id: String,
+        id: MediaId,
         name: String,
         description: String,
         public: bool,
     },
     ConfirmDeletePlaylist {
-        id: String,
+        id: MediaId,
         name: String,
-        owned: bool,
     },
     Shortcuts,
-    /// The signed-in account is not Premium, so nothing will play.
-    PremiumNeeded,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -556,33 +422,35 @@ pub struct Toast {
 #[derive(Clone, Debug)]
 pub enum Action {
     Open(Page),
+    /// A media reference entering through CLI, MPRIS, or loopback IPC. App
+    /// must parse and profile-check it before turning it into a typed action.
     OpenUri(String),
     Back,
     Forward,
     PlayContext {
-        uri: String,
-        offset_uri: Option<String>,
+        context: MediaId,
+        offset: Option<MediaId>,
         offset_index: Option<u32>,
     },
-    PlayUris {
-        uris: Vec<String>,
+    PlaySongs {
+        songs: Vec<Song>,
         index: u32,
     },
     PlayFromRow {
         context: RowContext,
-        uri: String,
+        song: Song,
         index: u32,
     },
-    /// Spotify's station seeded by this song.
-    PlayTrackRadio(String),
-    ShufflePlay(String),
+    /// Play one exact row from the authoritative local queue.
+    PlayQueueOccurrence(crate::player::OccurrenceId),
+    ShufflePlay(MediaId),
     TogglePlay,
     Next,
     Previous,
     Seek(u32),
     SeekBy(i64),
     SetVolume(u8),
-    /// Preview volume locally during a drag; send it to Spotify on release.
+    /// Preview volume locally during a drag.
     PreviewVolume(u8),
     VolumeBy(i8),
     ToggleMute,
@@ -591,60 +459,56 @@ pub enum Action {
     SetShuffle(bool),
     SetRepeat(crate::player::RepeatMode),
     AddToQueue {
-        uri: String,
+        song: Song,
         label: String,
     },
-    ToggleSaved(String),
+    ToggleFavorite(MediaId),
     /// Queue several songs in order and show one notification.
     QueueMany {
-        songs: Vec<(String, String)>,
+        songs: Vec<Song>,
     },
-    /// Set saved state for several songs explicitly.
-    SetSavedMany {
-        uris: Vec<String>,
-        saved: bool,
+    /// Set favorite state for several entities explicitly.
+    SetFavoriteMany {
+        ids: Vec<MediaId>,
+        favorite: bool,
     },
     AddToPlaylist {
-        playlist_id: String,
+        playlist_id: MediaId,
         playlist_name: String,
-        uris: Vec<String>,
+        songs: Vec<Song>,
     },
     RemoveFromPlaylist {
-        playlist_id: String,
-        uris: Vec<String>,
+        playlist_id: MediaId,
+        row_indices: Vec<u32>,
     },
-    MoveInPlaylist {
-        playlist_id: String,
-        from: u32,
-        to: u32,
+    /// Replace an editable playlist with this permutation of its original
+    /// server row indices. Row identity, rather than song ID, preserves
+    /// duplicate occurrences while a drag is in flight.
+    ReorderPlaylist {
+        playlist_id: MediaId,
+        ordered_row_indices: Vec<u32>,
     },
     ShowDialog(Dialog),
     CloseDialog,
     CreatePlaylist {
         name: String,
         public: bool,
-        add_uris: Vec<String>,
+        songs: Vec<Song>,
     },
     UpdatePlaylist {
-        id: String,
+        id: MediaId,
         name: String,
         description: String,
         public: bool,
     },
-    DeletePlaylist(String),
-    Transfer(String),
-    /// Send the account to a receiver found on the local network.
-    ActivateReceiver(Box<crate::zeroconf::Receiver>),
-    RefreshDevices,
+    DeletePlaylist(MediaId),
     /// Empty Next up of its queued songs, keeping the context's own.
     ClearQueue,
     /// Save the current and upcoming queue as a playlist.
     SaveQueueAsPlaylist,
-    RefreshQueue,
-    CopyLink(String),
+    CopyLink(MediaId),
     /// Open a web page in the browser.
     OpenUrl(String),
-    OpenInSpotify(String),
     Search(String),
     SetSearchFilter(SearchFilter),
     FocusSearch,
@@ -652,25 +516,14 @@ pub enum Action {
     LoadMoreRecents,
     ReloadRecents,
     SetQueueTab(QueueTab),
-    LoadMoreArtistAlbums(String),
-    SetDiscographyFilter {
-        artist_id: String,
-        filter: DiscographyFilter,
-    },
-    ToggleShowAllTop(String),
     Reload(Page),
     SignIn,
-    CancelSignIn,
     SignOut,
-    /// Add, replace, or remove the optional personal Web API app.
-    ConfigurePersonalWebApp,
     ToggleSidebar,
     ToggleQueuePanel,
     ToggleLyricsPanel,
-    ToggleDevicesPopup,
     SettingsChanged,
     RestartEngine,
-    EnablePlayback,
     ShowWindow,
     HideWindow,
     ClearArtCache,
@@ -714,16 +567,38 @@ pub enum Action {
     CloseWindow,
     /// Roll the main window up to its title bar, or down again.
     ToggleWinampShade,
-    /// Open or close the MilkDrop window.
-    ToggleWinampMilkdrop,
-    /// How long each MilkDrop preset plays, in seconds.
-    SetMilkdropSeconds(u32),
-    SetMilkdropScale(u32),
-    /// How many frames a second the MilkDrop window draws; 0 is uncapped.
-    SetMilkdropFps(u32),
-    OpenMilkdropFolder,
-    /// Fetch one of projectM's preset packs into the folder, by its place
-    /// in the list.
-    DownloadMilkdropPack(usize),
     Quit,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn media(kind: MediaKind, raw: &str) -> MediaId {
+        MediaId::new(
+            ProfileId::new("0123456789abcdef0123456789abcdef01234567"),
+            kind,
+            raw,
+        )
+    }
+
+    #[test]
+    fn typed_pages_round_trip_arbitrary_server_ids() {
+        for page in [
+            Page::Playlist(media(MediaKind::Playlist, "list:/ 中文")),
+            Page::Album(media(MediaKind::Album, "album:?&")),
+            Page::Artist(media(MediaKind::Artist, "artist:with:colons")),
+        ] {
+            assert_eq!(Page::decode(&page.encode()), Some(page));
+        }
+    }
+
+    #[test]
+    fn page_kind_and_legacy_provider_refs_cannot_cross_the_boundary() {
+        let song = media(MediaKind::Song, "song");
+        assert_eq!(Page::from_uri(&song.uri()), None);
+        assert_eq!(Page::decode(&format!("album|{}", song.uri())), None);
+        assert_eq!(Page::from_uri("legacy:track:old-id"), None);
+        assert_eq!(Page::decode("playlist:legacy"), None);
+    }
 }

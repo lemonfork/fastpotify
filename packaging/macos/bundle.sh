@@ -14,11 +14,13 @@ binary="$1"
 app="$2"
 version="$3"
 here="$(cd "$(dirname "$0")" && pwd)"
+root="$(cd "$here/../.." && pwd)"
 
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 
 cp "$binary" "$app/Contents/MacOS/fastpotify"
+cp "$root/THIRD_PARTY_NOTICES.md" "$app/Contents/Resources/"
 chmod 755 "$app/Contents/MacOS/fastpotify"
 # The build number has to be numbers: a release candidate's -rc1 comes off.
 build="${version%%-*}"

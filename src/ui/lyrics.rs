@@ -188,9 +188,9 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
             }
             // Words without timing can only be followed by the clock: sit
             // at the part of the text the song is probably at.
-            if app.lyrics_following && !lyrics.synced && now.duration_ms > 0 {
+            if app.lyrics_following && !lyrics.synced && now.song.duration_ms > 0 {
                 let fraction =
-                    (f64::from(now.position_ms) / f64::from(now.duration_ms)).clamp(0.0, 1.0);
+                    (f64::from(now.position_ms) / f64::from(now.song.duration_ms)).clamp(0.0, 1.0);
                 let content = ui.min_rect();
                 let y = content.top() + content.height() * fraction as f32;
                 ui.scroll_to_rect(

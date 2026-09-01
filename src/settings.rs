@@ -49,23 +49,15 @@ impl ThemeChoice {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// The Spotify Connect name other devices see.
-    pub device_name: String,
-    /// 96, 160, or 320 kbps.
+    /// Maximum server transcoding bitrate in kbps. Navidrome may still return
+    /// the original stream when it is already within this limit.
     pub bitrate: u16,
-    pub normalisation: bool,
-    pub autoplay: bool,
-    pub gapless: bool,
-    /// librespot backend name; `None` picks the platform default.
-    pub audio_backend: Option<String>,
     pub audio_device: Option<String>,
     /// Output buffer in milliseconds. Smaller values may click under load;
     /// larger values delay playback controls.
     /// See [`crate::sink::DEFAULT_BUFFER_MS`].
     #[serde(default = "default_buffer_ms")]
     pub audio_buffer_ms: u32,
-    pub audio_cache: bool,
-    pub audio_cache_mb: u64,
     pub theme: ThemeChoice,
     /// Tint the interface with the colour of the playing album's art.
     pub accent_from_art: bool,
@@ -84,17 +76,11 @@ pub struct Settings {
     pub tracklist_compact: bool,
     pub search_history: Vec<String>,
     pub show_shortcut_hints: bool,
-    /// An optional personal Spotify Web API application id. The shared
-    /// application remains active for coverage when this is present.
-    pub web_client_id: Option<String>,
-    /// Local playback has been authorized at least once on this machine, so
-    /// the app can resume it silently instead of prompting.
-    pub playback_authorized: bool,
     /// Closing the window hides to the tray and keeps the music playing.
     pub keep_playing_in_background: bool,
     /// Ask GitHub once a day whether a newer release exists.
     pub check_for_updates: bool,
-    /// Context URIs pinned to the top of the sidebar, in pin order.
+    /// Server-scoped media references pinned to the top of the sidebar.
     pub pinned_contexts: Vec<String>,
     /// The sidebar's own playlist order, set by dragging rows. Empty means
     /// the automatic order: the pinned block first, then recently played.
@@ -134,36 +120,14 @@ pub struct Settings {
     pub eq_shaded: bool,
     /// The main window is rolled up to its title bar.
     pub winamp_shaded: bool,
-    /// The MilkDrop window is open (its own window, not part of the skin).
-    pub milkdrop_open: bool,
-    /// How long each preset plays before the next, in seconds.
-    pub milkdrop_seconds: u32,
-    /// How many frames a second the MilkDrop window draws; 0 is uncapped.
-    pub milkdrop_fps: u32,
-    /// Last reported MilkDrop screen refresh rate. The first value sets the
-    /// default frame rate; this field is not directly configurable.
-    pub milkdrop_screen_hz: u32,
-    /// The picture's inner resolution: 1 full, 2 half, 4 quarter.
-    pub milkdrop_scale: u32,
-    /// The MilkDrop window fills the screen.
-    pub milkdrop_fullscreen: bool,
-    /// The MilkDrop window's size in logical points, when not full-screen.
-    pub milkdrop_size: [f32; 2],
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            device_name: "Fastpotify".to_string(),
             bitrate: 320,
-            normalisation: false,
-            autoplay: true,
-            gapless: true,
-            audio_backend: None,
             audio_device: None,
             audio_buffer_ms: default_buffer_ms(),
-            audio_cache: true,
-            audio_cache_mb: 1024,
             theme: ThemeChoice::Dark,
             accent_from_art: true,
             volume: (u16::MAX as u32 * 70 / 100) as u16,
@@ -176,8 +140,6 @@ impl Default for Settings {
             tracklist_compact: false,
             search_history: Vec::new(),
             show_shortcut_hints: true,
-            web_client_id: None,
-            playback_authorized: false,
             keep_playing_in_background: true,
             check_for_updates: true,
             pinned_contexts: Vec::new(),
@@ -199,13 +161,6 @@ impl Default for Settings {
             playlist_shaded: false,
             eq_shaded: false,
             winamp_shaded: false,
-            milkdrop_open: false,
-            milkdrop_seconds: crate::milkdrop::DEFAULT_SECONDS,
-            milkdrop_fps: crate::milkdrop::DEFAULT_FPS,
-            milkdrop_screen_hz: 0,
-            milkdrop_scale: 1,
-            milkdrop_fullscreen: false,
-            milkdrop_size: crate::milkdrop::DEFAULT_SIZE,
         }
     }
 }
@@ -236,22 +191,9 @@ impl Settings {
                 return;
             }
         };
-        let temporary = path.with_extension("json.tmp");
-        let written =
-            std::fs::write(&temporary, text).and_then(|()| std::fs::rename(&temporary, path));
-        if let Err(error) = written {
+        if let Err(error) = crate::paths::atomic_write(path, text.as_bytes()) {
             log::warn!("unable to save settings to {}: {error}", path.display());
         }
-    }
-
-    pub fn platform_backend(&self) -> Option<String> {
-        self.audio_backend.clone().or_else(|| {
-            if cfg!(target_os = "linux") {
-                Some("pulseaudio".to_string())
-            } else {
-                None
-            }
-        })
     }
 
     pub fn remember_search(&mut self, query: &str) {
@@ -368,7 +310,7 @@ mod tests {
 #[serde(default)]
 pub struct SessionState {
     pub last_page: Option<String>,
-    /// Context URIs most recently played, newest first.
+    /// Server-scoped contexts most recently played, newest first.
     pub recent_contexts: Vec<String>,
     /// What was playing when the app closed, to resume from a cold start.
     pub last_context: Option<String>,
@@ -382,8 +324,6 @@ pub struct SessionState {
     /// Queue rows displayed on the next start. Playback restores manual rows
     /// from `last_added_queue`; it does not enqueue this list.
     pub last_queue_rows: Vec<crate::api::models::PlayableItem>,
-    /// Sidebar folders rolled up, by their rootlist ids.
-    pub collapsed_folders: Vec<String>,
     /// Shuffle mode saved across contexts and restarts.
     pub shuffle_on: bool,
     /// Each table's chosen sort, by encoded page, restored at start.
@@ -398,8 +338,6 @@ pub struct SessionState {
     pub queue_tab: Option<String>,
     /// Last outer position of the Winamp window.
     pub winamp_pos: Option<[f32; 2]>,
-    /// Last outer position of the MilkDrop window.
-    pub milkdrop_pos: Option<[f32; 2]>,
 }
 
 impl SessionState {
@@ -414,8 +352,13 @@ impl SessionState {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if let Ok(text) = serde_json::to_string(self) {
-            let _ = std::fs::write(path, text);
+        if let Ok(text) = serde_json::to_string(self)
+            && let Err(error) = crate::paths::atomic_write(path, text.as_bytes())
+        {
+            log::warn!(
+                "unable to save session state to {}: {error}",
+                path.display()
+            );
         }
     }
 }

@@ -30,6 +30,6 @@ body:
     id: fit
     attributes:
       label: Why does this fit Fastpotify?
-      description: Explain why it belongs in a small, native Spotify client.
+      description: Explain why it belongs in a small, native Navidrome/OpenSubsonic client.
     validations:
       required: true

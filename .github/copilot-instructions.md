@@ -6,9 +6,9 @@ and review.
 When reviewing a pull request, prioritize correctness, regressions, product
 fit, cross-platform behaviour, UI-thread blocking, credential exposure, and
 unnecessary dependencies. Treat violations of the documented product
-boundaries as blockers. In particular, flag alternate sources for Spotify
-audio, DRM circumvention, embedded browser engines, telemetry, and hosted
-Fastpotify services.
+boundaries as blockers. In particular, flag media sources outside the active
+Navidrome/OpenSubsonic server, credential exposure, embedded browser engines,
+telemetry, and hosted Fastpotify services.
 
 Check that behavioural changes have focused tests and that user-visible
 settings, files, and network access are documented. For UI changes, ask for

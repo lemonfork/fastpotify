@@ -1,7 +1,7 @@
 //! Single-instance guard and remote-control channel.
 //!
-//! A second instance would duplicate the Spotify Connect device, MPRIS player,
-//! and tray icon. A second launch raises the running instance and exits.
+//! A second instance would duplicate the local player, MPRIS service, and tray
+//! icon. A second launch raises the running instance and exits.
 //!
 //! Linux uses a non-queued D-Bus well-known name as the guard and MPRIS
 //! `Raise` to show the running instance. D-Bus releases the name when the
@@ -21,11 +21,11 @@
 //! app state. Linux uses MPRIS for these controls.
 //!
 //! The Stream Deck plugin uses the same channel. It can set shuffle and repeat,
-//! save the current track, play a URI, list devices, and transfer playback.
-//! Clients poll the current snapshot; the app does not push updates.
+//! favorite the current track, and play a secret-free media reference. Clients
+//! poll the current snapshot; the app does not push updates.
 //!
-//! Any local process can reach the port, so `play-uri` and `transfer` validate
-//! their free-text arguments here.
+//! Any local process can reach the port, so `play-ref` validates its free-text
+//! argument here before it enters the app.
 
 /// The name held for the lifetime of the running instance.
 #[cfg(target_os = "linux")]
@@ -67,15 +67,10 @@ pub enum ControlCommand {
     SetRepeat(crate::player::RepeatMode),
     /// Absolute position, in milliseconds.
     SeekTo(u32),
-    /// Save the playing track to the library, or take it back out.
+    /// Favorite the playing track, or take it back out.
     ToggleSaved,
-    /// Play a `spotify:` URI: a track, album, playlist, artist, or show.
-    PlayUri(String),
-    /// Move playback to a Spotify Connect device, by id.
-    Transfer(String),
-    /// Refresh the device list. Sent by the `devices` read, which answers
-    /// from a snapshot that is only as fresh as the app's last look.
-    RefreshDevices,
+    /// Play a validated, secret-free `fastpotify:` media reference.
+    PlayRef(String),
 }
 
 /// Marks this process as the running instance until dropped.
@@ -87,8 +82,6 @@ pub struct Guard {
     commands: std::sync::Arc<std::sync::Mutex<Vec<ControlCommand>>>,
     /// Current-track snapshot for `nowplaying` requests.
     now_playing: std::sync::Arc<std::sync::Mutex<String>>,
-    /// Last Spotify Connect device snapshot, as one line of JSON.
-    devices: std::sync::Arc<std::sync::Mutex<String>>,
 }
 
 impl Guard {
@@ -101,18 +94,10 @@ impl Guard {
     pub fn now_playing_slot(&self) -> std::sync::Arc<std::sync::Mutex<String>> {
         std::sync::Arc::clone(&self.now_playing)
     }
-
-    /// The slot the app writes the device list into.
-    pub fn devices_slot(&self) -> std::sync::Arc<std::sync::Mutex<String>> {
-        std::sync::Arc::clone(&self.devices)
-    }
 }
 
 /// Snapshot value reported when nothing is playing.
 pub const NOTHING_PLAYING: &str = "stopped";
-
-/// Device snapshot used before loading and when Spotify reports no devices.
-pub const NO_DEVICES: &str = "[]";
 
 /// Loopback port that marks a running instance on platforms without a bus.
 /// Registered to nothing; chosen high and out of the ephemeral range.
@@ -127,8 +112,6 @@ const PREFIX: &str = "fastpotify:";
 const OK_REPLY: &str = "fastpotify:ok";
 #[cfg(not(target_os = "linux"))]
 const NOW_REPLY: &str = "fastpotify:now ";
-#[cfg(not(target_os = "linux"))]
-const DEVICES_REPLY: &str = "fastpotify:devices ";
 
 /// What the running instance said back.
 #[cfg(not(target_os = "linux"))]
@@ -137,17 +120,23 @@ pub enum Reply {
     Ok,
     /// The `nowplaying` snapshot: [`NOTHING_PLAYING`], or tab-separated
     /// `state, title, artists, album, position_ms, duration_ms, volume,
-    /// shuffle, repeat, art_url, saved, device`.
+    /// shuffle, repeat, artwork_ref, favorite, device`. The final device field
+    /// is retained for compatibility and is empty or `local`.
     NowPlaying(String),
-    /// The `devices` snapshot: a JSON array of objects with `id`, `name`,
-    /// `kind`, and `active`, or [`NO_DEVICES`]. JSON safely carries free-text
-    /// device names.
-    Devices(String),
 }
 
 /// Sends one verb to the running instance and reads its reply.
 #[cfg(not(target_os = "linux"))]
 pub fn send(verb: &str) -> std::io::Result<Reply> {
+    // Validate before opening the socket as well as on the server. This keeps
+    // an accidental authenticated URL out of IPC even when this library API
+    // is called directly rather than through the CLI parser.
+    if parse(&format!("{PREFIX}{verb}")).is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid Fastpotify control command",
+        ));
+    }
     send_to(INSTANCE_PORT, verb)
 }
 
@@ -169,8 +158,6 @@ fn send_to(port: u16, verb: &str) -> std::io::Result<Reply> {
         Ok(Reply::Ok)
     } else if let Some(snapshot) = line.strip_prefix(NOW_REPLY) {
         Ok(Reply::NowPlaying(snapshot.to_owned()))
-    } else if let Some(snapshot) = line.strip_prefix(DEVICES_REPLY) {
-        Ok(Reply::Devices(snapshot.to_owned()))
     } else {
         Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -187,7 +174,6 @@ pub fn acquire(waker: &crate::backend::Waker) -> Outcome {
     let unguarded = || Guard {
         commands: Default::default(),
         now_playing: Arc::new(Mutex::new(NOTHING_PLAYING.to_owned())),
-        devices: Arc::new(Mutex::new(NO_DEVICES.to_owned())),
     };
 
     let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, INSTANCE_PORT)) {
@@ -206,11 +192,10 @@ pub fn acquire(waker: &crate::backend::Waker) -> Outcome {
     let guard = unguarded();
     let commands = Arc::clone(&guard.commands);
     let now_playing = Arc::clone(&guard.now_playing);
-    let devices = Arc::clone(&guard.devices);
     let waker = waker.clone();
     let spawned = std::thread::Builder::new()
         .name("fastpotify-instance".to_owned())
-        .spawn(move || serve(listener, &commands, &now_playing, &devices, &waker));
+        .spawn(move || serve(listener, &commands, &now_playing, &waker));
     if let Err(error) = spawned {
         log::warn!("cannot listen for other launches: {error}");
     }
@@ -224,7 +209,6 @@ fn serve(
     listener: std::net::TcpListener,
     commands: &std::sync::Mutex<Vec<ControlCommand>>,
     now_playing: &std::sync::Mutex<String>,
-    devices: &std::sync::Mutex<String>,
     waker: &crate::backend::Waker,
 ) {
     use std::io::Write;
@@ -253,20 +237,32 @@ fn serve(
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .clone();
+                let snapshot = publishable_now_playing(&snapshot);
                 let _ = stream.write_all(format!("{NOW_REPLY}{snapshot}\n").as_bytes());
-            }
-            Some(Request::Devices) => {
-                let snapshot = devices.lock().unwrap_or_else(|p| p.into_inner()).clone();
-                let _ = stream.write_all(format!("{DEVICES_REPLY}{snapshot}\n").as_bytes());
-                // Return the current snapshot, then request a refresh for the
-                // next read. The app otherwise refreshes only while its picker
-                // is open.
-                queue(ControlCommand::RefreshDevices);
             }
             // Not our client; say nothing and hang up.
             None => {}
         }
     }
+}
+
+/// Keeps the raw snapshot layout compatible while ensuring the two fields
+/// that used to carry provider URLs and remote devices are safe to publish.
+#[cfg(not(target_os = "linux"))]
+fn publishable_now_playing(snapshot: &str) -> String {
+    let mut fields: Vec<&str> = snapshot.split('\t').collect();
+    if let Some(artwork) = fields.get_mut(9)
+        && !artwork.is_empty()
+        && !crate::media::is_artwork_ref(artwork)
+    {
+        *artwork = "";
+    }
+    if let Some(device) = fields.get_mut(11)
+        && *device != "local"
+    {
+        *device = "";
+    }
+    fields.join("\t")
 }
 
 /// A parsed request line: a command for the app, or a read the listener
@@ -275,7 +271,6 @@ fn serve(
 enum Request {
     Command(ControlCommand),
     NowPlaying,
-    Devices,
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -310,38 +305,21 @@ fn parse(line: &str) -> Option<Request> {
         ("repeat-set", Some("track")) => {
             ControlCommand::SetRepeat(crate::player::RepeatMode::Track)
         }
-        ("save-toggle", None) => ControlCommand::ToggleSaved,
-        ("play-uri", Some(uri)) => ControlCommand::PlayUri(spotify_uri(uri)?),
-        ("transfer", Some(id)) => ControlCommand::Transfer(device_id(id)?),
+        ("favorite-toggle" | "save-toggle", None) => ControlCommand::ToggleSaved,
+        ("play-ref" | "play-uri", Some(reference)) => {
+            ControlCommand::PlayRef(media_ref(reference)?)
+        }
         ("nowplaying", None) => return Some(Request::NowPlaying),
-        ("devices", None) => return Some(Request::Devices),
         _ => return None,
     };
     Some(Request::Command(command))
 }
 
-/// Validates the scheme, length, and characters of a Spotify URI received over
-/// the local control port.
+/// Validates a secret-free media reference received over the local control
+/// port. Authenticated stream and artwork URLs are rejected by construction.
 #[cfg(not(target_os = "linux"))]
-fn spotify_uri(text: &str) -> Option<String> {
-    let shaped = text.starts_with("spotify:")
-        && text.len() <= 128
-        && text
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '-' | '_' | '.' | '%' | '+'));
-    shaped.then(|| text.to_owned())
-}
-
-/// A Spotify Connect device id: the opaque hex-ish string the Web API hands
-/// out. Checked for the same reason as [`spotify_uri`].
-#[cfg(not(target_os = "linux"))]
-fn device_id(text: &str) -> Option<String> {
-    let shaped = !text.is_empty()
-        && text.len() <= 64
-        && text
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'));
-    shaped.then(|| text.to_owned())
+fn media_ref(text: &str) -> Option<String> {
+    crate::media::is_media_ref(text).then(|| text.to_owned())
 }
 
 /// Reads up to the first newline. A line too long to be one of ours, or any
@@ -349,7 +327,7 @@ fn device_id(text: &str) -> Option<String> {
 #[cfg(not(target_os = "linux"))]
 fn read_line(stream: &mut std::net::TcpStream) -> Option<String> {
     use std::io::Read;
-    let mut buffer = [0u8; 256];
+    let mut buffer = [0u8; crate::media::MAX_MEDIA_REF_LEN + 64];
     let mut filled = 0;
     loop {
         if filled == buffer.len() {
@@ -379,7 +357,6 @@ pub fn acquire(_waker: &crate::backend::Waker) -> Outcome {
         _connection: connection,
         commands: Default::default(),
         now_playing: std::sync::Arc::new(std::sync::Mutex::new(NOTHING_PLAYING.to_owned())),
-        devices: std::sync::Arc::new(std::sync::Mutex::new(NO_DEVICES.to_owned())),
     };
 
     let connection = match Connection::session() {
@@ -437,6 +414,7 @@ fn raise_running_instance(connection: &mpris_server::zbus::blocking::Connection)
 #[cfg(all(test, not(target_os = "linux")))]
 mod tests {
     use super::*;
+    use crate::api::models::{MediaId, MediaKind, ProfileId};
     use crate::player::RepeatMode;
 
     fn command(line: &str) -> Option<ControlCommand> {
@@ -444,6 +422,15 @@ mod tests {
             Some(Request::Command(command)) => Some(command),
             _ => None,
         }
+    }
+
+    fn song_ref(id: &str) -> String {
+        MediaId::new(
+            ProfileId::new("0123456789abcdef0123456789abcdef01234567"),
+            MediaKind::Song,
+            id,
+        )
+        .uri()
     }
 
     #[test]
@@ -507,26 +494,27 @@ mod tests {
             Some(ControlCommand::SeekTo(90_000))
         );
         assert_eq!(
-            command("fastpotify:save-toggle"),
+            command("fastpotify:favorite-toggle"),
             Some(ControlCommand::ToggleSaved)
         );
         assert_eq!(
-            command("fastpotify:play-uri spotify:playlist:37i9dQZF1DXcBWIGoYBM5M"),
-            Some(ControlCommand::PlayUri(
-                "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M".to_owned()
-            ))
+            command("fastpotify:save-toggle"),
+            Some(ControlCommand::ToggleSaved)
         );
+        let reference = song_ref("track-1");
         assert_eq!(
-            command("fastpotify:transfer a1b2c3d4e5"),
-            Some(ControlCommand::Transfer("a1b2c3d4e5".to_owned()))
+            command(&format!("fastpotify:play-ref {reference}")),
+            Some(ControlCommand::PlayRef(reference.clone()))
+        );
+        // Older local-control clients may keep using the old verb, but the
+        // argument is still required to be a new secret-free reference.
+        assert_eq!(
+            command(&format!("fastpotify:play-uri {reference}")),
+            Some(ControlCommand::PlayRef(reference))
         );
         assert!(matches!(
             parse("fastpotify:nowplaying"),
             Some(Request::NowPlaying)
-        ));
-        assert!(matches!(
-            parse("fastpotify:devices"),
-            Some(Request::Devices)
         ));
     }
 
@@ -542,20 +530,56 @@ mod tests {
 
     /// Free-text control arguments are validated before reaching the app.
     #[test]
-    fn refuses_arguments_that_are_not_shaped_like_spotifys_own() {
+    fn refuses_urls_secrets_and_legacy_provider_uris() {
         // #given / #when / #then
-        assert!(command("fastpotify:play-uri http://example.com/pwn").is_none());
-        assert!(command("fastpotify:play-uri spotify:track:a b").is_none());
-        assert!(command("fastpotify:play-uri ../../etc/passwd").is_none());
+        assert!(command("fastpotify:play-ref http://example.com/pwn").is_none());
+        assert!(
+            command("fastpotify:play-ref https://music.example/rest/stream?id=1&u=user&t=secret")
+                .is_none()
+        );
+        assert!(command("fastpotify:play-ref legacy:track:old-id").is_none());
+        assert!(command("fastpotify:play-ref ../../etc/passwd").is_none());
+        assert!(command("fastpotify:play-ref fastpotify:song:bad-profile:c29uZw").is_none());
+        assert!(command("fastpotify:play-ref").is_none());
         assert!(command("fastpotify:play-uri").is_none());
-        assert!(command(&format!("fastpotify:play-uri spotify:{}", "x".repeat(200))).is_none());
-        assert!(command("fastpotify:transfer ../secrets").is_none());
-        assert!(command("fastpotify:transfer").is_none());
+        assert!(
+            command(&format!(
+                "fastpotify:play-ref {}",
+                "x".repeat(crate::media::MAX_MEDIA_REF_LEN + 1)
+            ))
+            .is_none()
+        );
+        assert!(command("fastpotify:devices").is_none());
+        assert!(command("fastpotify:transfer local").is_none());
         // A word that is not one of the three is refused rather than read
         // as `off`, which is what `RepeatMode::from_api` would have done.
         assert!(command("fastpotify:repeat-set sometimes").is_none());
         assert!(command("fastpotify:shuffle-set maybe").is_none());
         assert!(command("fastpotify:seek-to -1").is_none());
+    }
+
+    #[test]
+    fn now_playing_never_publishes_authenticated_urls_or_remote_devices() {
+        let snapshot = concat!(
+            "playing\tTitle\tArtist\tAlbum\t1\t2\t50\toff\toff\t",
+            "https://music.example/rest/getCoverArt?id=1&u=user&t=secret",
+            "\tyes\tKitchen"
+        );
+        let public = publishable_now_playing(snapshot);
+        let fields: Vec<_> = public.split('\t').collect();
+        assert_eq!(fields.len(), 12);
+        assert_eq!(fields[9], "");
+        assert_eq!(fields[10], "yes");
+        assert_eq!(fields[11], "");
+
+        let art = crate::api::models::ArtworkRef::new(
+            ProfileId::new("0123456789abcdef0123456789abcdef01234567"),
+            "cover-1",
+        )
+        .uri();
+        let safe = format!("playing\tT\tA\tB\t1\t2\t50\toff\toff\t{art}\tyes\tlocal");
+        assert_eq!(publishable_now_playing(&safe), safe);
+        assert_eq!(publishable_now_playing("stopped"), "stopped");
     }
 
     /// Socket commands reach the queue and reads return published snapshots.
@@ -565,53 +589,47 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         // #given
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a loopback port");
+        let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) {
+            Ok(listener) => listener,
+            // Some managed sandboxes deny even loopback listeners. That is an
+            // host restriction, not a regression in the IPC contract.
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("a loopback port: {error}"),
+        };
         let port = listener.local_addr().expect("a bound address").port();
         let commands: Arc<Mutex<Vec<ControlCommand>>> = Default::default();
         let now_playing = Arc::new(Mutex::new("playing\tGo\tThe Band".to_owned()));
-        let devices = Arc::new(Mutex::new(
-            r#"[{"id":"abc","name":"Kitchen","kind":"Speaker","active":true}]"#.to_owned(),
-        ));
         let served = {
             let commands = Arc::clone(&commands);
             let now_playing = Arc::clone(&now_playing);
-            let devices = Arc::clone(&devices);
             let waker = crate::backend::Waker::default();
-            std::thread::spawn(move || serve(listener, &commands, &now_playing, &devices, &waker))
+            std::thread::spawn(move || serve(listener, &commands, &now_playing, &waker))
         };
 
         // #when
         let accepted = send_to(port, "next").expect("a reply");
         let volume = send_to(port, "volume-by -5").expect("a reply");
-        let liked = send_to(port, "save-toggle").expect("a reply");
+        let favorited = send_to(port, "favorite-toggle").expect("a reply");
         let snapshot = send_to(port, "nowplaying").expect("a reply");
-        let listed = send_to(port, "devices").expect("a reply");
         let refused = send_to(port, "frobnicate");
 
         // #then
         assert!(matches!(accepted, Reply::Ok));
         assert!(matches!(volume, Reply::Ok));
-        assert!(matches!(liked, Reply::Ok));
+        assert!(matches!(favorited, Reply::Ok));
         match snapshot {
             Reply::NowPlaying(line) => assert_eq!(line, "playing\tGo\tThe Band"),
             _ => panic!("nowplaying answered with something else"),
         }
-        match listed {
-            Reply::Devices(json) => assert!(json.contains("Kitchen")),
-            _ => panic!("devices answered with something else"),
-        }
         // An unknown verb gets no reply at all, so the client sees a closed
         // connection rather than a command it never sent being obeyed.
         assert!(refused.is_err());
-        // Reading the devices also asks the app to look again, so the next
-        // read is fresh.
         assert_eq!(
             *commands.lock().expect("the queue"),
             vec![
                 ControlCommand::Next,
                 ControlCommand::VolumeBy(-5),
                 ControlCommand::ToggleSaved,
-                ControlCommand::RefreshDevices,
             ]
         );
 

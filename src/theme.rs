@@ -40,9 +40,9 @@ impl Palette {
             text: Color32::from_rgb(0xf2, 0xf4, 0xf6),
             secondary: Color32::from_rgb(0xa9, 0xb1, 0xbc),
             dim: Color32::from_rgb(0x6e, 0x77, 0x84),
-            accent: Color32::from_rgb(0x1e, 0xd7, 0x60),
-            accent_hover: Color32::from_rgb(0x3c, 0xe8, 0x7a),
-            on_accent: Color32::from_rgb(0x0a, 0x14, 0x0e),
+            accent: Color32::from_rgb(0x5b, 0x8c, 0xff),
+            accent_hover: Color32::from_rgb(0x7a, 0xa3, 0xff),
+            on_accent: Color32::from_rgb(0x0a, 0x10, 0x20),
             danger: Color32::from_rgb(0xf5, 0x71, 0x7f),
             warning: Color32::from_rgb(0xf2, 0xb8, 0x5c),
             overlay: Color32::from_rgb(0x22, 0x27, 0x2e),
@@ -62,8 +62,8 @@ impl Palette {
             text: Color32::from_rgb(0x14, 0x17, 0x1a),
             secondary: Color32::from_rgb(0x53, 0x5b, 0x66),
             dim: Color32::from_rgb(0x8b, 0x93, 0x9e),
-            accent: Color32::from_rgb(0x15, 0xa6, 0x4a),
-            accent_hover: Color32::from_rgb(0x12, 0x8f, 0x40),
+            accent: Color32::from_rgb(0x35, 0x65, 0xd8),
+            accent_hover: Color32::from_rgb(0x2b, 0x54, 0xb8),
             on_accent: Color32::WHITE,
             danger: Color32::from_rgb(0xd6, 0x3b, 0x4c),
             warning: Color32::from_rgb(0xb8, 0x7a, 0x14),
@@ -313,6 +313,9 @@ fn install_fonts(ctx: &egui::Context) {
         // epaint rebuilds the glyph atlas.
         let mut data = FontData::from_static(&font.bytes);
         data.index = font.index;
+        data.tweak.y_offset_factor =
+            crate::system_fonts::baseline_offset_factor(inter, 0, &font.bytes, font.index)
+                .unwrap_or_default();
         fonts.font_data.insert(font.name.clone(), Arc::new(data));
         for family in fonts.families.values_mut() {
             family.push(font.name.clone());
@@ -635,7 +638,7 @@ pub fn circle_button(
 }
 
 /// A disc the size of a [`circle_button`] whose icon is replaced by a
-/// spinner: the pressed play button itself shows that Spotify is reacting.
+/// spinner: the pressed play button itself shows that playback is reacting.
 pub fn circle_spinner(
     ui: &mut egui::Ui,
     diameter: f32,
@@ -851,6 +854,55 @@ mod tests {
                 Color32::WHITE,
             );
             assert!(galley.rows[0].glyphs.len() >= 5);
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn latin_and_han_fallbacks_keep_the_same_visible_center() {
+        use skrifa::MetadataProvider as _;
+
+        let has_han_fallback = crate::system_fonts::fallbacks().iter().any(|fallback| {
+            skrifa::FontRef::from_index(&fallback.bytes, fallback.index)
+                .ok()
+                .is_some_and(|font| {
+                    let charmap = font.charmap();
+                    ['中', '文', '测', '试']
+                        .into_iter()
+                        .all(|character| charmap.map(character).is_some())
+                })
+        });
+        if !has_han_fallback {
+            // A minimal container may have no CJK face installed at all.
+            return;
+        }
+
+        let ctx = egui::Context::default();
+        install(&ctx);
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let galley =
+                ui.painter()
+                    .layout_no_wrap("H中文测试".to_string(), regular(32.0), Color32::WHITE);
+            let glyphs = &galley.rows[0].glyphs;
+            let visible_center = |glyph: &egui::epaint::text::Glyph| {
+                glyph.pos.y + glyph.uv_rect.offset.y + glyph.uv_rect.size.y / 2.0
+            };
+            let latin = glyphs
+                .iter()
+                .find(|glyph| glyph.chr == 'H')
+                .expect("the Latin glyph is laid out");
+            let latin_center = visible_center(latin);
+            for character in ['中', '文', '测', '试'] {
+                let han = glyphs
+                    .iter()
+                    .find(|glyph| glyph.chr == character)
+                    .unwrap_or_else(|| panic!("the {character} glyph is laid out"));
+                let difference = (visible_center(han) - latin_center).abs();
+                assert!(
+                    difference <= 2.0,
+                    "{character} is {difference:.2}px off the Latin visible center"
+                );
+            }
         });
         output.textures_delta.clear();
     }

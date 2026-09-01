@@ -97,7 +97,7 @@ fn now_playing_block(app: &mut App, ui: &mut egui::Ui, region: Rect, now: Option
     super::widgets::paint_cover(
         ui,
         &palette,
-        now.art_small.as_deref().or(now.art_url.as_deref()),
+        now.song.image(128),
         cover_rect,
         6.0,
         Icon::Music,
@@ -109,21 +109,20 @@ fn now_playing_block(app: &mut App, ui: &mut egui::Ui, region: Rect, now: Option
             Sense::click(),
         )
         .on_hover_cursor(egui::CursorIcon::PointingHand);
-    // Hovering the cover offers to dock the art large at the sidebar's
-    // bottom, the way Spotify expands it. (#92)
-    let art_available = now.art_url.is_some() || now.art_small.is_some();
+    // Hovering the cover offers to dock the art large at the sidebar's bottom.
+    let art_available = now.song.image(128).is_some();
     let expand_rect = Rect::from_center_size(
         pos2(cover_rect.right() - 10.0, cover_rect.top() + 10.0),
         Vec2::splat(18.0),
     );
     let offer_expand = art_available && !app.settings.art_expanded && app.settings.sidebar_visible;
     let over_expand = offer_expand && ui.rect_contains_pointer(expand_rect);
-    if cover_response.clicked() && !over_expand {
-        if let Some(id) = &now.album_id {
-            app.actions.push(Action::Open(Page::Album(id.clone())));
-        } else if let Some(id) = &now.show_id {
-            app.actions.push(Action::Open(Page::Show(id.clone())));
-        }
+    if cover_response.clicked()
+        && !over_expand
+        && let Some(album) = &now.song.album
+    {
+        app.actions
+            .push(Action::Open(Page::Album(album.id.clone())));
     }
     if offer_expand && (cover_response.hovered() || over_expand) {
         let expand = ui
@@ -144,7 +143,7 @@ fn now_playing_block(app: &mut App, ui: &mut egui::Ui, region: Rect, now: Option
             app.actions.push(Action::SettingsChanged);
         }
     }
-    let heart_width = if now.is_episode { 0.0 } else { 42.0 };
+    let heart_width = 42.0;
     let text_left = cover_rect.right() + 12.0;
     let text_width = (region.right() - text_left - heart_width).max(40.0);
     let text_rect = Rect::from_min_size(pos2(text_left, cy - 18.0), vec2(text_width, 36.0));
@@ -156,26 +155,31 @@ fn now_playing_block(app: &mut App, ui: &mut egui::Ui, region: Rect, now: Option
     );
     text_ui.set_clip_rect(text_rect.intersect(ui.clip_rect()));
     text_ui.spacing_mut().item_spacing.y = 2.0;
-    let title_response = theme::link(&mut text_ui, &now.title, theme::medium(14.0), palette.text);
-    if title_response.clicked() {
-        if let Some(id) = &now.album_id {
-            app.actions.push(Action::Open(Page::Album(id.clone())));
-        } else if let Some(id) = &now.show_id {
-            app.actions.push(Action::Open(Page::Show(id.clone())));
-        }
+    let title_response = theme::link(
+        &mut text_ui,
+        &now.song.name,
+        theme::medium(14.0),
+        palette.text,
+    );
+    if title_response.clicked()
+        && let Some(album) = &now.song.album
+    {
+        app.actions
+            .push(Action::Open(Page::Album(album.id.clone())));
     }
     text_ui.horizontal_top(|ui| {
-        if now.artists.is_empty() {
-            if theme::link(ui, &now.subtitle, theme::regular(12.0), palette.secondary).clicked()
-                && let Some(id) = &now.show_id
-            {
-                app.actions.push(Action::Open(Page::Show(id.clone())));
-            }
+        if now.song.artists.is_empty() {
+            theme::text(
+                ui,
+                now.song.artist_names(),
+                theme::regular(12.0),
+                palette.secondary,
+            );
         } else {
             super::widgets::artist_links(
                 ui,
                 app,
-                &now.artists,
+                &now.song.artists,
                 theme::regular(12.0),
                 palette.secondary,
             );
@@ -183,29 +187,30 @@ fn now_playing_block(app: &mut App, ui: &mut egui::Ui, region: Rect, now: Option
     });
     // The playing thing answers the same right-click menu as a table row,
     // from the cover, the empty space around the words, or the words.
-    if let Some(item) = app.now_playing_item() {
-        for response in [&cover_response, &info_response, &title_response] {
-            egui::Popup::context_menu(response)
-                .frame(super::widgets::menu_frame(&palette))
-                .show(|ui| super::widgets::item_menu(ui, app, &item, None, None));
-        }
+    let item = crate::api::models::PlayableItem::Track(now.song.clone());
+    for response in [&cover_response, &info_response, &title_response] {
+        egui::Popup::context_menu(response)
+            .frame(super::widgets::menu_frame(&palette))
+            .show(|ui| super::widgets::item_menu(ui, app, &item, None, None));
     }
 
-    if !now.is_episode {
-        let saved = app.is_saved(&now.uri).unwrap_or(false);
+    {
+        let saved = app.is_saved(&now.song.id).unwrap_or(now.song.starred);
         let (icon, color, tooltip) = if saved {
-            (Icon::HeartFilled, palette.accent, "Remove from Liked Songs")
+            (Icon::HeartFilled, palette.accent, "Remove from Favorites")
         } else {
-            (Icon::Heart, palette.secondary, "Save to Liked Songs")
+            (Icon::Heart, palette.secondary, "Add to Favorites")
         };
         // Sit the heart just past the actual text, not at the region's far
         // edge, so it stays visually attached to the title.
         let natural = {
-            let title =
-                ui.painter()
-                    .layout_no_wrap(now.title.clone(), theme::medium(14.0), palette.text);
+            let title = ui.painter().layout_no_wrap(
+                now.song.name.clone(),
+                theme::medium(14.0),
+                palette.text,
+            );
             let subtitle = ui.painter().layout_no_wrap(
-                now.subtitle.clone(),
+                now.song.artist_names(),
                 theme::regular(12.0),
                 palette.secondary,
             );
@@ -219,7 +224,8 @@ fn now_playing_block(app: &mut App, ui: &mut egui::Ui, region: Rect, now: Option
                 .layout(Layout::centered_and_justified(egui::Direction::LeftToRight)),
         );
         if theme::icon_button(&mut heart_ui, icon, 17.0, color, palette.text, tooltip).clicked() {
-            app.actions.push(Action::ToggleSaved(now.uri.clone()));
+            app.actions
+                .push(Action::ToggleFavorite(now.song.id.clone()));
         }
     }
 }
@@ -373,12 +379,9 @@ fn transport(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>, region:
     let row_cy = cy + 31.0;
     let slider_width = (region.width() - 120.0).clamp(120.0, 620.0);
     let (position, duration) = now
-        .map(|now| (now.position_ms, now.duration_ms))
+        .map(|now| (now.position_ms, now.song.duration_ms))
         .unwrap_or((0, 0));
-    let shown_position = match app.seek_preview {
-        Some(fraction) => (fraction * duration as f32) as u32,
-        None => position,
-    };
+    let shown_position = app.seek_preview.unwrap_or(position);
     let time_color = if now.is_some() {
         palette.secondary
     } else {
@@ -413,7 +416,9 @@ fn transport(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>, region:
         palette.accent,
         None,
     ) {
-        SliderEvent::Dragging(value) => app.seek_preview = Some(value),
+        SliderEvent::Dragging(value) => {
+            app.seek_preview = Some((value * duration as f32) as u32);
+        }
         SliderEvent::Committed(value) => {
             app.seek_preview = None;
             if duration > 0 {
@@ -437,11 +442,8 @@ fn extras(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>) {
     ui.spacing_mut().item_spacing.x = 6.0;
     let volume = now
         .map(|now| now.volume_percent)
-        .unwrap_or_else(|| crate::app::volume_to_percent(app.local.volume));
-    let shown = match app.volume_preview {
-        Some(fraction) => (fraction * 100.0).round() as u8,
-        None => volume,
-    };
+        .unwrap_or_else(|| crate::app::volume_to_percent(app.settings.volume));
+    let shown = app.volume_preview.unwrap_or(volume);
     match thin_slider(
         ui,
         &palette,
@@ -452,12 +454,9 @@ fn extras(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>) {
         Some(0.05),
     ) {
         SliderEvent::Dragging(value) => {
-            app.volume_preview = Some(value);
-            // Local volume is cheap to apply continuously; remote goes on release.
-            if now.is_none_or(|now| now.local) {
-                app.actions
-                    .push(Action::PreviewVolume((value * 100.0).round() as u8));
-            }
+            let percent = (value * 100.0).round() as u8;
+            app.volume_preview = Some(percent);
+            app.actions.push(Action::PreviewVolume(percent));
         }
         SliderEvent::Committed(value) => {
             app.volume_preview = None;
@@ -485,25 +484,6 @@ fn extras(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>) {
         app.actions.push(Action::ToggleMute);
     }
     ui.add_space(4.0);
-    let remote = now.is_some_and(|now| !now.local);
-    let devices = theme::icon_button(
-        ui,
-        Icon::Speaker,
-        18.0,
-        if remote {
-            palette.accent
-        } else {
-            palette.secondary
-        },
-        palette.text,
-        "Connect to a device",
-    );
-    ui.ctx().data_mut(|data| {
-        data.insert_temp(egui::Id::new(super::devices::BUTTON_RECT_ID), devices.rect)
-    });
-    if devices.clicked() {
-        app.actions.push(Action::ToggleDevicesPopup);
-    }
     let queue_open = app.show_queue_panel || matches!(app.page(), Page::Queue);
     if theme::icon_button(
         ui,

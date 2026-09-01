@@ -1,23 +1,20 @@
 //! Local play history.
 //!
-//! Spotify does not record playback from librespot clients. Fastpotify stores
-//! local plays and merges them with `/me/player/recently-played`, which covers
-//! other devices. A track counts only after enough listening time, so skips do
-//! not fill the history.
+//! Fastpotify stores plays made by its local player. Navidrome receives
+//! explicit scrobbles separately; keeping this small client-side history makes
+//! the Recents UI immediate and deterministic without pretending the server's
+//! recently played albums are a per-song play log. A song counts only after
+//! enough listening time, so skips do not fill the history.
 
-use std::collections::HashMap;
 use std::path::Path;
 
-use crate::api::models::{Album, Image, PlayHistory, Track};
+use crate::api::models::{PlayHistory, ProfileId, Song};
 
 /// A play counts after 30 seconds, or halfway through a shorter track.
 const COUNTS_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Maximum number of stored local plays.
 const KEPT: usize = 500;
-
-/// Matching plays within this many seconds are treated as duplicates.
-const SAME_PLAY: i64 = 60;
 
 /// When a song has been listened to long enough to count.
 pub fn counts_after(duration_ms: u32) -> std::time::Duration {
@@ -37,11 +34,14 @@ pub struct History {
 
 impl History {
     /// Reads the history, or returns an empty history if the file is unreadable.
-    pub fn load(path: &Path) -> Self {
-        let plays = std::fs::read_to_string(path)
+    pub fn load(path: &Path, profile: &ProfileId) -> Self {
+        let mut plays = std::fs::read_to_string(path)
             .ok()
             .and_then(|text| serde_json::from_str::<Vec<PlayHistory>>(&text).ok())
             .unwrap_or_default();
+        // A copied or manually edited state file must not introduce media
+        // references from another server into the active profile.
+        plays.retain(|play| &play.track.id.profile == profile);
         Self {
             plays,
             dirty: false,
@@ -61,14 +61,15 @@ impl History {
         if !self.dirty {
             return;
         }
-        self.dirty = false;
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         match serde_json::to_string(&self.plays) {
             Ok(text) => {
-                if let Err(error) = std::fs::write(path, text) {
+                if let Err(error) = crate::paths::atomic_write(path, text.as_bytes()) {
                     log::warn!("could not write the play history: {error}");
+                } else {
+                    self.dirty = false;
                 }
             }
             Err(error) => log::warn!("could not write the play history: {error}"),
@@ -76,13 +77,13 @@ impl History {
     }
 
     /// Writes down that `track` was played at `at`, newest first.
-    pub fn record(&mut self, track: Track, at: jiff::Timestamp) {
+    pub fn record(&mut self, track: Song, at: jiff::Timestamp, context: Option<String>) {
         self.plays.insert(
             0,
             PlayHistory {
                 track,
                 played_at: Some(at.to_string()),
-                context: None,
+                context,
             },
         );
         self.plays.truncate(KEPT);
@@ -98,78 +99,21 @@ impl History {
     }
 }
 
-/// Converts the playing track into a history record.
-pub fn played_track(now: &crate::app::NowPlaying) -> Track {
-    Track {
-        id: now.id.clone(),
-        name: now.title.clone(),
-        uri: now.uri.clone(),
-        duration_ms: now.duration_ms,
-        artists: now.artists.clone(),
-        album: Some(Album {
-            id: now.album_id.clone().unwrap_or_default(),
-            name: now.album_name.clone(),
-            images: now
-                .art_url
-                .as_deref()
-                .or(now.art_small.as_deref())
-                .map(|url| {
-                    vec![Image {
-                        url: url.to_string(),
-                        width: None,
-                        height: None,
-                    }]
-                })
-                .unwrap_or_default(),
-            ..Album::default()
-        }),
-        ..Track::default()
-    }
-}
-
-/// Merges local and Spotify history, newest first.
-///
-/// Matching plays within the duplicate window are deduplicated. Entries
-/// without a timestamp sort to the end.
-pub fn merged(local: &[PlayHistory], remote: &[PlayHistory]) -> Vec<PlayHistory> {
-    let mut seen: HashMap<String, Vec<i64>> = HashMap::new();
-    let mut out: Vec<(Option<i64>, PlayHistory)> = Vec::new();
-    for play in local.iter().chain(remote) {
-        let at = play
-            .played_at
-            .as_deref()
-            .and_then(|at| at.parse::<jiff::Timestamp>().ok())
-            .map(|at| at.as_second());
-        if let Some(at) = at {
-            let times = seen.entry(play.track.uri.clone()).or_default();
-            if times.iter().any(|held| (held - at).abs() <= SAME_PLAY) {
-                continue;
-            }
-            times.push(at);
-        }
-        out.push((at, play.clone()));
-    }
-    out.sort_by(|a, b| match (a.0, b.0) {
-        (Some(a), Some(b)) => b.cmp(&a),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => std::cmp::Ordering::Equal,
-    });
-    out.into_iter().map(|(_, play)| play).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::models::{MediaId, MediaKind};
 
-    fn play(uri: &str, at: &str) -> PlayHistory {
-        PlayHistory {
-            track: Track {
-                uri: uri.to_string(),
-                ..Track::default()
-            },
-            played_at: Some(at.to_string()),
-            context: None,
+    fn profile() -> ProfileId {
+        ProfileId::new("0123456789abcdef0123456789abcdef01234567")
+    }
+
+    fn song(id: &str) -> Song {
+        let id = MediaId::new(profile(), MediaKind::Song, id);
+        Song {
+            uri: id.uri(),
+            id,
+            ..Song::default()
         }
     }
 
@@ -198,76 +142,46 @@ mod tests {
         assert_eq!(recorded, 1, "written down once, and it did not panic");
     }
 
-    /// Both sources are sorted together, newest first.
-    #[test]
-    fn the_two_histories_interleave_by_time() {
-        let local = vec![
-            play("spotify:track:here-late", "2026-09-01T15:00:00Z"),
-            play("spotify:track:here-early", "2026-09-01T09:00:00Z"),
-        ];
-        let remote = vec![play("spotify:track:phone", "2026-09-01T12:00:00Z")];
-        let rows = merged(&local, &remote);
-        let uris: Vec<&str> = rows.iter().map(|play| play.track.uri.as_str()).collect();
-        assert_eq!(
-            uris,
-            vec![
-                "spotify:track:here-late",
-                "spotify:track:phone",
-                "spotify:track:here-early"
-            ]
-        );
-    }
-
-    /// Separate plays of the same track remain separate rows.
-    #[test]
-    fn the_same_song_played_twice_is_two_rows() {
-        let local = vec![
-            play("spotify:track:a", "2026-09-01T15:00:00Z"),
-            play("spotify:track:a", "2026-09-01T09:00:00Z"),
-        ];
-        assert_eq!(merged(&local, &[]).len(), 2);
-    }
-
-    /// A play reported by both sources appears once.
-    #[test]
-    fn one_play_seen_twice_is_one_row() {
-        let local = vec![play("spotify:track:a", "2026-09-01T15:00:00Z")];
-        let remote = vec![play("spotify:track:a", "2026-09-01T15:00:20Z")];
-        assert_eq!(merged(&local, &remote).len(), 1, "twenty seconds apart");
-        let distant = vec![play("spotify:track:a", "2026-09-01T15:05:00Z")];
-        assert_eq!(merged(&local, &distant).len(), 2, "five minutes apart");
-    }
-
-    /// A play without a timestamp sorts to the end.
-    #[test]
-    fn a_play_with_no_time_sinks_to_the_end() {
-        let mut timeless = play("spotify:track:timeless", "");
-        timeless.played_at = None;
-        let local = vec![timeless, play("spotify:track:a", "2026-09-01T09:00:00Z")];
-        let rows = merged(&local, &[]);
-        let uris: Vec<&str> = rows.iter().map(|play| play.track.uri.as_str()).collect();
-        assert_eq!(uris, vec!["spotify:track:a", "spotify:track:timeless"]);
-    }
-
     /// The newest play comes first and the list is capped.
     #[test]
     fn the_newest_play_is_first_and_the_list_is_capped() {
         let mut history = History::default();
         let at: jiff::Timestamp = "2026-09-01T09:00:00Z".parse().unwrap();
         for index in 0..KEPT + 10 {
-            history.record(
-                Track {
-                    uri: format!("spotify:track:{index}"),
-                    ..Track::default()
-                },
-                at,
-            );
+            history.record(song(&index.to_string()), at, None);
         }
         assert_eq!(history.plays().len(), KEPT, "the oldest fall off the end");
         assert_eq!(
             history.plays()[0].track.uri,
-            format!("spotify:track:{}", KEPT + 9),
+            song(&(KEPT + 9).to_string()).uri,
             "the newest is first"
         );
+    }
+
+    #[test]
+    fn load_rejects_rows_from_another_server_profile() {
+        let directory = std::env::temp_dir().join(format!(
+            "fastpotify-history-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("history.json");
+        let other = ProfileId::new("fedcba9876543210fedcba9876543210fedcba98");
+        let mut foreign = song("foreign");
+        foreign.id.profile = other;
+        crate::paths::atomic_write(
+            &path,
+            serde_json::to_string(&vec![PlayHistory {
+                track: foreign,
+                played_at: None,
+                context: None,
+            }])
+            .unwrap()
+            .as_bytes(),
+        )
+        .unwrap();
+        assert!(History::load(&path, &profile()).is_empty());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

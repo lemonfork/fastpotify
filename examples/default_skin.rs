@@ -29,10 +29,10 @@ const OUTLINE: Rgb = [0x2a, 0x30, 0x38];
 const TEXT: Rgb = [0xf2, 0xf4, 0xf6];
 const SECONDARY: Rgb = [0xa9, 0xb1, 0xbc];
 const DIM: Rgb = [0x6e, 0x77, 0x84];
-const ACCENT: Rgb = [0x1e, 0xd7, 0x60];
-const ON_ACCENT: Rgb = [0x0a, 0x14, 0x0e];
+const ACCENT: Rgb = [0x5b, 0x8c, 0xff];
+const ON_ACCENT: Rgb = [0x0a, 0x10, 0x20];
 /// Lamps that are off: the accent, nearly out.
-const ACCENT_DARK: Rgb = [0x14, 0x4a, 0x2a];
+const ACCENT_DARK: Rgb = [0x17, 0x2a, 0x5e];
 
 /// The 5x6 bitmap font, drawn four pixels wide with a blank column after
 /// (M, V, and W take the fifth). Rows are separated by `/`; `#` is a pixel.
@@ -792,7 +792,7 @@ fn eq_ex_sheet() -> Canvas {
     c
 }
 
-const PLEDIT_TXT: &str = "[Text]\r\nNormal=#A9B1BC\r\nCurrent=#1ED760\r\nNormalBG=#0F1114\r\nSelectedBG=#2F353F\r\nFont=Inter\r\n";
+const PLEDIT_TXT: &str = "[Text]\r\nNormal=#A9B1BC\r\nCurrent=#5B8CFF\r\nNormalBG=#0F1114\r\nSelectedBG=#2F353F\r\nFont=Inter\r\n";
 
 /// Background, grid, sixteen spectrum bands from the top down, the
 /// oscilloscope's five shades, and the peak marks.

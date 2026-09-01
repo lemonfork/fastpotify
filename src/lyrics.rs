@@ -1,14 +1,15 @@
-//! Lyrics for the playing track, from Spotify or LRCLIB.
+//! Lyrics for the playing song, from OpenSubsonic or LRCLIB.
 //!
 //! [LRCLIB](https://lrclib.net) provides plain and LRC-synced lyrics without an
-//! account or key. Fastpotify tries Spotify's transcription first when the
-//! playback session is signed in, then LRCLIB.
+//! account or key. Fastpotify asks the active server first and uses LRCLIB only
+//! when that server has no lyrics. Cache keys contain only an opaque,
+//! profile-scoped media reference.
 //!
 //! Matching starts with an exact lookup, then ranks search results. Track
 //! length is the strongest signal for distinguishing versions with the same
 //! title.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -16,7 +17,12 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 
+use crate::api::{ApiClient, MediaId, MediaKind};
+
 const API: &str = "https://lrclib.net/api";
+/// Keep a malformed or hostile fallback service from growing the process
+/// without bound. Normal LRCLIB records are tiny compared with this limit.
+const MAX_LRCLIB_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 /// Lyrics do not change; a cached answer is good for this long.
 const CACHE_LIFETIME: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// A candidate this far from the playing track's length is another
@@ -26,6 +32,8 @@ const MAX_DRIFT_SECS: f64 = 30.0;
 /// Track metadata used for lyrics lookup.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Query {
+    /// Profile-scoped song identity; never an authenticated stream URL.
+    pub media: MediaId,
     pub artist: String,
     pub title: String,
     pub album: String,
@@ -62,68 +70,73 @@ impl Lyrics {
     }
 }
 
-/// Parses Spotify's `color-lyrics` response.
-pub fn from_spotify(json: &serde_json::Value) -> Option<Lyrics> {
-    let lyrics = json.get("lyrics")?;
-    let synced = lyrics.get("syncType").and_then(|value| value.as_str()) == Some("LINE_SYNCED");
-    let lines: Vec<Line> = lyrics
-        .get("lines")?
-        .as_array()?
-        .iter()
-        .filter_map(|line| {
-            let text = line.get("words")?.as_str()?.trim();
-            if text.is_empty() || text == "\u{266a}" {
-                return None;
-            }
-            let at_ms = line
-                .get("startTimeMs")
-                .and_then(|value| {
-                    value
-                        .as_str()
-                        .and_then(|text| text.parse().ok())
-                        .or_else(|| value.as_u64().and_then(|n| u32::try_from(n).ok()))
-                })
-                .filter(|_| synced);
-            Some(Line {
-                at_ms,
-                text: text.to_string(),
-            })
-        })
-        .collect();
-    if lines.is_empty() {
-        return None;
-    }
-    let synced = synced && lines.iter().all(|line| line.at_ms.is_some());
-    Some(Lyrics {
-        lines,
-        synced,
-        instrumental: false,
-    })
-}
-
-/// The cached answer at `path`, while it is fresh.
-pub fn cached(path: &Path) -> Option<Option<Lyrics>> {
-    read_cache(&path.to_path_buf())
-}
-
-/// Remember an answer at `path`, `None` included.
-pub fn store(path: &Path, found: &Option<Lyrics>) {
-    write_cache(path, found);
-}
-
-/// Fetches lyrics for `query`, using the disk cache when available.
+/// Fetches lyrics for `query`, using the active OpenSubsonic profile first and
+/// the disk cache or LRCLIB fallback when necessary.
 pub async fn fetch(
+    client: &ApiClient,
     http: &reqwest::Client,
     cache_dir: &Path,
     query: &Query,
 ) -> Result<Option<Lyrics>> {
+    anyhow::ensure!(
+        query.media.profile == *client.profile_id()
+            && query.media.kind == MediaKind::Song
+            && crate::media::is_media_ref(&query.media.uri()),
+        "lyrics reference does not belong to the active song profile"
+    );
     let cache_path = cache_dir.join(format!("{}.json", cache_key(query)));
     if let Some(cached) = read_cache(&cache_path) {
         return Ok(cached);
     }
-    let found = lookup(http, query).await?;
-    write_cache(&cache_path, &found);
-    Ok(found)
+
+    let server = client
+        .lyrics(optional(&query.artist), optional(&query.title))
+        .await;
+    if let Ok(answer) = &server
+        && let Some(found) = from_server_text(&answer.text)
+    {
+        let found = Some(found);
+        write_cache(&cache_path, &found);
+        return Ok(found);
+    }
+
+    let fallback = lookup(http, query).await?;
+    // Do not turn a transient server failure into a month-long negative
+    // cache entry. A positive fallback is still safe to retain.
+    if server.is_ok() || fallback.is_some() {
+        write_cache(&cache_path, &fallback);
+    }
+    Ok(fallback)
+}
+
+fn optional(value: &str) -> Option<&str> {
+    (!value.trim().is_empty()).then_some(value.trim())
+}
+
+fn from_server_text(text: &str) -> Option<Lyrics> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let synced = parse_lrc(text);
+    if !synced.is_empty() {
+        return Some(Lyrics {
+            lines: synced,
+            synced: true,
+            instrumental: false,
+        });
+    }
+    Some(Lyrics {
+        lines: text
+            .lines()
+            .map(|line| Line {
+                at_ms: None,
+                text: line.trim_end().to_owned(),
+            })
+            .collect(),
+        synced: false,
+        instrumental: false,
+    })
 }
 
 async fn lookup(http: &reqwest::Client, query: &Query) -> Result<Option<Lyrics>> {
@@ -182,12 +195,45 @@ async fn get<T: DeserializeOwned>(
     if !status.is_success() {
         anyhow::bail!("LRCLIB answered {status}");
     }
-    Ok(Some(
+    ensure_declared_size(response.content_length())?;
+    let mut response = response;
+    let mut body = Vec::with_capacity(
         response
-            .json()
-            .await
-            .context("unexpected answer from LRCLIB")?,
+            .content_length()
+            .unwrap_or_default()
+            .min(MAX_LRCLIB_RESPONSE_BYTES as u64) as usize,
+    );
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("cannot read the answer from LRCLIB")?
+    {
+        extend_bounded(&mut body, &chunk)?;
+    }
+    Ok(Some(
+        serde_json::from_slice(&body).context("unexpected answer from LRCLIB")?,
     ))
+}
+
+fn extend_bounded(body: &mut Vec<u8>, chunk: &[u8]) -> Result<()> {
+    let length = body
+        .len()
+        .checked_add(chunk.len())
+        .context("LRCLIB answer size overflow")?;
+    anyhow::ensure!(
+        length <= MAX_LRCLIB_RESPONSE_BYTES,
+        "LRCLIB answer exceeds the size limit"
+    );
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
+fn ensure_declared_size(length: Option<u64>) -> Result<()> {
+    anyhow::ensure!(
+        length.is_none_or(|length| length <= MAX_LRCLIB_RESPONSE_BYTES as u64),
+        "LRCLIB answer exceeds the size limit"
+    );
+    Ok(())
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -556,17 +602,11 @@ struct Cached {
 }
 
 fn cache_key(query: &Query) -> String {
-    let digest = Sha1::digest(
-        format!(
-            "{}|{}|{}|{}",
-            query.artist, query.title, query.album, query.duration_ms
-        )
-        .as_bytes(),
-    );
+    let digest = Sha1::digest(query.media.uri().as_bytes());
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn read_cache(path: &PathBuf) -> Option<Option<Lyrics>> {
+fn read_cache(path: &Path) -> Option<Option<Lyrics>> {
     let modified = std::fs::metadata(path).ok()?.modified().ok()?;
     if modified.elapsed().unwrap_or(CACHE_LIFETIME) >= CACHE_LIFETIME {
         return None;
@@ -584,13 +624,33 @@ fn write_cache(path: &Path, found: &Option<Lyrics>) {
     if let Ok(text) = serde_json::to_string(&Cached {
         found: found.clone(),
     }) {
-        let _ = std::fs::write(path, text);
+        let _ = crate::paths::atomic_write(path, text.as_bytes());
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn media(profile: &str, id: &str) -> MediaId {
+        MediaId::new(crate::auth::ProfileId::new(profile), MediaKind::Song, id)
+    }
+
+    #[test]
+    fn lrclib_response_body_has_declared_and_chunked_size_boundaries() {
+        ensure_declared_size(None).unwrap();
+        ensure_declared_size(Some(MAX_LRCLIB_RESPONSE_BYTES as u64)).unwrap();
+        assert!(ensure_declared_size(Some(MAX_LRCLIB_RESPONSE_BYTES as u64 + 1)).is_err());
+
+        let mut body = Vec::new();
+        let first_chunk = vec![b'x'; MAX_LRCLIB_RESPONSE_BYTES / 2];
+        let second_chunk = vec![b'x'; MAX_LRCLIB_RESPONSE_BYTES / 2];
+        extend_bounded(&mut body, &first_chunk).unwrap();
+        extend_bounded(&mut body, &second_chunk).unwrap();
+        assert_eq!(body.len(), MAX_LRCLIB_RESPONSE_BYTES);
+        assert!(extend_bounded(&mut body, b"x").is_err());
+        assert_eq!(body.len(), MAX_LRCLIB_RESPONSE_BYTES);
+    }
 
     #[test]
     fn titles_lose_what_a_database_leaves_out() {
@@ -638,6 +698,7 @@ mod tests {
     #[test]
     fn the_closest_length_wins_and_synced_breaks_ties() {
         let query = Query {
+            media: media("0123456789abcdef0123456789abcdef01234567", "song-id"),
             artist: "Artist".into(),
             title: "Song".into(),
             album: String::new(),
@@ -700,5 +761,91 @@ mod tests {
         assert_eq!(plain.lines.len(), 1);
         let nothing = Record::default();
         assert!(nothing.lyrics().is_none());
+    }
+
+    #[test]
+    fn server_text_supports_plain_and_lrc_without_a_supplier_parser() {
+        let plain = from_server_text("first\nsecond").unwrap();
+        assert!(!plain.synced);
+        assert_eq!(plain.lines[1].text, "second");
+
+        let synced = from_server_text("[00:01.00]first\n[00:02.50]second").unwrap();
+        assert!(synced.synced);
+        assert_eq!(synced.lines[1].at_ms, Some(2_500));
+        assert!(from_server_text("  ").is_none());
+    }
+
+    #[test]
+    fn lyric_cache_keys_are_profile_scoped_and_secret_free() {
+        let query = |profile| Query {
+            media: media(profile, "same raw id"),
+            artist: "Artist".into(),
+            title: "Song".into(),
+            album: "Album".into(),
+            duration_ms: 180_000,
+        };
+        let first = query("0123456789abcdef0123456789abcdef01234567");
+        let second = query("fedcba9876543210fedcba9876543210fedcba98");
+        assert_ne!(cache_key(&first), cache_key(&second));
+        assert_eq!(cache_key(&first).len(), 40);
+        assert!(!cache_key(&first).contains("same raw id"));
+    }
+
+    #[test]
+    fn fetch_rejects_lyrics_from_another_profile_before_any_network_lookup() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let credentials =
+            crate::auth::Credentials::new("https://music.example.test", "alice", "secret").unwrap();
+        let client = ApiClient::with_default_activity(credentials).unwrap();
+        let http = reqwest::Client::new();
+        let cache_dir = std::env::temp_dir().join(format!(
+            "fastpotify-lyrics-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let query = Query {
+            media: media("fedcba9876543210fedcba9876543210fedcba98", "song"),
+            artist: "Artist".into(),
+            title: "Song".into(),
+            album: String::new(),
+            duration_ms: 180_000,
+        };
+        let error = runtime
+            .block_on(fetch(&client, &http, &cache_dir, &query))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("active song profile"));
+    }
+
+    #[test]
+    fn fetch_rejects_non_song_media_references() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let credentials =
+            crate::auth::Credentials::new("https://music.example.test", "alice", "secret").unwrap();
+        let client = ApiClient::with_default_activity(credentials).unwrap();
+        let http = reqwest::Client::new();
+        let cache_dir = std::env::temp_dir().join(format!(
+            "fastpotify-lyrics-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let query = Query {
+            media: MediaId::new(client.profile_id().clone(), MediaKind::Album, "album"),
+            artist: "Artist".into(),
+            title: "Song".into(),
+            album: String::new(),
+            duration_ms: 180_000,
+        };
+        let error = runtime
+            .block_on(fetch(&client, &http, &cache_dir, &query))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("active song profile"));
     }
 }

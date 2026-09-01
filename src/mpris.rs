@@ -16,7 +16,7 @@ use crate::media::{MediaCommand, MediaState, MediaTrack};
 use crate::player::{Playback, RepeatMode};
 
 const PLAYING_POSITION_INTERVAL: Duration = Duration::from_millis(1000);
-const TRACK_OBJECT_PATH_PREFIX: &str = "/me/paolino/Fastpotify/Track/";
+const TRACK_OBJECT_PATH_PREFIX: &str = "/me/paolino/Fastpotify/Track/r_";
 
 enum Update {
     State(MediaState),
@@ -121,7 +121,7 @@ async fn run(
         .can_go_next(true)
         .can_go_previous(true)
         .can_seek(true)
-        .supported_uri_schemes(vec!["spotify".to_string()])
+        .supported_uri_schemes(vec!["fastpotify".to_string()])
         .build()
         .await?;
 
@@ -165,9 +165,9 @@ async fn run(
     {
         let send = send.clone();
         player.connect_set_position(move |_, track_id, position| {
-            if let Some(uri) = uri_from_object_path(track_id.as_str()) {
+            if let Some(media_ref) = media_ref_from_object_path(track_id.as_str()) {
                 send(MediaCommand::SetPosition {
-                    track_uri: uri,
+                    track_uri: media_ref,
                     position_ms: position.as_millis().max(0) as u32,
                 });
             }
@@ -193,7 +193,11 @@ async fn run(
     }
     {
         let send = send.clone();
-        player.connect_open_uri(move |_, uri| send(MediaCommand::OpenUri(uri.to_string())));
+        player.connect_open_uri(move |_, uri| {
+            if crate::media::is_media_ref(uri) {
+                send(MediaCommand::OpenUri(uri.to_string()));
+            }
+        });
     }
     {
         let send = send.clone();
@@ -267,10 +271,12 @@ fn metadata(track: Option<&MediaTrack>) -> Metadata {
     };
     let mut builder = Metadata::builder()
         .title(track.title.clone())
-        .length(Time::from_millis(track.duration_ms as i64))
-        .url(track.uri.clone());
-    if let Some(track_id) = object_path_for(&track.uri) {
-        builder = builder.trackid(track_id);
+        .length(Time::from_millis(track.duration_ms as i64));
+    if let Some(media_ref) = publishable_media_ref(&track.uri) {
+        builder = builder.url(media_ref);
+        if let Some(track_id) = object_path_for(&track.uri) {
+            builder = builder.trackid(track_id);
+        }
     }
     if !track.artists.is_empty() {
         builder = builder.artist(track.artists.clone());
@@ -278,33 +284,52 @@ fn metadata(track: Option<&MediaTrack>) -> Metadata {
     if !track.album.is_empty() {
         builder = builder.album(track.album.clone());
     }
-    if let Some(art) = &track.art_url {
-        builder = builder.art_url(art.clone());
-    }
+    // `fastpotify-art:` is an internal opaque reference, not a URL desktop
+    // clients can dereference. Authenticated cover URLs must never leave the
+    // Navidrome client, so omit mpris:artUrl until a verified cached file URI
+    // is available.
     builder.build()
 }
 
-fn object_path_for(uri: &str) -> Option<TrackId> {
-    let id: String = uri
-        .rsplit(':')
-        .next()
-        .unwrap_or("track")
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-        .collect();
-    let id = if id.is_empty() {
-        "track".to_string()
-    } else {
-        id
-    };
-    let kind = crate::util::uri_kind(uri).unwrap_or("track");
-    TrackId::try_from(format!("{TRACK_OBJECT_PATH_PREFIX}{kind}_{id}")).ok()
+fn publishable_media_ref(value: &str) -> Option<String> {
+    crate::media::is_media_ref(value).then(|| value.to_owned())
 }
 
-fn uri_from_object_path(path: &str) -> Option<String> {
-    let rest = path.strip_prefix(TRACK_OBJECT_PATH_PREFIX)?;
-    let (kind, id) = rest.split_once('_')?;
-    Some(format!("spotify:{kind}:{id}"))
+/// MPRIS track IDs are D-Bus object paths rather than arbitrary strings. Hex
+/// encodes the complete opaque reference into one reversible path component;
+/// no provider URI is inferred when a SetPosition call comes back.
+fn object_path_for(media_ref: &str) -> Option<TrackId> {
+    if !crate::media::is_media_ref(media_ref) {
+        return None;
+    }
+    let mut encoded = String::with_capacity(media_ref.len() * 2);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in media_ref.bytes() {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    TrackId::try_from(format!("{TRACK_OBJECT_PATH_PREFIX}{encoded}")).ok()
+}
+
+fn media_ref_from_object_path(path: &str) -> Option<String> {
+    let encoded = path.strip_prefix(TRACK_OBJECT_PATH_PREFIX)?;
+    if encoded.is_empty() || encoded.len() % 2 != 0 {
+        return None;
+    }
+    let mut decoded = Vec::with_capacity(encoded.len() / 2);
+    for pair in encoded.as_bytes().chunks_exact(2) {
+        decoded.push(hex_nibble(pair[0])? << 4 | hex_nibble(pair[1])?);
+    }
+    let media_ref = String::from_utf8(decoded).ok()?;
+    crate::media::is_media_ref(&media_ref).then_some(media_ref)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
 }
 
 /// The desktop entry's name: inside a Flatpak the entry is exported under
@@ -320,13 +345,47 @@ fn desktop_entry() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::models::{ArtworkRef, MediaId, MediaKind, ProfileId};
+
+    fn profile() -> ProfileId {
+        ProfileId::new("0123456789abcdef0123456789abcdef01234567")
+    }
 
     #[test]
-    fn object_paths_round_trip() {
-        let path = object_path_for("spotify:track:14XWXWv5FoCbFzLksawpEe").unwrap();
+    fn opaque_object_paths_round_trip_without_reconstructing_a_provider_uri() {
+        let media_ref = MediaId::new(profile(), MediaKind::Song, "opaque:/? 音乐").uri();
+        let path = object_path_for(&media_ref).unwrap();
         assert_eq!(
-            uri_from_object_path(path.as_str()).as_deref(),
-            Some("spotify:track:14XWXWv5FoCbFzLksawpEe")
+            media_ref_from_object_path(path.as_str()).as_deref(),
+            Some(media_ref.as_str())
         );
+    }
+
+    #[test]
+    fn legacy_provider_uris_and_malformed_paths_are_rejected() {
+        assert!(object_path_for("legacy:track:old-id").is_none());
+        assert!(media_ref_from_object_path(TRACK_OBJECT_PATH_PREFIX).is_none());
+        assert!(
+            media_ref_from_object_path(&format!("{TRACK_OBJECT_PATH_PREFIX}not_hex")).is_none()
+        );
+    }
+
+    #[test]
+    fn only_secret_free_media_references_are_publishable_as_metadata_urls() {
+        let media_ref = MediaId::new(profile(), MediaKind::Song, "track-1").uri();
+        let art_ref = ArtworkRef::new(profile(), "cover-1").uri();
+        assert_eq!(
+            publishable_media_ref(&media_ref).as_deref(),
+            Some(media_ref.as_str())
+        );
+        let metadata = metadata(Some(&MediaTrack {
+            uri: media_ref,
+            art_url: Some(art_ref),
+            ..MediaTrack::default()
+        }));
+        assert!(metadata.art_url().is_none());
+
+        let stream = "https://music.example/rest/stream?id=1&u=user&t=secret";
+        assert!(publishable_media_ref(stream).is_none());
     }
 }

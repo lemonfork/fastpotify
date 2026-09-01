@@ -5,12 +5,13 @@ These instructions add implementation constraints for coding agents.
 
 ## Product boundaries
 
-- Keep Fastpotify a small native Spotify client. Do not add a browser engine,
-  telemetry, a hosted backend, or alternate sources for Spotify audio.
-- Playback capabilities come from librespot. Do not advertise or implement a
-  capability merely because its name appears in a protobuf or enum. In
-  particular, do not pursue Spotify Lossless or DRM circumvention unless
-  lawful support first lands upstream.
+- Keep Fastpotify a small native Navidrome/OpenSubsonic client. Do not add a
+  browser engine, telemetry, a hosted Fastpotify backend, or audio sources
+  outside the signed-in server.
+- Playback capabilities come from the server's OpenSubsonic `stream` endpoint
+  and the local decoder. Do not advertise gapless playback, normalization, or
+  a codec merely because a server or decoder names it; add only capabilities
+  the complete pipeline implements and tests.
 - Do not broaden a task into adjacent features or a general refactor. Preserve
   existing user behaviour unless the task explicitly changes it.
 
@@ -29,23 +30,22 @@ These instructions add implementation constraints for coding agents.
   the dependency when the reason is not obvious.
 
 Read `docs/_reference/how-it-connects.md` before changing authentication,
-Spotify requests, Connect, credential storage, or network behaviour. Read
-`docs/_reference/queue.md` before touching the queue: its rules are the
-contract, and the queue tests in `src/app.rs` enforce them. Read the
-nearby module tests before changing a state machine or API fallback.
+OpenSubsonic requests, streaming, credential storage, or network behaviour.
+Read `docs/_reference/queue.md` before touching the queue: its rules are the
+contract, and the queue tests in `src/player.rs` enforce them. Read the nearby
+module tests before changing a state machine or API fallback.
 
-The interface is optimistic, always. A control shows its result the
-moment it is used: a double-clicked song is the playing song, Next pops
-the queue's head, an added song has its row. The backend then makes it
-true and Spotify's state catches up behind; an answer that still tells
-the story from before the user's action is stale, so hold the shown
-state and ask again rather than let the lagging answer undo what the
-user just did. Nothing the user did may ever flicker away and come back.
+The interface is optimistic, always. A control shows its result the moment it
+is used: a double-clicked song is the playing song, Next pops the queue's head,
+and a newly starred song has its state. The local player owns playback and the
+queue; the server catches up for library and playlist mutations. A stale
+answer must never undo what the listener just did or make it flicker away and
+back.
 
-Every visualiser, the spectrum analyser, the oscilloscope, and MilkDrop,
-shows the signal post-equalizer and pre-volume: the EQ shapes what is
-heard so the picture follows it, and the volume knob never moves the
-picture. Zero volume still dances.
+Every visualiser—including the spectrum analyser and the oscilloscope—shows
+the signal post-equalizer and pre-volume: the EQ shapes what is heard so the
+picture follows it, and the volume knob never moves the picture. Zero volume
+still dances.
 
 ## Branches
 

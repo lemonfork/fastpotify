@@ -4,12 +4,12 @@
 //! from -12 to +12 dB. The UI writes settings behind a mutex; the player reads
 //! them once per packet and rebuilds filters only after changes.
 //!
-//! This stage does not clip boosted samples. `vis::Tapped` limits the signal
-//! later, after accounting for output volume.
+//! This stage does not clip boosted samples. [`crate::vis::PcmProcessor`]
+//! limits the signal later, after accounting for output volume.
 
 use std::sync::{Arc, Mutex};
 
-use librespot_playback::{NUM_CHANNELS, SAMPLE_RATE};
+use crate::sink::{PCM_CHANNELS, PCM_SAMPLE_RATE};
 
 /// The centre frequencies, Winamp's, in hertz.
 pub const BANDS: [f32; 10] = [
@@ -361,7 +361,7 @@ impl Biquad {
     /// times too narrow, which is what rippled the treble.
     fn peaking(hz: f64, width: f64, gain_db: f64) -> Self {
         let a = 10f64.powf(gain_db / 40.0);
-        let w0 = std::f64::consts::TAU * hz / f64::from(SAMPLE_RATE);
+        let w0 = std::f64::consts::TAU * hz / f64::from(PCM_SAMPLE_RATE);
         let (sin, cos) = w0.sin_cos();
         let alpha = sin * ((std::f64::consts::LN_2 / 2.0) * width * w0 / sin).sinh();
         let a0 = 1.0 + alpha / a;
@@ -379,7 +379,7 @@ impl Biquad {
     /// function on the unit circle: what is played, including the bend
     /// the bilinear transform puts near the top of the band.
     fn gain_db_at(&self, hz: f64) -> f64 {
-        let w = std::f64::consts::TAU * hz / f64::from(SAMPLE_RATE);
+        let w = std::f64::consts::TAU * hz / f64::from(PCM_SAMPLE_RATE);
         let (sin1, cos1) = w.sin_cos();
         let (sin2, cos2) = (2.0 * w).sin_cos();
         let numerator = (self.b0 + self.b1 * cos1 + self.b2 * cos2).powi(2)
@@ -416,7 +416,7 @@ impl Processor {
         let mut processor = Self {
             shared,
             applied: EqSettings::default(),
-            chains: vec![Vec::new(); NUM_CHANNELS as usize],
+            chains: vec![Vec::new(); PCM_CHANNELS],
             gain: 1.0,
         };
         processor.rebuild();
@@ -426,7 +426,7 @@ impl Processor {
     fn rebuild(&mut self) {
         let settings = self.applied;
         self.gain = 10f64.powf(f64::from(settings.preamp_db) / 20.0);
-        self.chains = vec![chain(&settings.bands_db); NUM_CHANNELS as usize];
+        self.chains = vec![chain(&settings.bands_db); PCM_CHANNELS];
     }
 
     /// Runs interleaved stereo samples through the equalizer, in place.
@@ -467,7 +467,7 @@ impl Processor {
                 // the one ceiling in the chain sits at the end, past the
                 // volume: a boost that would clip at full volume is fine
                 // three notches down, and holding it back here would take
-                // that away for good. See `vis::Tapped`.
+                // that away for good. See `vis::PcmProcessor`.
                 *sample *= gain;
             }
         }
@@ -481,7 +481,7 @@ mod tests {
     fn tone(hz: f32, frames: usize) -> Vec<f64> {
         (0..frames)
             .flat_map(|i| {
-                let t = i as f64 / f64::from(SAMPLE_RATE);
+                let t = i as f64 / f64::from(PCM_SAMPLE_RATE);
                 let sample = 0.25 * (std::f64::consts::TAU * f64::from(hz) * t).sin();
                 [sample, sample]
             })

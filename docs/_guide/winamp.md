@@ -45,7 +45,7 @@ playlist and equalizer have their own shade buttons.
 The left display shows the spectrum analyser. Click it to switch to the
 oscilloscope, then off. You can also use the **V** menu. The visualiser uses
 local audio after the equalizer and before volume, so it still moves at zero
-volume. It stays flat when another device is playing.
+volume.
 
 ## Playlist
 
@@ -53,17 +53,17 @@ volume. It stays flat when another device is playing.
 by the queue. Double-click a song to play it, Ctrl-click to select several, and
 drag the lower-right corner to resize the window. Use X or **PL** to close it.
 
-- **ADD** opens search or Liked Songs.
+- **ADD** opens search or Favorites.
 - **SEL** selects rows.
 - **MISC** opens song, artist, and album pages.
 - **LIST OPTS** starts one of your playlists or saves the queue as a new one.
 - **REM → Remove all** clears your queued songs when this computer is playing.
 
-Spotify does not let third-party apps remove one song from the queue. Notices
-from the main window scroll through the mini player's text display.
+Removing one occurrence from the local queue is supported. Notices from the
+main window scroll through the mini player's text display.
 
 ## Equalizer
 
-**EQ** opens the ten-band equalizer. It affects playback on this computer, not
-other Spotify Connect devices. The preamp ranges from -12 to 12 dB. **AUTO**
-resets all bands. The same controls and presets are in Settings.
+**EQ** opens the ten-band equalizer. It affects local playback. The preamp
+ranges from -12 to 12 dB. **AUTO** resets all bands. The same controls and
+presets are in Settings.

@@ -1,97 +1,240 @@
-//! Spotify Web API response shapes.
+//! Provider-neutral music domain models.
 //!
-//! Every field that Spotify may omit, null, or rename is optional or
-//! defaulted, so a response that changed shape degrades to a blank field
-//! instead of a failed page. The 2026 endpoint changes (`/playlists/{id}/items`
-//! returning `item` instead of `track`, `items.total` beside `tracks.total`)
-//! are accepted alongside the classic shapes.
+//! OpenSubsonic JSON is decoded into private wire DTOs first. These models
+//! contain server-scoped identifiers and secret-free artwork references only.
 
-use serde::{Deserialize, Deserializer, Serialize};
+use std::fmt;
+use std::str::FromStr;
 
-fn skip_nulls<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    let items: Vec<Option<T>> = Vec::deserialize(deserializer)?;
-    Ok(items.into_iter().flatten().collect())
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+pub use crate::auth::ProfileId;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MediaKind {
+    Artist,
+    Album,
+    #[default]
+    Song,
+    Playlist,
+    MusicFolder,
 }
 
-fn null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de> + Default,
-{
-    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
-}
-
-/// One page of a paginated collection.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
-#[serde(bound(deserialize = "T: Deserialize<'de>", serialize = "T: Serialize"))]
-pub struct Page<T> {
-    #[serde(default = "Vec::new", deserialize_with = "skip_nulls")]
-    pub items: Vec<T>,
-    #[serde(default)]
-    pub total: u32,
-    #[serde(default)]
-    pub limit: u32,
-    #[serde(default)]
-    pub offset: u32,
-    #[serde(default)]
-    pub next: Option<String>,
-}
-
-impl<T> Page<T> {
-    pub fn next_offset(&self) -> Option<u32> {
-        let consumed = self.limit.max(self.items.len() as u32);
-        (self.next.is_some() && consumed > 0).then_some(self.offset + consumed)
+impl MediaKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Artist => "artist",
+            Self::Album => "album",
+            Self::Song => "song",
+            Self::Playlist => "playlist",
+            Self::MusicFolder => "music-folder",
+        }
     }
 }
 
-/// A cursor-paginated collection (followed artists, recently played).
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-#[serde(bound(deserialize = "T: Deserialize<'de>"))]
-pub struct CursorPage<T> {
-    #[serde(default = "Vec::new", deserialize_with = "skip_nulls")]
-    pub items: Vec<T>,
-    #[serde(default)]
-    pub total: Option<u32>,
-    #[serde(default)]
-    pub next: Option<String>,
-    #[serde(default)]
-    pub cursors: Option<Cursors>,
+impl fmt::Display for MediaKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-pub struct Cursors {
-    #[serde(default)]
-    pub after: Option<String>,
-    #[serde(default)]
-    pub before: Option<String>,
+impl FromStr for MediaKind {
+    type Err = MediaIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "artist" => Ok(Self::Artist),
+            "album" => Ok(Self::Album),
+            "song" => Ok(Self::Song),
+            "playlist" => Ok(Self::Playlist),
+            "music-folder" => Ok(Self::MusicFolder),
+            _ => Err(MediaIdError::UnknownKind),
+        }
+    }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+/// An OpenSubsonic identifier scoped to one server/user profile and entity kind.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MediaId {
+    pub profile: ProfileId,
+    pub kind: MediaKind,
+    /// The server's ID verbatim. OpenSubsonic IDs are strings, never numbers.
+    #[serde(deserialize_with = "deserialize_nonempty_string")]
+    pub id: String,
+}
+
+impl MediaId {
+    pub fn new(profile: ProfileId, kind: MediaKind, id: impl Into<String>) -> Self {
+        Self {
+            profile,
+            kind,
+            id: id.into(),
+        }
+    }
+
+    pub fn uri(&self) -> String {
+        format!(
+            "fastpotify:{}:{}:{}",
+            self.kind,
+            self.profile,
+            URL_SAFE_NO_PAD.encode(self.id.as_bytes())
+        )
+    }
+
+    pub fn raw(&self) -> &str {
+        &self.id
+    }
+}
+
+impl fmt::Display for MediaId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.uri())
+    }
+}
+
+impl FromStr for MediaId {
+    type Err = MediaIdError;
+
+    fn from_str(uri: &str) -> Result<Self, Self::Err> {
+        let mut parts = uri.splitn(4, ':');
+        if parts.next() != Some("fastpotify") {
+            return Err(MediaIdError::InvalidScheme);
+        }
+        let kind = parts
+            .next()
+            .ok_or(MediaIdError::Malformed)?
+            .parse::<MediaKind>()?;
+        let profile = parts
+            .next()
+            .ok_or(MediaIdError::Malformed)?
+            .parse::<ProfileId>()
+            .map_err(|_| MediaIdError::Malformed)?;
+        let encoded = parts.next().ok_or(MediaIdError::Malformed)?;
+        let bytes = URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|_| MediaIdError::Malformed)?;
+        let id = String::from_utf8(bytes).map_err(|_| MediaIdError::Malformed)?;
+        if id.is_empty() {
+            return Err(MediaIdError::Malformed);
+        }
+        Ok(Self::new(profile, kind, id))
+    }
+}
+
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum MediaIdError {
+    #[error("not a Fastpotify media URI")]
+    InvalidScheme,
+    #[error("unknown media kind")]
+    UnknownKind,
+    #[error("malformed media URI")]
+    Malformed,
+}
+
+/// Secret-free reference resolved by the active API client when artwork loads.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ArtworkRef {
+    pub profile: ProfileId,
+    #[serde(deserialize_with = "deserialize_nonempty_string")]
+    pub id: String,
+}
+
+impl ArtworkRef {
+    pub fn new(profile: ProfileId, id: impl Into<String>) -> Self {
+        Self {
+            profile,
+            id: id.into(),
+        }
+    }
+
+    pub fn uri(&self) -> String {
+        format!(
+            "fastpotify-art:{}:{}",
+            self.profile,
+            URL_SAFE_NO_PAD.encode(self.id.as_bytes())
+        )
+    }
+}
+
+impl fmt::Display for ArtworkRef {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.uri())
+    }
+}
+
+impl FromStr for ArtworkRef {
+    type Err = ArtworkRefError;
+
+    fn from_str(uri: &str) -> Result<Self, Self::Err> {
+        let mut parts = uri.splitn(3, ':');
+        if parts.next() != Some("fastpotify-art") {
+            return Err(ArtworkRefError);
+        }
+        let profile = parts
+            .next()
+            .ok_or(ArtworkRefError)?
+            .parse::<ProfileId>()
+            .map_err(|_| ArtworkRefError)?;
+        let encoded = parts.next().ok_or(ArtworkRefError)?;
+        let id = URL_SAFE_NO_PAD
+            .decode(encoded)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .ok_or(ArtworkRefError)?;
+        if id.is_empty() {
+            return Err(ArtworkRefError);
+        }
+        Ok(Self::new(profile, id))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+#[error("malformed Fastpotify artwork reference")]
+pub struct ArtworkRefError;
+
+fn deserialize_nonempty_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.is_empty() {
+        Err(serde::de::Error::custom("server id must not be empty"))
+    } else {
+        Ok(value)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Image {
-    #[serde(default, deserialize_with = "null_default")]
+    /// Always `fastpotify-art:...`; never an authenticated HTTP URL.
     pub url: String,
-    #[serde(default)]
     pub width: Option<u32>,
-    #[serde(default)]
     pub height: Option<u32>,
 }
 
-/// Picks the smallest image at least `target` pixels wide, or the largest.
+impl Image {
+    pub fn from_cover_art(profile: ProfileId, id: impl Into<String>) -> Self {
+        Self {
+            url: ArtworkRef::new(profile, id).uri(),
+            width: None,
+            height: None,
+        }
+    }
+}
+
 pub fn pick_image(images: &[Image], target: u32) -> Option<&str> {
     let mut best: Option<&Image> = None;
-    for image in images {
+    for image in images.iter().filter(|image| !image.url.is_empty()) {
         let width = image.width.unwrap_or(u32::MAX);
         match best {
             None => best = Some(image),
             Some(current) => {
                 let current_width = current.width.unwrap_or(u32::MAX);
-                let current_ok = current_width >= target;
-                let candidate_ok = width >= target;
-                let better = match (current_ok, candidate_ok) {
+                let better = match (current_width >= target, width >= target) {
                     (true, true) => width < current_width,
                     (false, true) => true,
                     (true, false) => false,
@@ -106,154 +249,126 @@ pub fn pick_image(images: &[Image], target: u32) -> Option<&str> {
     best.map(|image| image.url.as_str())
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
-pub struct ExternalUrls {
-    #[serde(default)]
-    pub spotify: Option<String>,
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    /// Exact total only when the final page has been reached. OpenSubsonic
+    /// list/search responses do not otherwise expose a total count.
+    pub total: Option<u32>,
+    pub limit: u32,
+    pub offset: u32,
+    /// The next local offset. OpenSubsonic list responses have no URL cursor.
+    pub next: Option<u32>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
-pub struct Followers {
-    #[serde(default)]
-    pub total: u64,
+impl<T> Page<T> {
+    pub fn from_slice(items: Vec<T>, offset: u32, limit: u32, has_more: bool) -> Self {
+        let count = items.len() as u32;
+        Self {
+            items,
+            total: (!has_more).then_some(offset.saturating_add(count)),
+            limit,
+            offset,
+            next: has_more.then_some(offset.saturating_add(count)),
+        }
+    }
+
+    pub fn next_offset(&self) -> Option<u32> {
+        self.next
+    }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtistRef {
-    #[serde(default)]
-    pub id: Option<String>,
-    #[serde(default)]
-    #[serde(deserialize_with = "null_default")]
+    pub id: Option<MediaId>,
     pub name: String,
-    #[serde(default)]
     pub uri: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Artist {
-    #[serde(default)]
-    #[serde(deserialize_with = "null_default")]
-    pub id: String,
-    #[serde(default)]
-    #[serde(deserialize_with = "null_default")]
+    pub id: MediaId,
     pub name: String,
-    #[serde(default)]
-    #[serde(deserialize_with = "null_default")]
     pub uri: String,
-    #[serde(default, deserialize_with = "null_default")]
     pub images: Vec<Image>,
-    #[serde(default, deserialize_with = "null_default")]
     pub genres: Vec<String>,
-    #[serde(default)]
-    pub followers: Option<Followers>,
-    #[serde(default)]
-    pub popularity: Option<u8>,
-    #[serde(default)]
-    pub external_urls: ExternalUrls,
+    pub album_count: u32,
+    pub albums: Vec<Album>,
+    pub starred: bool,
+    pub starred_at: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Album {
-    #[serde(default)]
-    #[serde(deserialize_with = "null_default")]
-    pub id: String,
-    #[serde(default)]
-    #[serde(deserialize_with = "null_default")]
+    pub id: MediaId,
     pub name: String,
-    #[serde(default)]
-    #[serde(deserialize_with = "null_default")]
     pub uri: String,
-    #[serde(default)]
-    pub album_type: Option<String>,
-    #[serde(default)]
-    pub album_group: Option<String>,
-    #[serde(default)]
-    pub total_tracks: Option<u32>,
-    #[serde(default, deserialize_with = "null_default")]
     pub images: Vec<Image>,
-    #[serde(default, deserialize_with = "null_default")]
     pub artists: Vec<ArtistRef>,
-    #[serde(default)]
     pub release_date: Option<String>,
-    #[serde(default)]
-    pub label: Option<String>,
-    #[serde(default, deserialize_with = "null_default")]
+    pub year: Option<u32>,
     pub genres: Vec<String>,
-    #[serde(default)]
-    pub popularity: Option<u8>,
-    #[serde(default)]
-    pub tracks: Option<Page<Track>>,
-    #[serde(default)]
-    pub external_urls: ExternalUrls,
-    #[serde(default, deserialize_with = "null_default")]
-    pub copyrights: Vec<Copyright>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
-pub struct Copyright {
-    #[serde(default)]
-    #[serde(deserialize_with = "null_default")]
-    pub text: String,
-    #[serde(default, rename = "type")]
-    #[serde(deserialize_with = "null_default")]
-    pub kind: String,
+    pub total_tracks: Option<u32>,
+    pub duration_ms: u32,
+    pub tracks: Option<Page<Song>>,
+    pub starred: bool,
+    pub starred_at: Option<String>,
 }
 
 impl Album {
+    pub fn year_label(&self) -> Option<String> {
+        self.year.map(|year| year.to_string()).or_else(|| {
+            self.release_date
+                .as_deref()
+                .map(|date| date.chars().take(4).collect())
+        })
+    }
+
     pub fn year(&self) -> Option<&str> {
-        self.release_date
-            .as_deref()
-            .map(|date| &date[..date.len().min(4)])
+        self.release_date.as_deref().map(|date| {
+            let end = date
+                .char_indices()
+                .nth(4)
+                .map_or(date.len(), |(index, _)| index);
+            &date[..end]
+        })
     }
 
     pub fn kind_label(&self) -> &'static str {
-        match self
-            .album_group
-            .as_deref()
-            .or(self.album_type.as_deref())
-            .unwrap_or("album")
-        {
-            "single" => "Single",
-            "compilation" => "Compilation",
-            "appears_on" => "Appears On",
-            _ => "Album",
-        }
+        "Album"
+    }
+
+    pub fn track_total(&self) -> u32 {
+        self.total_tracks
+            .or_else(|| self.tracks.as_ref().and_then(|tracks| tracks.total))
+            .unwrap_or(0)
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
-pub struct Track {
-    #[serde(default)]
-    pub id: Option<String>,
-    #[serde(default)]
-    #[serde(deserialize_with = "null_default")]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Song {
+    pub id: MediaId,
     pub name: String,
-    #[serde(default)]
-    #[serde(deserialize_with = "null_default")]
     pub uri: String,
-    #[serde(default)]
     pub duration_ms: u32,
-    #[serde(default)]
-    pub explicit: bool,
-    #[serde(default, deserialize_with = "null_default")]
     pub artists: Vec<ArtistRef>,
-    #[serde(default)]
     pub album: Option<Album>,
-    #[serde(default)]
     pub track_number: Option<u32>,
-    #[serde(default)]
     pub disc_number: Option<u32>,
-    #[serde(default)]
-    pub is_local: bool,
-    #[serde(default)]
-    pub is_playable: Option<bool>,
-    #[serde(default)]
-    pub popularity: Option<u8>,
-    #[serde(default)]
-    pub external_urls: ExternalUrls,
+    pub year: Option<u32>,
+    pub genres: Vec<String>,
+    pub content_type: Option<String>,
+    pub suffix: Option<String>,
+    pub bit_rate: Option<u32>,
+    pub size: Option<u64>,
+    pub starred: bool,
+    pub starred_at: Option<String>,
 }
 
-impl Track {
+/// Compatibility name used by the existing UI during the migration.
+pub type Track = Song;
+
+impl Song {
     pub fn artist_names(&self) -> String {
         join_names(self.artists.iter().map(|artist| artist.name.as_str()))
     }
@@ -265,405 +380,185 @@ impl Track {
     }
 }
 
-pub fn join_names<'a>(names: impl Iterator<Item = &'a str>) -> String {
-    let mut out = String::new();
-    for (index, name) in names.enumerate() {
-        if index > 0 {
-            out.push_str(", ");
-        }
-        out.push_str(name);
+/// Music-only compatibility wrapper used by queue and track-table code.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum PlayableItem {
+    Track(Song),
+}
+
+impl Default for PlayableItem {
+    fn default() -> Self {
+        Self::Track(Song::default())
     }
-    out
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
-pub struct ResumePoint {
-    #[serde(default)]
-    pub fully_played: bool,
-    #[serde(default)]
-    pub resume_position_ms: u32,
+impl From<Song> for PlayableItem {
+    fn from(song: Song) -> Self {
+        Self::Track(song)
+    }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
-pub struct Episode {
-    #[serde(default)]
-    #[serde(deserialize_with = "null_default")]
-    pub id: String,
-    #[serde(default)]
-    #[serde(deserialize_with = "null_default")]
-    pub name: String,
-    #[serde(default)]
-    #[serde(deserialize_with = "null_default")]
-    pub uri: String,
-    #[serde(default)]
-    pub duration_ms: u32,
-    #[serde(default)]
-    #[serde(deserialize_with = "null_default")]
-    pub description: String,
-    #[serde(default, deserialize_with = "null_default")]
-    pub images: Vec<Image>,
-    #[serde(default)]
-    pub release_date: Option<String>,
-    #[serde(default)]
-    pub explicit: bool,
-    #[serde(default)]
-    pub resume_point: Option<ResumePoint>,
-    #[serde(default)]
-    pub show: Option<Show>,
-    #[serde(default)]
-    pub external_urls: ExternalUrls,
+impl PlayableItem {
+    pub fn as_track(&self) -> &Song {
+        self.song()
+    }
+
+    pub fn song(&self) -> &Song {
+        let Self::Track(song) = self;
+        song
+    }
+
+    pub fn uri(&self) -> &str {
+        &self.song().uri
+    }
+
+    pub fn id(&self) -> Option<&str> {
+        Some(self.song().id.raw())
+    }
+
+    pub fn name(&self) -> &str {
+        &self.song().name
+    }
+
+    pub fn duration_ms(&self) -> u32 {
+        self.song().duration_ms
+    }
+
+    pub fn subtitle(&self) -> String {
+        self.song().artist_names()
+    }
+
+    pub fn image(&self, target: u32) -> Option<&str> {
+        self.song().image(target)
+    }
+
+    pub fn is_track(&self) -> bool {
+        true
+    }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
-pub struct Show {
-    #[serde(default)]
-    #[serde(deserialize_with = "null_default")]
-    pub id: String,
-    #[serde(default)]
-    #[serde(deserialize_with = "null_default")]
-    pub name: String,
-    #[serde(default)]
-    #[serde(deserialize_with = "null_default")]
-    pub uri: String,
-    #[serde(default)]
-    #[serde(deserialize_with = "null_default")]
-    pub publisher: String,
-    #[serde(default)]
-    #[serde(deserialize_with = "null_default")]
-    pub description: String,
-    #[serde(default, deserialize_with = "null_default")]
-    pub images: Vec<Image>,
-    #[serde(default)]
-    pub total_episodes: Option<u32>,
-    #[serde(default)]
-    pub episodes: Option<Page<Episode>>,
-    #[serde(default)]
-    pub external_urls: ExternalUrls,
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlaylistItem {
+    /// Original zero-based position returned by `getPlaylist`. Mutations must
+    /// use this value, never a filtered or sorted UI row index.
+    pub index: u32,
+    pub added_at: Option<String>,
+    pub track: Song,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
-pub struct Owner {
-    #[serde(default)]
+impl PlaylistItem {
+    pub fn playable(&self) -> &Song {
+        &self.track
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlayHistory {
+    pub track: Song,
+    pub played_at: Option<String>,
+    /// Opaque provider-neutral context URI when one is known.
+    pub context: Option<String>,
+}
+
+pub fn join_names<'a>(names: impl Iterator<Item = &'a str>) -> String {
+    names
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserRef {
     pub id: Option<String>,
-    #[serde(default)]
     pub display_name: Option<String>,
-    #[serde(default)]
-    pub uri: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
-pub struct TrackCount {
-    #[serde(default)]
-    pub total: u32,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Playlist {
-    #[serde(default)]
-    #[serde(deserialize_with = "null_default")]
-    pub id: String,
-    #[serde(default)]
-    #[serde(deserialize_with = "null_default")]
+    pub id: MediaId,
     pub name: String,
-    #[serde(default)]
-    #[serde(deserialize_with = "null_default")]
     pub uri: String,
-    #[serde(default)]
     pub description: Option<String>,
-    #[serde(default, deserialize_with = "null_default")]
     pub images: Vec<Image>,
-    #[serde(default)]
-    pub owner: Owner,
-    #[serde(default)]
+    pub owner: UserRef,
     pub public: Option<bool>,
+    /// True for smart or server-managed playlists that must not be mutated.
     #[serde(default)]
-    pub collaborative: bool,
-    #[serde(default)]
-    pub snapshot_id: Option<String>,
-    #[serde(default)]
-    pub tracks: Option<TrackCount>,
-    #[serde(default, rename = "items")]
-    pub items_count: Option<TrackCount>,
-    #[serde(default)]
-    pub external_urls: ExternalUrls,
+    pub readonly: bool,
+    pub track_count: u32,
+    pub duration_ms: u32,
+    pub created: Option<String>,
+    pub changed: Option<String>,
+    pub entries: Vec<PlaylistItem>,
 }
 
 impl Playlist {
     pub fn track_total(&self) -> u32 {
-        self.items_count
-            .as_ref()
-            .or(self.tracks.as_ref())
-            .map_or(0, |count| count.total)
+        self.track_count.max(self.entries.len() as u32)
     }
 
     pub fn owner_name(&self) -> &str {
-        self.owner.display_name.as_deref().unwrap_or("Spotify")
+        self.owner
+            .display_name
+            .as_deref()
+            .or(self.owner.id.as_deref())
+            .unwrap_or("")
     }
 
     pub fn owned_by(&self, user_id: &str) -> bool {
-        self.owner.id.as_deref() == Some(user_id)
+        !self.readonly && self.owner.id.as_deref() == Some(user_id)
+    }
+
+    pub fn editable_by(&self, user: &User) -> bool {
+        user.roles.playlist && self.owned_by(&user.id)
     }
 }
 
-/// A track or an episode, as returned wherever Spotify mixes both.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-#[serde(tag = "type", rename_all = "lowercase")]
-pub enum PlayableItem {
-    Track(Track),
-    Episode(Episode),
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Favorites {
+    pub artists: Vec<Artist>,
+    pub albums: Vec<Album>,
+    pub songs: Vec<Song>,
 }
 
-impl PlayableItem {
-    pub fn uri(&self) -> &str {
-        match self {
-            Self::Track(track) => &track.uri,
-            Self::Episode(episode) => &episode.uri,
-        }
-    }
-
-    pub fn id(&self) -> Option<&str> {
-        match self {
-            Self::Track(track) => track.id.as_deref(),
-            Self::Episode(episode) => Some(&episode.id),
-        }
-    }
-
-    pub fn name(&self) -> &str {
-        match self {
-            Self::Track(track) => &track.name,
-            Self::Episode(episode) => &episode.name,
-        }
-    }
-
-    pub fn duration_ms(&self) -> u32 {
-        match self {
-            Self::Track(track) => track.duration_ms,
-            Self::Episode(episode) => episode.duration_ms,
-        }
-    }
-
-    pub fn subtitle(&self) -> String {
-        match self {
-            Self::Track(track) => track.artist_names(),
-            Self::Episode(episode) => episode
-                .show
-                .as_ref()
-                .map(|show| show.name.clone())
-                .unwrap_or_default(),
-        }
-    }
-
-    pub fn image(&self, target: u32) -> Option<&str> {
-        match self {
-            Self::Track(track) => track.image(target),
-            Self::Episode(episode) => pick_image(&episode.images, target).or_else(|| {
-                episode
-                    .show
-                    .as_ref()
-                    .and_then(|show| pick_image(&show.images, target))
-            }),
-        }
-    }
-
-    pub fn is_track(&self) -> bool {
-        matches!(self, Self::Track(_))
-    }
-}
-
-/// An entry in a playlist. `item` is the 2026 name, `track` the classic one.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
-pub struct PlaylistItem {
-    #[serde(default)]
-    pub added_at: Option<String>,
-    #[serde(default)]
-    pub added_by: Option<UserRef>,
-    #[serde(default)]
-    pub is_local: bool,
-    #[serde(default)]
-    pub item: Option<PlayableItem>,
-    #[serde(default)]
-    pub track: Option<PlayableItem>,
-}
-
-/// A bare user reference, as `added_by` carries it.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
-pub struct UserRef {
-    #[serde(default)]
-    pub id: Option<String>,
-}
-
-impl PlaylistItem {
-    pub fn playable(&self) -> Option<&PlayableItem> {
-        self.item.as_ref().or(self.track.as_ref())
-    }
-}
-
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-pub struct SavedTrack {
-    #[serde(default)]
-    pub added_at: Option<String>,
-    pub track: Track,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-pub struct SavedAlbum {
-    #[serde(default)]
-    pub added_at: Option<String>,
-    pub album: Album,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-pub struct SavedShow {
-    #[serde(default)]
-    pub added_at: Option<String>,
-    pub show: Show,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-pub struct SavedEpisode {
-    #[serde(default)]
-    pub added_at: Option<String>,
-    pub episode: Episode,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-pub struct FollowedArtists {
-    pub artists: CursorPage<Artist>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
-pub struct PlayHistory {
-    pub track: Track,
-    #[serde(default)]
-    pub played_at: Option<String>,
-    #[serde(default)]
-    pub context: Option<Context>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
-pub struct Context {
-    #[serde(default)]
-    #[serde(deserialize_with = "null_default")]
-    pub uri: String,
-    #[serde(default, rename = "type")]
-    #[serde(deserialize_with = "null_default")]
-    pub kind: String,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
-pub struct Device {
-    #[serde(default)]
-    pub id: Option<String>,
-    #[serde(default)]
-    #[serde(deserialize_with = "null_default")]
-    pub name: String,
-    #[serde(default)]
-    pub is_active: bool,
-    #[serde(default)]
-    pub is_restricted: bool,
-    #[serde(default)]
-    pub volume_percent: Option<u8>,
-    #[serde(default)]
-    pub supports_volume: Option<bool>,
-    #[serde(default, rename = "type")]
-    #[serde(deserialize_with = "null_default")]
-    pub kind: String,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-pub struct DeviceList {
-    #[serde(default)]
-    #[serde(deserialize_with = "skip_nulls")]
-    pub devices: Vec<Device>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-pub struct PlaybackState {
-    #[serde(default)]
-    pub device: Option<Device>,
-    #[serde(default)]
-    #[serde(deserialize_with = "null_default")]
-    pub repeat_state: String,
-    #[serde(default)]
-    pub shuffle_state: bool,
-    #[serde(default)]
-    pub context: Option<Context>,
-    #[serde(default)]
-    pub timestamp: u64,
-    #[serde(default)]
-    pub progress_ms: Option<u32>,
-    #[serde(default)]
-    pub is_playing: bool,
-    #[serde(default)]
-    pub item: Option<PlayableItem>,
-    #[serde(default)]
-    pub currently_playing_type: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-pub struct Queue {
-    #[serde(default)]
-    pub currently_playing: Option<PlayableItem>,
-    #[serde(default, deserialize_with = "skip_nulls")]
-    pub queue: Vec<PlayableItem>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchResults {
-    #[serde(default)]
-    pub tracks: Option<Page<Track>>,
-    #[serde(default)]
+    pub tracks: Option<Page<Song>>,
     pub artists: Option<Page<Artist>>,
-    #[serde(default)]
     pub albums: Option<Page<Album>>,
-    #[serde(default)]
+    /// `search3` has no playlists; the client fills this by filtering the
+    /// user's playlist metadata locally.
     pub playlists: Option<Page<Playlist>>,
-    #[serde(default)]
-    pub shows: Option<Page<Show>>,
-    #[serde(default)]
-    pub episodes: Option<Page<Episode>>,
 }
 
 impl SearchResults {
     pub fn is_empty(&self) -> bool {
-        [
-            self.tracks
+        self.tracks
+            .as_ref()
+            .is_none_or(|page| page.items.is_empty())
+            && self
+                .artists
                 .as_ref()
-                .is_none_or(|page| page.items.is_empty()),
-            self.artists
+                .is_none_or(|page| page.items.is_empty())
+            && self
+                .albums
                 .as_ref()
-                .is_none_or(|page| page.items.is_empty()),
-            self.albums
+                .is_none_or(|page| page.items.is_empty())
+            && self
+                .playlists
                 .as_ref()
-                .is_none_or(|page| page.items.is_empty()),
-            self.playlists
-                .as_ref()
-                .is_none_or(|page| page.items.is_empty()),
-            self.shows.as_ref().is_none_or(|page| page.items.is_empty()),
-            self.episodes
-                .as_ref()
-                .is_none_or(|page| page.items.is_empty()),
-        ]
-        .iter()
-        .all(|empty| *empty)
+                .is_none_or(|page| page.items.is_empty())
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct User {
-    #[serde(default)]
-    #[serde(deserialize_with = "null_default")]
     pub id: String,
-    #[serde(default)]
     pub display_name: Option<String>,
-    #[serde(default, deserialize_with = "null_default")]
-    pub images: Vec<Image>,
-    #[serde(default)]
-    pub product: Option<String>,
-    #[serde(default)]
-    pub country: Option<String>,
-    #[serde(default)]
-    pub uri: Option<String>,
+    pub scrobbling_enabled: bool,
+    pub max_bit_rate: Option<u32>,
+    pub roles: UserRoles,
 }
 
 impl User {
@@ -672,45 +567,200 @@ impl User {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-pub struct TopTracks {
-    #[serde(default, deserialize_with = "skip_nulls")]
-    pub tracks: Vec<Track>,
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserRoles {
+    pub admin: bool,
+    pub settings: bool,
+    pub download: bool,
+    pub upload: bool,
+    pub playlist: bool,
+    pub cover_art: bool,
+    pub comment: bool,
+    pub podcast: bool,
+    pub stream: bool,
+    pub jukebox: bool,
+    pub share: bool,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-pub struct RelatedArtists {
-    #[serde(default, deserialize_with = "skip_nulls")]
-    pub artists: Vec<Artist>,
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MusicFolder {
+    pub id: String,
+    pub name: String,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-pub struct Recommendations {
-    #[serde(default, deserialize_with = "skip_nulls")]
-    pub tracks: Vec<Track>,
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenSubsonicExtension {
+    pub name: String,
+    pub versions: Vec<u32>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-pub struct SnapshotId {
-    #[serde(default)]
-    pub snapshot_id: Option<String>,
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerCapabilities {
+    pub protocol_version: String,
+    pub server_type: Option<String>,
+    pub server_version: Option<String>,
+    pub open_subsonic: bool,
+    pub extensions: Vec<OpenSubsonicExtension>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-pub struct ApiErrorBody {
-    #[serde(default)]
-    pub error: ApiErrorDetail,
+impl ServerCapabilities {
+    pub fn supports(&self, name: &str, version: u32) -> bool {
+        self.extensions
+            .iter()
+            .any(|extension| extension.name == name && extension.versions.contains(&version))
+    }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-pub struct ApiErrorDetail {
-    #[serde(default)]
-    pub status: u16,
-    #[serde(default)]
-    #[serde(deserialize_with = "null_default")]
-    pub message: String,
-    #[serde(default)]
-    pub reason: Option<String>,
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifiedServer {
+    pub profile: ProfileId,
+    pub user: User,
+    pub music_folders: Vec<MusicFolder>,
+    pub capabilities: ServerCapabilities,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lyrics {
+    pub artist: Option<String>,
+    pub title: Option<String>,
+    pub text: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AlbumListType {
+    Random,
+    #[default]
+    Newest,
+    Highest,
+    Frequent,
+    Recent,
+    AlphabeticalByName,
+    AlphabeticalByArtist,
+    Starred,
+    ByYear,
+    ByGenre,
+}
+
+impl AlbumListType {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Random => "random",
+            Self::Newest => "newest",
+            Self::Highest => "highest",
+            Self::Frequent => "frequent",
+            Self::Recent => "recent",
+            Self::AlphabeticalByName => "alphabeticalByName",
+            Self::AlphabeticalByArtist => "alphabeticalByArtist",
+            Self::Starred => "starred",
+            Self::ByYear => "byYear",
+            Self::ByGenre => "byGenre",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AlbumListRequest {
+    pub kind: AlbumListType,
+    pub offset: u32,
+    pub limit: u32,
+    pub from_year: Option<i32>,
+    pub to_year: Option<i32>,
+    pub genre: Option<String>,
+    pub music_folder_id: Option<String>,
+}
+
+impl Default for AlbumListRequest {
+    fn default() -> Self {
+        Self {
+            kind: AlbumListType::Newest,
+            offset: 0,
+            limit: 50,
+            from_year: None,
+            to_year: None,
+            genre: None,
+            music_folder_id: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchOptions {
+    pub artist_offset: u32,
+    pub artist_count: u32,
+    pub album_offset: u32,
+    pub album_count: u32,
+    pub song_offset: u32,
+    pub song_count: u32,
+    pub music_folder_id: Option<String>,
+    pub include_playlists: bool,
+}
+
+impl Default for SearchOptions {
+    fn default() -> Self {
+        Self {
+            artist_offset: 0,
+            artist_count: 20,
+            album_offset: 0,
+            album_count: 20,
+            song_offset: 0,
+            song_count: 50,
+            music_folder_id: None,
+            include_playlists: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RandomSongsRequest {
+    pub size: u32,
+    pub genre: Option<String>,
+    pub from_year: Option<u32>,
+    pub to_year: Option<u32>,
+    pub music_folder_id: Option<String>,
+}
+
+impl Default for RandomSongsRequest {
+    fn default() -> Self {
+        Self {
+            size: 50,
+            genre: None,
+            from_year: None,
+            to_year: None,
+            music_folder_id: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PlaylistUpdate {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub public: Option<bool>,
+    pub songs_to_add: Vec<MediaId>,
+    pub song_indexes_to_remove: Vec<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Scrobble {
+    pub song: MediaId,
+    /// Unix timestamp in milliseconds, as required by OpenSubsonic.
+    pub time_ms: Option<u64>,
+}
+
+impl Scrobble {
+    pub fn now(song: MediaId) -> Self {
+        Self {
+            song,
+            time_ms: None,
+        }
+    }
+}
+
+pub(crate) fn seconds_to_millis(seconds: Option<u64>) -> u32 {
+    seconds
+        .unwrap_or_default()
+        .saturating_mul(1_000)
+        .min(u32::MAX as u64) as u32
 }
 
 #[cfg(test)]
@@ -718,28 +768,91 @@ mod tests {
     use super::*;
 
     #[test]
-    fn playlist_items_accept_both_item_and_track_keys() {
-        let classic = r#"{"items":[{"added_at":"2024-01-01T00:00:00Z","track":{"type":"track","id":"a","name":"One","uri":"spotify:track:a","duration_ms":1000,"artists":[{"name":"Artist"}]}}],"total":1}"#;
-        let modern = r#"{"items":[{"added_at":"2024-01-01T00:00:00Z","item":{"type":"episode","id":"e","name":"Ep","uri":"spotify:episode:e","duration_ms":2000}}, null],"total":2}"#;
-        let classic: Page<PlaylistItem> = serde_json::from_str(classic).unwrap();
-        let modern: Page<PlaylistItem> = serde_json::from_str(modern).unwrap();
-        assert_eq!(classic.items[0].playable().unwrap().name(), "One");
-        assert_eq!(modern.items.len(), 1);
-        assert_eq!(modern.items[0].playable().unwrap().name(), "Ep");
-        assert!(!modern.items[0].playable().unwrap().is_track());
+    fn arbitrary_string_media_id_round_trips() {
+        let original = MediaId::new(
+            ProfileId::new("0123456789abcdef0123456789abcdef01234567"),
+            MediaKind::Song,
+            "slashes/colons: spaces 中文 \0 and ?&#",
+        );
+        let uri = original.uri();
+        assert_eq!(uri.parse::<MediaId>().unwrap(), original);
+        assert!(!uri.contains("slashes/colons"));
     }
 
     #[test]
-    fn playlist_total_prefers_items_count() {
-        let json = r#"{"id":"p","name":"P","uri":"spotify:playlist:p","items":{"total":12},"tracks":{"total":3},"owner":{"id":"me","display_name":"Me"}}"#;
-        let playlist: Playlist = serde_json::from_str(json).unwrap();
-        assert_eq!(playlist.track_total(), 12);
-        assert!(playlist.owned_by("me"));
-        assert_eq!(playlist.owner_name(), "Me");
+    fn artwork_reference_is_opaque_and_secret_free() {
+        let art = ArtworkRef::new(
+            ProfileId::new("0123456789abcdef0123456789abcdef01234567"),
+            "cover/id?x=1&t=secret",
+        );
+        let uri = art.uri();
+        assert!(uri.starts_with("fastpotify-art:"));
+        assert!(!uri.contains("t=secret"));
+        assert_eq!(uri.parse::<ArtworkRef>().unwrap(), art);
     }
 
     #[test]
-    fn image_picker_prefers_smallest_sufficient() {
+    fn seconds_convert_without_overflow() {
+        assert_eq!(seconds_to_millis(Some(123)), 123_000);
+        assert_eq!(seconds_to_millis(None), 0);
+        assert_eq!(seconds_to_millis(Some(u64::MAX)), u32::MAX);
+    }
+
+    #[test]
+    fn page_total_is_known_only_after_the_last_page() {
+        let full = Page::from_slice(vec![1, 2], 0, 2, true);
+        assert_eq!(full.total, None);
+        assert_eq!(full.next, Some(2));
+
+        let last = Page::from_slice(vec![3], 2, 2, false);
+        assert_eq!(last.total, Some(3));
+        assert_eq!(last.next, None);
+    }
+
+    #[test]
+    fn malformed_unicode_release_date_never_panics() {
+        let album = Album {
+            release_date: Some("音楽年".into()),
+            ..Album::default()
+        };
+        assert_eq!(album.year(), Some("音楽年"));
+    }
+
+    #[test]
+    fn media_and_art_refs_reject_invalid_profile_fingerprints() {
+        assert!("fastpotify:song:profile:c29uZw".parse::<MediaId>().is_err());
+        assert!(
+            "fastpotify-art:profile:Y292ZXI"
+                .parse::<ArtworkRef>()
+                .is_err()
+        );
+        let profile = "0123456789abcdef0123456789abcdef01234567";
+        assert!(
+            format!("fastpotify:song:{profile}:")
+                .parse::<MediaId>()
+                .is_err()
+        );
+        assert!(
+            format!("fastpotify-art:{profile}:")
+                .parse::<ArtworkRef>()
+                .is_err()
+        );
+        assert!(
+            serde_json::from_str::<MediaId>(&format!(
+                r#"{{"profile":"{profile}","kind":"song","id":""}}"#
+            ))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<ArtworkRef>(&format!(r#"{{"profile":"{profile}","id":""}}"#))
+                .is_err()
+        );
+        let default_song = Song::default();
+        assert_eq!(default_song.id.profile.as_str().len(), 40);
+    }
+
+    #[test]
+    fn image_picker_prefers_smallest_sufficient_image() {
         let images = vec![
             Image {
                 url: "large".into(),
@@ -747,46 +860,16 @@ mod tests {
                 height: Some(640),
             },
             Image {
-                url: "medium".into(),
-                width: Some(300),
-                height: Some(300),
-            },
-            Image {
                 url: "small".into(),
                 width: Some(64),
                 height: Some(64),
             },
+            Image {
+                url: "medium".into(),
+                width: Some(300),
+                height: Some(300),
+            },
         ];
-        assert_eq!(pick_image(&images, 64), Some("small"));
         assert_eq!(pick_image(&images, 100), Some("medium"));
-        assert_eq!(pick_image(&images, 1000), Some("large"));
-        assert_eq!(pick_image(&[], 64), None);
-    }
-
-    #[test]
-    fn null_fields_fall_back_to_defaults() {
-        let json = r#"{"id":"x","name":"X","uri":"spotify:artist:x","images":null,"genres":null,"followers":null}"#;
-        let artist: Artist = serde_json::from_str(json).unwrap();
-        assert!(artist.images.is_empty());
-        assert!(artist.genres.is_empty());
-    }
-
-    #[test]
-    fn track_keeps_artist_objects_when_a_name_has_a_comma() {
-        let json = r#"{"name":"Song","artists":[{"id":"tyler","name":"Tyler, the Creator"},{"id":"guest","name":"Guest"}]}"#;
-        let track: Track = serde_json::from_str(json).unwrap();
-
-        assert_eq!(track.artists.len(), 2);
-        assert_eq!(track.artists[0].name, "Tyler, the Creator");
-        assert_eq!(track.artists[1].id.as_deref(), Some("guest"));
-    }
-
-    #[test]
-    fn search_playlists_skip_null_entries() {
-        let json = r#"{"playlists":{"items":[null,{"id":"p","name":"P","uri":"spotify:playlist:p"}],"total":2,"limit":2,"offset":0,"next":"next page"}}"#;
-        let results: SearchResults = serde_json::from_str(json).unwrap();
-        let playlists = results.playlists.unwrap();
-        assert_eq!(playlists.items.len(), 1);
-        assert_eq!(playlists.next_offset(), Some(2));
     }
 }

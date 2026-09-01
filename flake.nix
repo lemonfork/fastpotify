@@ -1,5 +1,5 @@
 {
-  description = "Spotify, native and fast";
+  description = "Native Navidrome and OpenSubsonic music client";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -46,10 +46,6 @@
               (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
               rust-analyzer
               pkg-config
-              # libprojectM (MilkDrop) is built from source by CMake, and its
-              # bindings by bindgen, which needs libclang.
-              cmake
-              rustPlatform.bindgenHook
             ]
             ++ lib.optionals stdenv.hostPlatform.isDarwin [
               apple-sdk
@@ -115,10 +111,6 @@
               with pkgs;
               [
                 pkg-config
-                # libprojectM (MilkDrop) is built from source by CMake, and
-                # its bindings by bindgen, which needs libclang.
-                cmake
-                rustPlatform.bindgenHook
               ]
               ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ makeWrapper ];
             buildInputs =
@@ -127,7 +119,6 @@
                 [
                   alsa-lib
                   libpulseaudio
-                  # libprojectM links OpenGL directly.
                   libGL
                 ]
               )
@@ -147,7 +138,7 @@
             '';
 
             meta = {
-              description = "Fast native Spotify client with local playback and Spotify Connect";
+              description = "Fast native Navidrome and OpenSubsonic client with local playback";
               homepage = "https://fastpotify.rocks";
               license = pkgs.lib.licenses.mit;
               mainProgram = "fastpotify";

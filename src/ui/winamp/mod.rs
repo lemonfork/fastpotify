@@ -417,7 +417,7 @@ fn full_window(
     time_display(app, view, now, time);
     let vis_moving = visualiser(app, view, now);
     marquee(app, view, now);
-    rates(app, view, now);
+    rates(view, now);
     sliders(app, view, now);
     windows_buttons(app, view);
     transport(app, view, now);
@@ -532,13 +532,10 @@ fn shade_bar(
     }
     let playing = now.is_some_and(|now| now.playing);
     if let Some(now) = now.filter(|now| !stopped(Some(now))) {
-        let position = match app.seek_preview {
-            Some(fraction) => (fraction * now.duration_ms as f32) as u32,
-            None => now.position_ms,
-        };
-        let remaining = app.winamp.time_remaining && now.duration_ms > 0;
+        let position = app.seek_preview.unwrap_or(now.position_ms);
+        let remaining = app.winamp.time_remaining && now.song.duration_ms > 0;
         let shown = if remaining {
-            now.duration_ms.saturating_sub(position)
+            now.song.duration_ms.saturating_sub(position)
         } else {
             position
         };
@@ -588,23 +585,23 @@ fn shade_bar(
 
     // The little seek bar.
     view.sprite(sprites::SHADE_POSITION_TRACK, layout::SHADE_POSITION);
-    let Some(now) = now.filter(|now| now.duration_ms > 0 && !stopped(Some(now))) else {
+    let Some(now) = now.filter(|now| now.song.duration_ms > 0 && !stopped(Some(now))) else {
         return;
     };
     let (response, event) = view.slider(layout::SHADE_POSITION, "shade-position", 3);
     match event {
-        SliderEvent::Dragging(value) => app.seek_preview = Some(value),
+        SliderEvent::Dragging(value) => {
+            app.seek_preview = Some((value * now.song.duration_ms as f32) as u32);
+        }
         SliderEvent::Committed(value) => {
             app.seek_preview = None;
             app.actions
-                .push(Action::Seek((value * now.duration_ms as f32) as u32));
+                .push(Action::Seek((value * now.song.duration_ms as f32) as u32));
         }
         SliderEvent::None => {}
     }
-    let fraction = app
-        .seek_preview
-        .unwrap_or(now.position_ms as f32 / now.duration_ms as f32)
-        .clamp(0.0, 1.0);
+    let shown_position = app.seek_preview.unwrap_or(now.position_ms);
+    let fraction = (shown_position as f32 / now.song.duration_ms as f32).clamp(0.0, 1.0);
     let travel = layout::SHADE_POSITION.width - 3;
     let thumb = if response.dragged() {
         sprites::SHADE_POSITION_THUMB_RIGHT
@@ -712,14 +709,6 @@ fn options_menu(app: &mut App, ui: &mut Ui, unit: f32) {
     let mut on_top = app.settings.winamp_on_top;
     if ui.checkbox(&mut on_top, "Always on top").clicked() {
         app.actions.push(Action::ToggleWinampOnTop);
-    }
-    let mut milkdrop = app.settings.milkdrop_open;
-    if ui
-        .checkbox(&mut milkdrop, "MilkDrop")
-        .on_hover_text(super::keys::MILKDROP_SHORTCUT)
-        .clicked()
-    {
-        app.actions.push(Action::ToggleWinampMilkdrop);
     }
     if ui.button("Choose a skin").clicked() {
         app.actions.push(Action::Open(Page::Settings));
@@ -851,10 +840,9 @@ fn clutter_bar(app: &mut App, view: &mut View, now: Option<&NowPlaying>) {
         .clicked()
         && let Some(now) = now
     {
-        if let Some(id) = &now.album_id {
-            app.actions.push(Action::Open(Page::Album(id.clone())));
-        } else if let Some(id) = &now.show_id {
-            app.actions.push(Action::Open(Page::Show(id.clone())));
+        if let Some(album) = &now.song.album {
+            app.actions
+                .push(Action::Open(Page::Album(album.id.clone())));
         }
         app.actions.push(Action::ToggleWinampWindow);
     }
@@ -878,13 +866,13 @@ fn clutter_bar(app: &mut App, view: &mut View, now: Option<&NowPlaying>) {
         };
         app.actions.push(Action::SetSkinScale(next as u8));
     }
-    // V opened Winamp's visualisation menu; this one has the display's
-    // three looks and MilkDrop.
+    // V opened Winamp's visualisation menu; this one has the display's three
+    // looks.
     let vis = view
         .lamp_button(
             layout::CLUTTER_V,
             sprites::CLUTTER_V_LIT,
-            app.settings.milkdrop_open,
+            app.settings.vis != VisMode::Off,
             "clutter-v",
         )
         .on_hover_text("Visualisation");
@@ -901,22 +889,13 @@ fn clutter_bar(app: &mut App, view: &mut View, now: Option<&NowPlaying>) {
                 app.actions.push(Action::SetVisualiser(mode));
             }
         }
-        ui.separator();
-        let mut milkdrop = app.settings.milkdrop_open;
-        if ui
-            .checkbox(&mut milkdrop, "MilkDrop")
-            .on_hover_text(super::keys::MILKDROP_SHORTCUT)
-            .clicked()
-        {
-            app.actions.push(Action::ToggleWinampMilkdrop);
-        }
     });
 }
 
 /// The display's left box: the spectrum analyser, the oscilloscope, or
 /// nothing, in the skin's own colours. A click, or V, goes to the next.
-/// Only sound from this computer passes the tap; a device across the room
-/// leaves the bars flat. Returns whether anything is still moving.
+/// The local player tap supplies post-EQ, pre-volume samples. Returns whether
+/// anything is still moving.
 fn visualiser(app: &mut App, view: &mut View, now: Option<&NowPlaying>) -> bool {
     let area = layout::VISUALIZER;
     if view
@@ -939,7 +918,7 @@ fn visualiser(app: &mut App, view: &mut View, now: Option<&NowPlaying>) -> bool 
             view.fill(area.x + x, area.y + y, 1, 1, color(1));
         }
     }
-    let sounding = now.is_some_and(|now| (now.playing || now.loading) && now.local);
+    let sounding = now.is_some_and(|now| now.playing || now.loading);
     match mode {
         VisMode::Bars => {
             let samples = if sounding {
@@ -992,8 +971,8 @@ fn visualiser(app: &mut App, view: &mut View, now: Option<&NowPlaying>) -> bool 
 }
 
 /// Whether the player is stopped, as Winamp meant it: something loaded and
-/// paused at the very start. Spotify has no stop, so this is what Stop
-/// leaves behind, and what the display treats as stopped.
+/// paused at the very start. This is what Stop leaves behind, and what the
+/// display treats as stopped.
 fn stopped(now: Option<&NowPlaying>) -> bool {
     now.is_some_and(|now| !now.playing && !now.loading && now.position_ms == 0)
 }
@@ -1087,13 +1066,10 @@ fn time_display(app: &mut App, view: &mut View, now: Option<&NowPlaying>, time: 
         blank(view);
         return;
     }
-    let position = match app.seek_preview {
-        Some(fraction) => (fraction * now.duration_ms as f32) as u32,
-        None => now.position_ms,
-    };
-    let remaining = app.winamp.time_remaining && now.duration_ms > 0;
+    let position = app.seek_preview.unwrap_or(now.position_ms);
+    let remaining = app.winamp.time_remaining && now.song.duration_ms > 0;
     let shown = if remaining {
-        now.duration_ms.saturating_sub(position)
+        now.song.duration_ms.saturating_sub(position)
     } else {
         position
     };
@@ -1121,8 +1097,8 @@ fn time_display(app: &mut App, view: &mut View, now: Option<&NowPlaying>, time: 
 /// them, a seek while it is dragged, else the song.
 pub fn marquee_text(
     now: Option<&NowPlaying>,
-    seek_preview: Option<f32>,
-    volume_preview: Option<f32>,
+    seek_preview: Option<u32>,
+    volume_preview: Option<u8>,
     balance_preview: Option<f32>,
     notice: Option<&str>,
 ) -> String {
@@ -1135,7 +1111,7 @@ pub fn marquee_text(
         };
     }
     if let Some(volume) = volume_preview {
-        return format!("Volume: {}%", (volume * 100.0).round() as u32);
+        return format!("Volume: {volume}%");
     }
     // The app's notices (a skin added, a playlist saved, an error) have
     // no toast to live in here; Winamp used the marquee for its own.
@@ -1145,24 +1121,28 @@ pub fn marquee_text(
     let Some(now) = now else {
         return "Fastpotify".to_string();
     };
-    if let Some(fraction) = seek_preview
-        && now.duration_ms > 0
+    if let Some(target) = seek_preview
+        && now.song.duration_ms > 0
     {
-        let target = (fraction * now.duration_ms as f32) as u32;
+        let percent = (target as f32 / now.song.duration_ms as f32 * 100.0).round() as u32;
         return format!(
             "Seek to: {}/{} ({}%)",
             util::format_duration_ms(target),
-            util::format_duration_ms(now.duration_ms),
-            (fraction * 100.0).round() as u32
+            util::format_duration_ms(now.song.duration_ms),
+            percent
         );
     }
-    let mut text = if now.subtitle.is_empty() {
-        now.title.clone()
+    let artists = now.song.artist_names();
+    let mut text = if artists.is_empty() {
+        now.song.name.clone()
     } else {
-        format!("{} - {}", now.subtitle, now.title)
+        format!("{} - {}", artists, now.song.name)
     };
-    if now.duration_ms > 0 {
-        text.push_str(&format!(" ({})", util::format_duration_ms(now.duration_ms)));
+    if now.song.duration_ms > 0 {
+        text.push_str(&format!(
+            " ({})",
+            util::format_duration_ms(now.song.duration_ms)
+        ));
     }
     text
 }
@@ -1267,24 +1247,21 @@ fn marquee_pixels(app: &mut App, view: &mut View, text: &str, offset: usize) {
     }
 }
 
-/// The bitrate and sample rate, as far as they are known: the bitrate is
-/// the one chosen for this computer, so a device across the room shows
-/// none.
-fn rates(app: &App, view: &mut View, now: Option<&NowPlaying>) {
+/// The stream bitrate, when the server supplied it.
+fn rates(view: &mut View, now: Option<&NowPlaying>) {
     let Some(now) = now.filter(|now| !stopped(Some(now))) else {
         return;
     };
-    if now.local {
-        view.text(&format!("{:>3}", app.settings.bitrate), layout::KBPS);
+    if let Some(bit_rate) = now.song.bit_rate {
+        view.text(&format!("{bit_rate:>3}"), layout::KBPS);
     }
-    view.text("44", layout::KHZ);
 }
 
 fn sliders(app: &mut App, view: &mut View, now: Option<&NowPlaying>) {
     // Volume: the track is drawn at the level, the thumb rides on it.
     let volume = now
         .map(|now| now.volume_percent)
-        .unwrap_or_else(|| crate::app::volume_to_percent(app.local.volume));
+        .unwrap_or_else(|| crate::app::volume_to_percent(app.settings.volume));
     let (response, event) = view.slider(layout::VOLUME, "volume", 14);
     let notches = wheel_notches(view.ui, &response);
     if notches != 0 {
@@ -1293,11 +1270,9 @@ fn sliders(app: &mut App, view: &mut View, now: Option<&NowPlaying>) {
     }
     match event {
         SliderEvent::Dragging(value) => {
-            app.volume_preview = Some(value);
-            if now.is_none_or(|now| now.local) {
-                app.actions
-                    .push(Action::PreviewVolume((value * 100.0).round() as u8));
-            }
+            let percent = (value * 100.0).round() as u8;
+            app.volume_preview = Some(percent);
+            app.actions.push(Action::PreviewVolume(percent));
         }
         SliderEvent::Committed(value) => {
             app.volume_preview = None;
@@ -1306,10 +1281,7 @@ fn sliders(app: &mut App, view: &mut View, now: Option<&NowPlaying>) {
         }
         SliderEvent::None => {}
     }
-    let shown = match app.volume_preview {
-        Some(fraction) => (fraction * 100.0).round() as u32,
-        None => u32::from(volume),
-    };
+    let shown = u32::from(app.volume_preview.unwrap_or(volume));
     let frame = (shown * (sprites::SLIDER_FRAMES - 1) + 50) / 100;
     view.sprite(sprites::volume_frame(frame), layout::VOLUME);
     let thumb = if response.dragged() || response.is_pointer_button_down_on() {
@@ -1350,23 +1322,23 @@ fn sliders(app: &mut App, view: &mut View, now: Option<&NowPlaying>) {
     // The seek bar. The thumb only exists while something plays, as in
     // Winamp, so an empty or stopped player has nothing to drag.
     view.sprite(sprites::POSITION_TRACK, layout::POSITION);
-    let Some(now) = now.filter(|now| now.duration_ms > 0 && !stopped(Some(now))) else {
+    let Some(now) = now.filter(|now| now.song.duration_ms > 0 && !stopped(Some(now))) else {
         return;
     };
     let (response, event) = view.slider(layout::POSITION, "position", 29);
     match event {
-        SliderEvent::Dragging(value) => app.seek_preview = Some(value),
+        SliderEvent::Dragging(value) => {
+            app.seek_preview = Some((value * now.song.duration_ms as f32) as u32);
+        }
         SliderEvent::Committed(value) => {
             app.seek_preview = None;
             app.actions
-                .push(Action::Seek((value * now.duration_ms as f32) as u32));
+                .push(Action::Seek((value * now.song.duration_ms as f32) as u32));
         }
         SliderEvent::None => {}
     }
-    let fraction = app
-        .seek_preview
-        .unwrap_or(now.position_ms as f32 / now.duration_ms as f32)
-        .clamp(0.0, 1.0);
+    let shown_position = app.seek_preview.unwrap_or(now.position_ms);
+    let fraction = (shown_position as f32 / now.song.duration_ms as f32).clamp(0.0, 1.0);
     let thumb = if response.dragged() || response.is_pointer_button_down_on() {
         sprites::POSITION_THUMB_PRESSED
     } else {
@@ -1521,22 +1493,27 @@ fn shuffle_repeat(app: &mut App, view: &mut View, now: Option<&NowPlaying>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::models::{ArtistRef, MediaId, MediaKind, ProfileId, Song};
 
     fn now(title: &str, subtitle: &str, duration_ms: u32) -> NowPlaying {
+        let profile = ProfileId::new("0123456789abcdef0123456789abcdef01234567");
+        let id = MediaId::new(profile.clone(), MediaKind::Song, "song");
         NowPlaying {
-            local: true,
-            device_name: None,
-            uri: "spotify:track:x".into(),
-            id: None,
-            title: title.into(),
-            artists: Vec::new(),
-            subtitle: subtitle.into(),
-            album_name: String::new(),
-            album_id: None,
-            show_id: None,
-            art_url: None,
-            art_small: None,
-            duration_ms,
+            song: Song {
+                uri: id.uri(),
+                id,
+                name: title.into(),
+                artists: (!subtitle.is_empty())
+                    .then(|| ArtistRef {
+                        id: Some(MediaId::new(profile, MediaKind::Artist, "artist")),
+                        name: subtitle.into(),
+                        uri: None,
+                    })
+                    .into_iter()
+                    .collect(),
+                duration_ms,
+                ..Song::default()
+            },
             position_ms: 0,
             playing: true,
             loading: false,
@@ -1544,7 +1521,6 @@ mod tests {
             repeat: RepeatMode::Off,
             volume_percent: 50,
             can_control: true,
-            is_episode: false,
             resuming: false,
         }
     }
@@ -1557,10 +1533,10 @@ mod tests {
             "Radiohead - Karma Police (4:24)"
         );
         assert_eq!(marquee_text(None, None, None, None, None), "Fastpotify");
-        let untitled = now("Episode 12", "", 0);
+        let untitled = now("Untitled track", "", 0);
         assert_eq!(
             marquee_text(Some(&untitled), None, None, None, None),
-            "Episode 12"
+            "Untitled track"
         );
     }
 
@@ -1568,7 +1544,7 @@ mod tests {
     fn a_seek_in_progress_says_where_it_is_going() {
         let playing = now("Karma Police", "Radiohead", 264_000);
         assert_eq!(
-            marquee_text(Some(&playing), Some(0.5), None, None, None),
+            marquee_text(Some(&playing), Some(132_000), None, None, None),
             "Seek to: 2:12/4:24 (50%)"
         );
     }
@@ -1577,7 +1553,7 @@ mod tests {
     fn sliders_announce_themselves_while_they_move() {
         let playing = now("Karma Police", "Radiohead", 264_000);
         assert_eq!(
-            marquee_text(Some(&playing), None, Some(0.57), None, None),
+            marquee_text(Some(&playing), None, Some(57), None, None),
             "Volume: 57%"
         );
         assert_eq!(

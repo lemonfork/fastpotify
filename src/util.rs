@@ -109,24 +109,12 @@ pub fn format_relative_date(iso: &str, now: jiff::Timestamp) -> String {
     format!("{count} {unit}{plural} ago")
 }
 
-/// Tears the id out of `spotify:track:abc` and friends.
-pub fn uri_id(uri: &str) -> Option<&str> {
-    uri.rsplit(':').next().filter(|id| !id.is_empty())
+/// Parses a canonical, server-scoped media reference.
+pub fn media_id(reference: &str) -> Option<crate::api::models::MediaId> {
+    reference.parse().ok()
 }
 
-pub fn uri_kind(uri: &str) -> Option<&str> {
-    let mut parts = uri.split(':');
-    parts.next()?;
-    parts.next()
-}
-
-pub fn open_spotify_url(uri: &str) -> Option<String> {
-    let kind = uri_kind(uri)?;
-    let id = uri_id(uri)?;
-    Some(format!("https://open.spotify.com/{kind}/{id}"))
-}
-
-/// The application icon, drawn at runtime: a green disc with a play mark.
+/// The application icon, drawn at runtime: a blue disc with a play mark.
 /// Shared by the window icon and the tray pixmap.
 /// The menu-bar shape for macOS: the circle with the play triangle punched
 /// out. macOS template images use only the alpha channel and paint the
@@ -176,7 +164,7 @@ pub fn app_icon_rgba(size: usize) -> Vec<u8> {
             let negative = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
             let positive = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
             let inside = !(negative && positive);
-            let (r, g, b) = if inside { (10, 20, 14) } else { (30, 215, 96) };
+            let (r, g, b) = if inside { (10, 16, 32) } else { (91, 140, 255) };
             let index = (y * size + x) * 4;
             rgba[index] = r;
             rgba[index + 1] = g;
@@ -199,7 +187,7 @@ fn local_hour() -> u8 {
     jiff::Zoned::now().hour() as u8
 }
 
-/// Strips the HTML Spotify embeds in playlist descriptions.
+/// Strips the small HTML subset some servers return in descriptions.
 pub fn strip_html(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut in_tag = false;
@@ -282,13 +270,17 @@ mod tests {
     }
 
     #[test]
-    fn uris() {
-        assert_eq!(uri_id("spotify:track:abc"), Some("abc"));
-        assert_eq!(uri_kind("spotify:playlist:x"), Some("playlist"));
-        assert_eq!(
-            open_spotify_url("spotify:album:z").as_deref(),
-            Some("https://open.spotify.com/album/z")
+    fn canonical_media_references_are_parsed_as_one_typed_value() {
+        use crate::api::models::{MediaId, MediaKind, ProfileId};
+
+        let id = MediaId::new(
+            ProfileId::new("0123456789abcdef0123456789abcdef01234567"),
+            MediaKind::Song,
+            "server/id 中文",
         );
+        assert_eq!(media_id(&id.uri()), Some(id));
+        assert_eq!(media_id("legacy:track:old-id"), None);
+        assert_eq!(media_id("https://example.test/rest/stream?t=secret"), None);
     }
 
     #[test]

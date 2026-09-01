@@ -1,13 +1,8 @@
-//! Desktop media controls on Windows and macOS: the keyboard's media keys,
-//! the system's now-playing panel, a headset's buttons. The same surface
-//! `mpris.rs` gives Linux, through the platforms' own APIs (the System Media
-//! Transport Controls; MPNowPlayingInfoCenter with MPRemoteCommandCenter) by
-//! way of souvlaki.
+//! Windows desktop media controls: media keys, the system's now-playing panel,
+//! and headset buttons through System Media Transport Controls via souvlaki.
 //!
-//! Windows ties the controls to a window, so they get a hidden one of their
-//! own, on a thread with a message loop, and survive the app's real window
-//! closing to the tray. macOS needs none of that: its handlers run on the
-//! main thread, which the headless loop in `main` keeps pumping.
+//! The controls get a hidden window of their own on a thread with a message
+//! loop, so they survive the app's real window closing to the tray.
 
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
@@ -310,53 +305,6 @@ impl MediaService {
             && updates.send(update).is_ok()
         {
             host::poke(*thread_id);
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-pub struct MediaService {
-    commands: Receiver<MediaCommand>,
-    bridge: std::sync::Mutex<Option<Bridge>>,
-}
-
-#[cfg(target_os = "macos")]
-impl MediaService {
-    pub fn spawn(wake: impl Fn() + Send + Sync + 'static) -> Self {
-        let (sender, commands) = std::sync::mpsc::channel();
-        let bridge = match Bridge::new(None, sender, Arc::new(wake)) {
-            Ok(bridge) => Some(bridge),
-            Err(error) => {
-                log::warn!("no media controls: {error}");
-                None
-            }
-        };
-        Self {
-            commands,
-            bridge: std::sync::Mutex::new(bridge),
-        }
-    }
-
-    pub fn drain_commands(&self) -> Vec<MediaCommand> {
-        self.commands.try_iter().collect()
-    }
-
-    pub fn update(&mut self, state: MediaState) {
-        self.with_bridge(|bridge| bridge.apply(state));
-    }
-
-    pub fn seeked(&self, position_ms: u32) {
-        self.with_bridge(|bridge| bridge.seeked(position_ms));
-    }
-
-    fn with_bridge(&self, act: impl FnOnce(&mut Bridge)) {
-        if let Some(bridge) = self
-            .bridge
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .as_mut()
-        {
-            act(bridge);
         }
     }
 }

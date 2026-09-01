@@ -1,472 +1,327 @@
-//! Spotify sign-in with the Authorization Code + PKCE flow.
+//! OpenSubsonic credentials and token authentication.
 //!
-//! Three independent grants may exist because Spotify treats them differently:
-//!
-//! - The shared and optional personal **Web API grants** use separate
-//!   registered application identities, token files, and request sessions.
-//! - The **playback grant** uses Spotify's desktop client identity, the one
-//!   librespot streams with. Its access token is exchanged once for a
-//!   reusable credential that librespot caches itself.
-//!
-//! The browser does the password entry; this process only ever sees the
-//! one-time authorization code that Spotify sends back to a loopback
-//! listener.
+//! Passwords are persisted only in the user's credential file. They are never
+//! included in `Debug`, `Display`, profile identifiers, media URIs, or artwork
+//! references. Each authenticated request derives a fresh salted token.
 
-use std::net::SocketAddr;
-use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::fmt;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow, bail};
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rand::RngCore;
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpListener;
-use tokio::sync::watch;
+use reqwest::Url;
+use serde::{Deserialize, Deserializer, Serialize};
+use sha1::{Digest, Sha1};
+use thiserror::Error;
 
-/// Spotify's own desktop client identity, the one librespot streams with.
-pub const PLAYBACK_CLIENT_ID: &str = "65b708073fc0480ea92a077233ca87bd";
-pub const PLAYBACK_REDIRECT_PORT: u16 = 8898;
+pub const API_VERSION: &str = "1.16.1";
+pub const CLIENT_NAME: &str = "Fastpotify";
 
-/// The public Web API application shared by spotify-player, ncspot, and
-/// Omarchy Spotify.
-pub const DEFAULT_WEB_CLIENT_ID: &str = "d420a117a32841c2b3474932e49fb54b";
-pub const WEB_REDIRECT_PORT: u16 = 8989;
+/// Stable, non-secret identity for one server/user profile.
+#[derive(Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct ProfileId(String);
 
-pub const REDIRECT_PATH: &str = "/login";
-
-/// Playback: what librespot needs to stream and join Spotify Connect.
-pub const PLAYBACK_SCOPES: &[&str] = &[
-    "app-remote-control",
-    "streaming",
-    "user-modify-playback-state",
-    "user-read-currently-playing",
-    "user-read-playback-state",
-    "user-read-private",
-];
-
-/// Web API: what visible features use, plus `user-read-private` for the
-/// plan (Free or Premium), which decides whether local playback is offered
-/// at all; no email.
-pub const WEB_SCOPES: &[&str] = &[
-    "playlist-modify-private",
-    "playlist-modify-public",
-    "playlist-read-collaborative",
-    "playlist-read-private",
-    "user-follow-modify",
-    "user-follow-read",
-    "user-library-modify",
-    "user-library-read",
-    "user-modify-playback-state",
-    "user-read-playback-position",
-    "user-read-playback-state",
-    "user-read-private",
-    "user-read-recently-played",
-    "user-top-read",
-];
-
-const AUTHORIZE_URL: &str = "https://accounts.spotify.com/authorize";
-const TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
-const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-/// Refresh this long before the access token expires.
-const REFRESH_MARGIN: Duration = Duration::from_secs(90);
-
-/// One OAuth application identity and what it is asked for.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Grant {
-    pub client_id: String,
-    pub redirect_port: u16,
-    pub scopes: &'static [&'static str],
-}
-
-impl Grant {
-    pub fn playback() -> Self {
-        Self {
-            client_id: PLAYBACK_CLIENT_ID.to_string(),
-            redirect_port: PLAYBACK_REDIRECT_PORT,
-            scopes: PLAYBACK_SCOPES,
-        }
+impl ProfileId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self::try_new(value).expect("profile fingerprints are 40 lowercase hexadecimal characters")
     }
 
-    pub fn shared_web_api() -> Self {
-        Self {
-            client_id: DEFAULT_WEB_CLIENT_ID.to_string(),
-            redirect_port: WEB_REDIRECT_PORT,
-            scopes: WEB_SCOPES,
-        }
-    }
-
-    pub fn personal_web_api(client_id: &str) -> Result<Self> {
-        let client_id = client_id.trim();
-        if client_id.is_empty() {
-            bail!("a personal Spotify Client ID is required");
-        }
-        Ok(Self {
-            client_id: client_id.to_string(),
-            redirect_port: WEB_REDIRECT_PORT,
-            scopes: WEB_SCOPES,
-        })
-    }
-
-    pub fn redirect_uri(&self) -> String {
-        format!("http://127.0.0.1:{}{REDIRECT_PATH}", self.redirect_port)
-    }
-}
-
-/// A started sign-in: the URL to open and the secrets needed to finish it.
-#[derive(Clone, Debug)]
-pub struct Flow {
-    pub verifier: String,
-    pub state: String,
-    pub url: String,
-}
-
-fn random_token(bytes: usize) -> String {
-    let mut buffer = vec![0u8; bytes];
-    rand::rng().fill_bytes(&mut buffer);
-    URL_SAFE_NO_PAD.encode(buffer)
-}
-
-pub fn begin(grant: Grant) -> Flow {
-    let verifier = random_token(48);
-    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
-    let state = random_token(18);
-    let url = format!(
-        "{AUTHORIZE_URL}?client_id={}&response_type=code&redirect_uri={}&code_challenge_method=S256&code_challenge={challenge}&state={state}&scope={}",
-        grant.client_id,
-        urlencoding::encode(&grant.redirect_uri()),
-        urlencoding::encode(&grant.scopes.join(" "))
-    );
-    Flow {
-        verifier,
-        state,
-        url,
-    }
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct TokenResponse {
-    pub access_token: String,
-    #[serde(default)]
-    pub refresh_token: Option<String>,
-    #[serde(default)]
-    pub expires_in: Option<u64>,
-    #[serde(default)]
-    pub scope: Option<String>,
-}
-
-/// Listens for Spotify's redirect and returns the authorization code.
-///
-/// Ends early when `cancel` flips to true (the user gave up) or after ten
-/// minutes.
-pub async fn wait_for_code(
-    port: u16,
-    expected_state: &str,
-    mut cancel: watch::Receiver<bool>,
-) -> Result<String> {
-    let address: SocketAddr = ([127, 0, 0, 1], port).into();
-    let listener = TcpListener::bind(address)
-        .await
-        .with_context(|| format!("unable to listen on {address} for the Spotify redirect"))?;
-    let deadline = tokio::time::sleep(LOGIN_TIMEOUT);
-    tokio::pin!(deadline);
-
-    loop {
-        let (mut stream, _) = tokio::select! {
-            accepted = listener.accept() => accepted.context("redirect listener failed")?,
-            _ = cancel.changed() => {
-                if *cancel.borrow() { bail!("sign-in cancelled"); }
-                continue;
-            }
-            _ = &mut deadline => bail!("sign-in timed out; try again"),
-        };
-
-        let mut reader = BufReader::new(&mut stream);
-        let mut request_line = String::new();
-        if reader.read_line(&mut request_line).await.is_err() {
-            continue;
-        }
-        let outcome = parse_request_line(&request_line, expected_state);
-        let (status, body) = match &outcome {
-            Ok(_) => ("200 OK", success_page()),
-            Err(error) => ("400 Bad Request", failure_page(&error.to_string())),
-        };
-        let response = format!(
-            "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
-        );
-        let _ = stream.write_all(response.as_bytes()).await;
-        let _ = stream.shutdown().await;
-        match outcome {
-            Ok(code) => return Ok(code),
-            Err(error) => {
-                // A favicon request or a stale tab is not the redirect; keep waiting.
-                log::debug!("ignored request on the redirect listener: {error}");
-                continue;
-            }
-        }
-    }
-}
-
-fn parse_request_line(line: &str, expected_state: &str) -> Result<String> {
-    let target = line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| anyhow!("malformed request"))?;
-    let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    if path != REDIRECT_PATH {
-        bail!("unexpected path {path}");
-    }
-    let mut code = None;
-    let mut state = None;
-    let mut error = None;
-    for pair in query.split('&') {
-        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-        let value = urlencoding::decode(value)
-            .map(|value| value.into_owned())
-            .unwrap_or_else(|_| value.to_string());
-        match key {
-            "code" => code = Some(value),
-            "state" => state = Some(value),
-            "error" => error = Some(value),
-            _ => {}
-        }
-    }
-    if let Some(error) = error {
-        bail!("Spotify refused the sign-in: {error}");
-    }
-    if state.as_deref() != Some(expected_state) {
-        bail!("state mismatch");
-    }
-    code.ok_or_else(|| anyhow!("Spotify did not return an authorization code"))
-}
-
-pub async fn exchange_code(
-    http: &reqwest::Client,
-    grant: &Grant,
-    code: &str,
-    verifier: &str,
-) -> Result<TokenResponse> {
-    token_request(
-        http,
-        &[
-            ("client_id", grant.client_id.as_str()),
-            ("grant_type", "authorization_code"),
-            ("code", code),
-            ("redirect_uri", grant.redirect_uri().as_str()),
-            ("code_verifier", verifier),
-        ],
-    )
-    .await
-    .map_err(|error| anyhow!("{error}"))
-}
-
-pub async fn refresh(
-    http: &reqwest::Client,
-    client_id: &str,
-    refresh_token: &str,
-) -> std::result::Result<TokenResponse, TokenEndpointError> {
-    token_request(
-        http,
-        &[
-            ("client_id", client_id),
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token),
-        ],
-    )
-    .await
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum TokenEndpointError {
-    /// Spotify refused the grant itself; only the browser can mint a new one.
-    #[error("Spotify rejected the token request ({status}): {detail}")]
-    Rejected { status: u16, detail: String },
-    /// The endpoint could not answer; the grant may still be valid.
-    #[error("token request failed: {0}")]
-    Unreachable(String),
-}
-
-async fn token_request(
-    http: &reqwest::Client,
-    form: &[(&str, &str)],
-) -> std::result::Result<TokenResponse, TokenEndpointError> {
-    let response = http
-        .post(TOKEN_URL)
-        .form(form)
-        .send()
-        .await
-        .map_err(|error| TokenEndpointError::Unreachable(error.to_string()))?;
-    let status = response.status();
-    let text = response.text().await.unwrap_or_default();
-    if status.is_client_error() {
-        let detail = serde_json::from_str::<serde_json::Value>(&text)
-            .ok()
-            .and_then(|value| {
-                value["error_description"]
-                    .as_str()
-                    .or(value["error"].as_str())
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| redact(&text));
-        return Err(TokenEndpointError::Rejected {
-            status: status.as_u16(),
-            detail,
-        });
-    }
-    if !status.is_success() {
-        return Err(TokenEndpointError::Unreachable(format!(
-            "Spotify answered {status}: {}",
-            redact(&text)
-        )));
-    }
-    serde_json::from_str(&text).map_err(|error| {
-        TokenEndpointError::Unreachable(format!("unexpected token response: {error}"))
-    })
-}
-
-fn redact(text: &str) -> String {
-    text.chars().take(200).collect()
-}
-
-/// The Web API grant as kept on disk between runs.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct StoredToken {
-    pub client_id: String,
-    pub access_token: String,
-    pub refresh_token: String,
-    /// Unix seconds.
-    pub expires_at: u64,
-    #[serde(default)]
-    pub scope: String,
-}
-
-impl StoredToken {
-    pub fn from_response(
-        client_id: &str,
-        response: TokenResponse,
-        previous_refresh: Option<&str>,
-    ) -> Result<Self> {
-        let refresh_token = response
-            .refresh_token
-            .or_else(|| previous_refresh.map(str::to_string))
-            .ok_or_else(|| anyhow!("Spotify did not return a refresh token"))?;
-        Ok(Self {
-            client_id: client_id.to_string(),
-            access_token: response.access_token,
-            refresh_token,
-            expires_at: now_secs() + response.expires_in.unwrap_or(3600),
-            scope: response.scope.unwrap_or_default(),
-        })
-    }
-
-    pub fn needs_refresh(&self) -> bool {
-        now_secs() + REFRESH_MARGIN.as_secs() >= self.expires_at
-    }
-
-    pub fn expired(&self) -> bool {
-        now_secs() >= self.expires_at
-    }
-
-    /// Whether the grant covers every scope in `scopes`. A grant cannot be
-    /// widened by a refresh, only by the browser.
-    pub fn has_scopes(&self, scopes: &[&str]) -> bool {
-        let granted: Vec<&str> = self.scope.split_whitespace().collect();
-        scopes.iter().all(|scope| granted.contains(scope))
-    }
-
-    pub fn load(path: &Path) -> Option<Self> {
-        let text = std::fs::read_to_string(path).ok()?;
-        serde_json::from_str(&text).ok()
-    }
-
-    pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let text = serde_json::to_string_pretty(self)?;
-        let temporary = path.with_extension("json.tmp");
-        write_private(&temporary, text.as_bytes())?;
-        std::fs::rename(&temporary, path)?;
-        Ok(())
-    }
-
-    pub fn remove(path: &Path) {
-        let _ = std::fs::remove_file(path);
-    }
-
-    pub fn migrate_legacy(legacy: &Path, shared: &Path, personal: &Path) -> Result<()> {
-        let Some(token) = Self::load(legacy) else {
-            return Ok(());
-        };
-        let target = if token.client_id == DEFAULT_WEB_CLIENT_ID {
-            shared
+    pub fn try_new(value: impl Into<String>) -> Result<Self, ProfileIdError> {
+        let value = value.into();
+        if value.len() == 40
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            Ok(Self(value))
         } else {
-            personal
-        };
-        if let Some(existing) = Self::load(target) {
-            if existing != token {
-                return Ok(());
-            }
-        } else {
-            token.save(target)?;
+            Err(ProfileIdError)
         }
-        Self::remove(legacy);
-        Ok(())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
-fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
+impl Default for ProfileId {
+    fn default() -> Self {
+        Self("0000000000000000000000000000000000000000".to_owned())
+    }
+}
+
+impl std::str::FromStr for ProfileId {
+    type Err = ProfileIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::try_new(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for ProfileId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        let value = String::deserialize(deserializer)?;
+        Self::try_new(value).map_err(serde::de::Error::custom)
     }
-    let mut file = options.open(path)?;
-    file.write_all(contents)?;
-    file.flush()
 }
 
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+#[error("profile fingerprint must be 40 lowercase hexadecimal characters")]
+pub struct ProfileIdError;
+
+impl fmt::Debug for ProfileId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_tuple("ProfileId").field(&self.0).finish()
+    }
 }
 
-fn page(title: &str, heading: &str, body: &str, accent: &str) -> String {
-    format!(
-        "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{title}</title>\
-<style>:root{{color-scheme:dark}}body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#0f1114;color:#e8eaed;font-family:Inter,system-ui,sans-serif}}\
-main{{max-width:28rem;padding:2.5rem;border-radius:1.25rem;background:#181b20;box-shadow:0 20px 60px rgba(0,0,0,.5);text-align:center}}\
-.mark{{width:64px;height:64px;border-radius:50%;background:{accent};display:grid;place-items:center;margin:0 auto 1.25rem}}\
-.mark svg{{width:30px;height:30px;fill:#0f1114}}h1{{font-size:1.4rem;margin:.25rem 0 .5rem}}p{{color:#a5adba;line-height:1.5;margin:0}}</style>\
-<main><div class=\"mark\"><svg viewBox=\"0 0 24 24\"><path d=\"M5 5a2 2 0 0 1 3.008-1.728l11.997 6.998a2 2 0 0 1 .003 3.458l-12 7A2 2 0 0 1 5 19z\"/></svg></div>\
-<h1>{heading}</h1><p>{body}</p></main><script>setTimeout(function(){{window.close()}},1500)</script></html>"
-    )
+impl fmt::Display for ProfileId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
 }
 
-fn success_page() -> String {
-    page(
-        "Signed in to Fastpotify",
-        "You're signed in",
-        "You can close this tab and go back to Fastpotify.",
-        "#1ed760",
-    )
+/// Credentials for one OpenSubsonic server.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Credentials {
+    #[serde(alias = "server_url", alias = "url")]
+    server: String,
+    #[serde(alias = "user")]
+    username: String,
+    password: String,
 }
 
-fn failure_page(reason: &str) -> String {
-    page(
-        "Sign-in failed",
-        "Sign-in didn't complete",
-        &format!("{reason}. Return to Fastpotify and try again."),
-        "#f5717f",
-    )
+impl Credentials {
+    /// Validates and normalizes credentials. Deployments below a path are
+    /// supported, while URL credentials, queries and fragments are rejected.
+    pub fn new(
+        server: impl AsRef<str>,
+        username: impl AsRef<str>,
+        password: impl Into<String>,
+    ) -> Result<Self, CredentialError> {
+        let server = normalize_server_url(server.as_ref())?;
+        let username = username.as_ref().trim();
+        if username.is_empty() {
+            return Err(CredentialError::InvalidUsername);
+        }
+        Ok(Self {
+            server,
+            username: username.to_owned(),
+            password: password.into(),
+        })
+    }
+
+    pub fn server(&self) -> &str {
+        &self.server
+    }
+
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    pub(crate) fn password(&self) -> &str {
+        &self.password
+    }
+
+    pub fn profile_id(&self) -> ProfileId {
+        let mut digest = Sha1::new();
+        digest.update(self.server.as_bytes());
+        digest.update([0]);
+        digest.update(self.username.as_bytes());
+        ProfileId::new(format!("{:x}", digest.finalize()))
+    }
+
+    /// Atomically replaces a JSON credential file. On Unix the temporary and
+    /// final files are owner-readable/writable only (0600).
+    pub fn save(&self, path: &Path) -> Result<(), CredentialError> {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty());
+        if let Some(parent) = parent {
+            fs::create_dir_all(parent).map_err(CredentialError::Io)?;
+        }
+        let bytes = serde_json::to_vec_pretty(self).map_err(CredentialError::Encode)?;
+        let temp = temporary_path(path);
+
+        let write_result = (|| -> Result<(), CredentialError> {
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&temp).map_err(CredentialError::Io)?;
+            file.write_all(&bytes).map_err(CredentialError::Io)?;
+            file.write_all(b"\n").map_err(CredentialError::Io)?;
+            file.sync_all().map_err(CredentialError::Io)?;
+            crate::paths::replace_file(&temp, path).map_err(CredentialError::Io)?;
+            set_owner_only(path)?;
+            sync_parent(path);
+            Ok(())
+        })();
+        if write_result.is_err() {
+            let _ = fs::remove_file(&temp);
+        }
+        write_result
+    }
+
+    pub fn load(path: &Path) -> Result<Self, CredentialError> {
+        set_owner_only(path)?;
+        let bytes = fs::read(path).map_err(CredentialError::Io)?;
+        let stored: Credentials =
+            serde_json::from_slice(&bytes).map_err(CredentialError::Decode)?;
+        Self::new(stored.server, stored.username, stored.password)
+    }
+}
+
+impl fmt::Debug for Credentials {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Credentials")
+            .field("server", &self.server)
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for Credentials {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} at {}", self.username, self.server)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct RequestAuthentication {
+    pub salt: String,
+    pub token: String,
+}
+
+impl fmt::Debug for RequestAuthentication {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RequestAuthentication")
+            .field("salt", &"<redacted>")
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+pub(crate) fn request_authentication(password: &str) -> RequestAuthentication {
+    let mut random = [0_u8; 12];
+    rand::rng().fill_bytes(&mut random);
+    let salt = hex(&random);
+    let token = format!(
+        "{:x}",
+        md5::compute([password.as_bytes(), salt.as_bytes()].concat())
+    );
+    RequestAuthentication { salt, token }
+}
+
+fn normalize_server_url(raw: &str) -> Result<String, CredentialError> {
+    let raw = raw.trim();
+    let mut url = Url::parse(raw).map_err(|_| CredentialError::InvalidServerUrl)?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || authority_has_userinfo(raw)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(CredentialError::InvalidServerUrl);
+    }
+    if url.path() == "/" {
+        url.set_path("");
+    } else {
+        // `Url::path()` is already percent encoded. Feeding it back through
+        // `set_path` encodes every `%` again (`%20` becomes `%2520`). Editing
+        // only empty trailing segments leaves the parsed path bytes intact.
+        while url.path().ends_with('/') {
+            url.path_segments_mut()
+                .map_err(|_| CredentialError::InvalidServerUrl)?
+                .pop_if_empty();
+        }
+    }
+    Ok(url.to_string().trim_end_matches('/').to_owned())
+}
+
+fn authority_has_userinfo(raw: &str) -> bool {
+    raw.split_once("://")
+        .map(|(_, remainder)| {
+            remainder
+                .split(['/', '?', '#'])
+                .next()
+                .is_some_and(|authority| authority.contains('@'))
+        })
+        .unwrap_or(false)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(DIGITS[(byte >> 4) as usize] as char);
+        out.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn temporary_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("credentials");
+    let mut random = [0_u8; 8];
+    rand::rng().fill_bytes(&mut random);
+    path.with_file_name(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        hex(&random)
+    ))
+}
+
+#[cfg(unix)]
+fn set_owner_only(path: &Path) -> Result<(), CredentialError> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(CredentialError::Io)
+}
+
+#[cfg(not(unix))]
+fn set_owner_only(_path: &Path) -> Result<(), CredentialError> {
+    Ok(())
+}
+
+fn sync_parent(path: &Path) {
+    #[cfg(unix)]
+    if let Some(directory) = path
+        .parent()
+        .and_then(|parent| OpenOptions::new().read(true).open(parent).ok())
+    {
+        let _ = directory.sync_all();
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum CredentialError {
+    #[error(
+        "server URL must be an http(s) origin or base path without credentials, query, or fragment"
+    )]
+    InvalidServerUrl,
+    #[error("username must not be empty")]
+    InvalidUsername,
+    #[error("unable to access the credential file: {0}")]
+    Io(#[source] io::Error),
+    #[error("credential file is not valid JSON")]
+    Decode(#[source] serde_json::Error),
+    #[error("unable to encode the credential file")]
+    Encode(#[source] serde_json::Error),
 }
 
 #[cfg(test)]
@@ -474,94 +329,132 @@ mod tests {
     use super::*;
 
     #[test]
-    fn begin_produces_valid_pkce_material() {
-        let flow = begin(Grant::shared_web_api());
-        assert!(flow.verifier.len() >= 43);
-        assert!(flow.url.contains("code_challenge_method=S256"));
-        assert!(flow.url.contains(&format!("state={}", flow.state)));
-        assert!(
-            flow.url
-                .contains(&format!("client_id={DEFAULT_WEB_CLIENT_ID}"))
+    fn official_md5_token_vector() {
+        let salt = "c19b2d";
+        let token = format!("{:x}", md5::compute(format!("sesame{salt}")));
+        assert_eq!(token, "26719a1196d2a940705a59634eb18eab");
+    }
+
+    #[test]
+    fn request_tokens_have_fresh_salts_and_expected_shape() {
+        let first = request_authentication("secret");
+        let second = request_authentication("secret");
+        assert_ne!(first.salt, second.salt);
+        assert_eq!(first.salt.len(), 24);
+        assert_eq!(first.token.len(), 32);
+        assert!(first.salt.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(first.token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn credentials_normalize_without_leaking_password() {
+        let credentials = Credentials::new(
+            " https://music.example.test/navidrome/// ",
+            " alice ",
+            "do-not-print",
+        )
+        .unwrap();
+        assert_eq!(credentials.server(), "https://music.example.test/navidrome");
+        assert_eq!(credentials.username(), "alice");
+        assert!(!format!("{credentials:?}").contains("do-not-print"));
+        assert!(!credentials.to_string().contains("do-not-print"));
+        assert_eq!(credentials.profile_id().as_str().len(), 40);
+        assert_eq!(
+            Credentials::new("http://localhost:4533", "alice", "different-password")
+                .unwrap()
+                .profile_id()
+                .as_str(),
+            "1c12d49145ac5cb1b31a9ef0baa6ef7372d70ee0"
         );
-        assert!(flow.url.contains("8989"));
-        let playback = begin(Grant::playback());
-        assert!(
-            playback
-                .url
-                .contains(&format!("client_id={PLAYBACK_CLIENT_ID}"))
-        );
-        assert!(playback.url.contains("8898"));
-    }
 
-    #[test]
-    fn personal_client_id_is_validated_at_the_boundary() {
-        assert_eq!(Grant::personal_web_api("  abc ").unwrap().client_id, "abc");
-        assert!(Grant::personal_web_api("  ").is_err());
-    }
-
-    #[test]
-    fn request_line_parsing() {
-        let code =
-            parse_request_line("GET /login?code=abc%20d&state=s1 HTTP/1.1\r\n", "s1").unwrap();
-        assert_eq!(code, "abc d");
-        assert!(parse_request_line("GET /login?code=abc&state=other HTTP/1.1", "s1").is_err());
-        assert!(parse_request_line("GET /favicon.ico HTTP/1.1", "s1").is_err());
-        assert!(
-            parse_request_line("GET /login?error=access_denied&state=s1 HTTP/1.1", "s1").is_err()
-        );
-    }
-
-    #[test]
-    fn stored_token_round_trips_and_tracks_expiry() {
-        let response = TokenResponse {
-            access_token: "a".into(),
-            refresh_token: Some("r".into()),
-            expires_in: Some(3600),
-            scope: Some("x".into()),
-        };
-        let token = StoredToken::from_response("id", response, None).unwrap();
-        assert!(!token.needs_refresh());
-        assert!(token.has_scopes(&["x"]));
-        assert!(!token.has_scopes(&["x", "y"]));
-        let expired = StoredToken {
-            expires_at: now_secs() + 10,
-            ..token.clone()
-        };
-        assert!(expired.needs_refresh());
-        let dir = std::env::temp_dir().join(format!("fastpotify-token-{}", std::process::id()));
-        let path = dir.join("token.json");
-        token.save(&path).unwrap();
-        assert_eq!(StoredToken::load(&path), Some(token));
-        StoredToken::remove(&path);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn legacy_tokens_move_to_the_matching_session() {
-        let dir = std::env::temp_dir().join(format!(
-            "fastpotify-token-migration-{}-{}",
-            std::process::id(),
-            now_secs()
-        ));
-        let legacy = dir.join("legacy.json");
-        let shared = dir.join("shared.json");
-        let personal = dir.join("personal.json");
-        for (client_id, target) in [
-            (DEFAULT_WEB_CLIENT_ID, &shared),
-            ("personal-client", &personal),
+        for invalid in [
+            "ftp://music.example.test",
+            "https://@music.example.test",
+            "https://alice:secret@music.example.test",
+            "https://music.example.test/?token=secret",
+            "https://music.example.test/#secret",
         ] {
-            let token = StoredToken {
-                client_id: client_id.into(),
-                access_token: "access".into(),
-                refresh_token: "refresh".into(),
-                expires_at: now_secs() + 3600,
-                ..StoredToken::default()
-            };
-            token.save(&legacy).unwrap();
-            StoredToken::migrate_legacy(&legacy, &shared, &personal).unwrap();
-            assert_eq!(StoredToken::load(target), Some(token));
-            assert!(!legacy.exists());
+            assert!(matches!(
+                Credentials::new(invalid, "alice", "secret"),
+                Err(CredentialError::InvalidServerUrl)
+            ));
         }
-        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn encoded_base_paths_are_not_encoded_a_second_time() {
+        let encoded = Credentials::new(
+            "https://music.example.test/Music%20Server/%E9%9F%B3%E4%B9%90/%2F/",
+            "alice",
+            "secret",
+        )
+        .unwrap();
+        assert_eq!(
+            encoded.server(),
+            "https://music.example.test/Music%20Server/%E9%9F%B3%E4%B9%90/%2F"
+        );
+        assert!(!encoded.server().contains("%25"));
+    }
+
+    #[test]
+    fn profile_ids_reject_noncanonical_construction_and_deserialization() {
+        let valid = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(ProfileId::try_new(valid).unwrap().as_str(), valid);
+        for invalid in [
+            "",
+            "profile",
+            "ABCDEF0123456789abcdef0123456789abcdef01",
+            "0123:567890123456789012345678901234567890",
+        ] {
+            assert!(ProfileId::try_new(invalid).is_err());
+            assert!(serde_json::from_str::<ProfileId>(&format!("\"{invalid}\"")).is_err());
+        }
+        let encoded = serde_json::to_string(&ProfileId::new(valid)).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ProfileId>(&encoded)
+                .unwrap()
+                .as_str(),
+            valid
+        );
+    }
+
+    #[test]
+    fn credential_file_round_trips_legacy_field_aliases_atomically() {
+        let directory = std::env::temp_dir().join(format!(
+            "fastpotify-auth-test-{}-{}",
+            std::process::id(),
+            hex(&rand::random::<[u8; 8]>())
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("credentials.json");
+        let credentials = Credentials::new("http://localhost:4533/", "alice", "secret").unwrap();
+        credentials.save(&path).unwrap();
+        assert_eq!(Credentials::load(&path).unwrap(), credentials);
+        assert!(
+            !directory
+                .read_dir()
+                .unwrap()
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+        );
+
+        fs::write(
+            &path,
+            r#"{"server_url":"https://example.test/music/","user":"bob","password":"pw"}"#,
+        )
+        .unwrap();
+        let legacy = Credentials::load(&path).unwrap();
+        assert_eq!(legacy.server(), "https://example.test/music");
+        assert_eq!(legacy.username(), "bob");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        fs::remove_dir_all(directory).unwrap();
     }
 }

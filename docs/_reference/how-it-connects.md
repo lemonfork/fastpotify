@@ -1,74 +1,80 @@
 ---
 title: How It Connects
-description: Fastpotify's independent Spotify grants, what is stored, and how API traffic is routed.
+description: How Fastpotify authenticates to Navidrome/OpenSubsonic, streams music, and keeps credentials private.
 nav_order: 1
 ---
 
-## Independent grants, once each
+## One server profile
 
-Fastpotify uses separate credentials for Web API access, a personal app, and
-local playback:
+Fastpotify connects directly to one Navidrome or OpenSubsonic-compatible
+server. Sign-in needs its base URL, username, and password. The app verifies
+the account, music folders, protocol version, and advertised OpenSubsonic
+extensions before it saves the profile.
 
-1. **The shared Web API app** keeps full catalogue and playlist coverage.
-2. **Your optional personal Web API app** handles supported playback, library,
-   catalog, playlist creation, and owned or collaborative playlist requests
-   without using the shared app's quota. Complete playlist-library views and
-   playlist-bearing search stay on the shared app so Spotify-owned results are
-   not filtered out. Both Web API grants must verify as the same Spotify
-   account.
-3. **Local playback** uses
-   [librespot](https://github.com/librespot-org/librespot). It needs one more
-   browser approval and stores its own reusable credential. Spotify Premium
-   is required.
+The password is stored only in `navidrome.json` in the platform state
+directory. The file is atomically replaced and owner-only on Unix. It is not
+written to settings, logs, media references, artwork keys, or desktop media
+metadata. Signing out deletes it.
 
-Local playback authorization stays separate from both Web API grants.
+For every API request Fastpotify creates a fresh random salt and sends the
+OpenSubsonic token `md5(password + salt)` alongside the username, client name,
+API version, and JSON response format. This is the standard token
+authentication defined by the
+[OpenSubsonic API](https://opensubsonic.netlify.app/docs/api-reference/).
 
-By default, Fastpotify uses the public app shared with spotify-player, ncspot,
-and Omarchy Spotify. Spotify divides its quota among all users. A personal app
-adds a separate Development Mode quota. See
-[Use a Personal Spotify App](/make-it-even-faster/).
+Use HTTPS whenever the server is not on a network you fully trust. Token
+authentication keeps the password itself out of a request, but it does not
+turn plain HTTP into an encrypted connection.
 
-## What the client stores
+## Requests and streams
 
-- Shared and personal Web API refresh tokens, plus librespot's credential, in
-  the state directory with owner-only permissions
-  ([file locations](/settings-and-files/)).
-- Downloaded audio and artwork, in the cache directory, within the budget
-  you set.
-- Lyrics, in the cache directory, for a month.
-- Fastpotify has no telemetry, analytics, or hosted service. When the lyrics
-  panel is open and Spotify has no lyrics, it sends the track's artist, title,
-  album, and length to [lrclib.net](https://lrclib.net). It also checks
-  api.github.com once a day for updates. You can turn off update checks in
-  Settings.
+Metadata requests have a bounded timeout and a small concurrency limit. Audio
+uses the server's `/rest/stream` endpoint through a separate client with no
+total response timeout, because a healthy stream is intentionally long-lived.
+Authenticated redirects are followed only within the configured origin.
 
-## When Spotify pushes back
+The first stream request asks the server for MP3 at the selected bitrate. If a
+server reports success but the transcode ends before its first byte,
+Fastpotify retries that song once with OpenSubsonic's `format=raw`. This keeps
+a broken server transcoder from making the original unplayable. That fallback
+play may exceed the selected bitrate because it is the original file.
+The response bytes, rather than the filename or `Content-Type`, select the
+container and codec. Symphonia handles the primary codec set, including ALAC;
+when it can demux mono or stereo Ogg Opus but has no decoder for it, Fastpotify
+uses its local pure-Rust Opus fallback. Other unsupported originals still fail
+visibly instead of entering a retry loop.
 
-Each Web API session has separate concurrency and rate limits. A `Retry-After`
-response pauses only that session. Fastpotify routes each request once and
-does not retry it through the other app.
+Playback is local and authoritative. Fastpotify downloads bounded chunks,
+decodes them off the UI thread, normalizes them to the output pipeline, applies
+the equalizer, feeds the visualizers, and applies volume last. The queue and
+transport state live in this local engine; OpenSubsonic's saved play-queue API
+is not treated as remote playback control.
 
-## Receivers on the local network
+Fastpotify calls `scrobble` when a song starts and submits it once after about
+30 seconds, or halfway through a shorter song. Starting a stream alone does
+not make Navidrome count the play.
 
-Spotify's device list only shows signed-in receivers. A new librespot or
-spotifyd receiver is therefore invisible to the Web API.
+## Secret-free media references
 
-Receivers announce themselves over mDNS as `_spotify-connect._tcp` and answer
-a small HTTP interface. Fastpotify encrypts the stored librespot credential
-with a receiver-specific key and a key from a Diffie-Hellman exchange. The
-encrypted value only works for that receiver and exchange. Fastpotify does not
-save another copy of the credential.
+OpenSubsonic IDs are arbitrary strings and can collide between servers.
+Fastpotify therefore stores an opaque `fastpotify:` reference containing the
+entity kind, a non-secret profile fingerprint, and an encoded server ID.
+Artwork uses a separate `fastpotify-art:` reference. Neither contains the
+server URL or authentication query.
 
-The receiver then signs in and appears in Spotify's device list. Fastpotify
-uses the Web API for subsequent control requests.
+Sessions, history, and disposable profile data are scoped by the same profile
+fingerprint. Switching servers cannot make an ID from the previous server
+open or play on the new one.
 
-## The engine
+## Other connections
 
-Playback runs on a separate runtime. Librespot maintains the Spotify Connect
-session, exposes this computer as a device, receives transfers, and reports
-playback state. If the session drops, it reconnects with the stored credential.
+Fastpotify has no telemetry, analytics, or hosted service. It connects to:
 
-The engine discovers access points through `apresolve.spotify.com` and
-connects over TCP in the resolver's preference order: port 4070 first,
-falling back to 443 and 80. Only outbound connections are needed; no
-inbound ports have to be open.
+- the signed-in server for metadata, artwork, lyrics, playlist changes,
+  scrobbles, and audio;
+- [LRCLIB](https://lrclib.net) only as a lyrics fallback when the server has
+  no lyrics for the playing song; and
+- GitHub once a day for update checks when that setting is enabled.
+
+Artwork and lyrics are cached in the platform cache directory. Clearing them
+never signs you out.

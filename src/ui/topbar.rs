@@ -2,7 +2,6 @@
 
 use egui::{Align, CornerRadius, Layout, Sense, Vec2, pos2, vec2};
 
-use crate::api::models::pick_image;
 use crate::app::App;
 use crate::model::{Action, Page};
 use crate::theme::{self, Icon, Palette};
@@ -107,7 +106,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 &palette,
                 id,
                 &mut app.search.query,
-                "What do you want to play?",
+                "Search this server",
                 search_width,
             );
             if app.search.focus_requested {
@@ -134,15 +133,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(super::widgets::PAGE_PADDING);
                 // Account.
-                let (name, avatar) = app
+                let name = app
                     .user
                     .as_ref()
-                    .map(|user| {
-                        (
-                            user.name().to_string(),
-                            pick_image(&user.images, 64).map(str::to_string),
-                        )
-                    })
+                    .map(|user| user.name().to_string())
                     .unwrap_or_default();
                 let (rect, response) = ui.allocate_exact_size(Vec2::splat(36.0), Sense::click());
                 if ui.is_rect_visible(rect) {
@@ -153,33 +147,21 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                     };
                     ui.painter().circle_filled(rect.center(), 18.0, fill);
                     let inner = egui::Rect::from_center_size(rect.center(), Vec2::splat(28.0));
-                    match avatar.as_deref() {
-                        Some(url) => super::widgets::paint_cover(
-                            ui,
-                            &palette,
-                            Some(url),
-                            inner,
-                            14.0,
-                            Icon::User,
-                        ),
-                        None => {
-                            let initial = name
-                                .chars()
-                                .next()
-                                .unwrap_or('?')
-                                .to_uppercase()
-                                .to_string();
-                            ui.painter()
-                                .circle_filled(inner.center(), 14.0, palette.accent);
-                            ui.painter().text(
-                                inner.center(),
-                                egui::Align2::CENTER_CENTER,
-                                initial,
-                                theme::bold(13.0),
-                                palette.on_accent,
-                            );
-                        }
-                    }
+                    let initial = name
+                        .chars()
+                        .next()
+                        .unwrap_or('?')
+                        .to_uppercase()
+                        .to_string();
+                    ui.painter()
+                        .circle_filled(inner.center(), 14.0, palette.accent);
+                    ui.painter().text(
+                        inner.center(),
+                        egui::Align2::CENTER_CENTER,
+                        initial,
+                        theme::bold(13.0),
+                        palette.on_accent,
+                    );
                 }
                 let response = response
                     .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -194,19 +176,15 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                             ui.add_space(10.0);
                             theme::text(ui, &name, theme::semibold(14.0), palette.text);
                         });
-                        if let Some(product) =
-                            app.user.as_ref().and_then(|user| user.product.clone())
-                        {
-                            ui.horizontal(|ui| {
-                                ui.add_space(10.0);
-                                theme::text(
-                                    ui,
-                                    capitalize(&product),
-                                    theme::regular(12.0),
-                                    palette.secondary,
-                                );
-                            });
-                        }
+                        ui.horizontal(|ui| {
+                            ui.add_space(10.0);
+                            theme::text(
+                                ui,
+                                "OpenSubsonic account",
+                                theme::regular(12.0),
+                                palette.secondary,
+                            );
+                        });
                         super::widgets::menu_separator(ui, &palette);
                         if super::widgets::menu_item(ui, &palette, Some(Icon::Settings), "Settings")
                         {
@@ -241,25 +219,6 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 }
                 if theme::icon_button(
                     ui,
-                    Icon::AudioLines,
-                    19.0,
-                    if app.settings.milkdrop_open {
-                        palette.accent
-                    } else {
-                        palette.secondary
-                    },
-                    palette.text,
-                    super::keys::platform_shortcut(
-                        "MilkDrop visualiser (Ctrl+Shift+K)",
-                        "MilkDrop visualiser (Cmd+Shift+K)",
-                    ),
-                )
-                .clicked()
-                {
-                    app.actions.push(Action::ToggleWinampMilkdrop);
-                }
-                if theme::icon_button(
-                    ui,
                     Icon::Shrink,
                     19.0,
                     palette.secondary,
@@ -272,53 +231,6 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 .clicked()
                 {
                     app.actions.push(Action::ToggleWinampWindow);
-                }
-                // A quiet spinner once the app has been talking to Spotify for a
-                // while, long enough that fast requests never flash it.
-                if app
-                    .backend
-                    .activity()
-                    .busy(std::time::Duration::from_millis(1000))
-                {
-                    theme::spinner(ui, 15.0, palette.secondary)
-                        .on_hover_text("Waiting for Spotify…");
-                }
-                // Where playback is.
-                if let Some(now) = app.now_playing()
-                    && !now.local
-                {
-                    let label = format!(
-                        "Playing on {}",
-                        now.device_name.unwrap_or_else(|| "another device".into())
-                    );
-                    let galley =
-                        ui.painter()
-                            .layout_no_wrap(label, theme::medium(12.5), palette.accent);
-                    let size = galley.size() + vec2(28.0, 12.0);
-                    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
-                    ui.painter().rect_filled(
-                        rect,
-                        CornerRadius::same(14),
-                        palette.accent.gamma_multiply(0.16),
-                    );
-                    let icon_rect = egui::Rect::from_center_size(
-                        pos2(rect.left() + 14.0, rect.center().y),
-                        Vec2::splat(13.0),
-                    );
-                    Icon::Speaker
-                        .image(palette.accent, 13.0)
-                        .paint_at(ui, icon_rect);
-                    ui.painter().galley(
-                        pos2(rect.left() + 24.0, rect.center().y - galley.size().y / 2.0),
-                        galley,
-                        palette.accent,
-                    );
-                    if response
-                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                        .clicked()
-                    {
-                        app.actions.push(Action::ToggleDevicesPopup);
-                    }
                 }
                 // A newer release. Most people never visit a releases page,
                 // so the app says so, quietly, until they do.
@@ -360,12 +272,4 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             });
         },
     );
-}
-
-fn capitalize(text: &str) -> String {
-    let mut chars = text.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-        None => String::new(),
-    }
 }

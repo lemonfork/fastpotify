@@ -47,6 +47,15 @@ const FALLBACK_SCRIPTS: &[(&str, char, &str)] = &[
     ("symbols", '\u{2605}', "symbol"),
 ];
 
+// Requiring one common phrase, rather than only `中`, keeps a partial Japanese
+// face from winning the Simplified Chinese slot and making one title jump
+// between two fallback fonts. The other cuts use a short phrase readers of
+// that locale are likely to encounter for the same reason.
+const HAN_SC_PROBES: &[char] = &['中', '文', '测', '试'];
+const HAN_TC_PROBES: &[char] = &['中', '文', '測', '試'];
+const HAN_JP_PROBES: &[char] = &['日', '本', '語'];
+const HAN_KR_PROBES: &[char] = &['韓', '國', '語'];
+
 /// The regional cut of a pan-CJK font a locale should be shown, longest
 /// prefix first.
 const HAN_REGIONS: &[(&str, &str)] = &[
@@ -78,6 +87,36 @@ const MAX_FACES: u32 = 64;
 pub fn fallbacks() -> &'static [Fallback] {
     static FONTS: OnceLock<Vec<Fallback>> = OnceLock::new();
     FONTS.get_or_init(load)
+}
+
+/// The vertical offset which makes a fallback face's baseline agree with the
+/// reference face after epaint centers their different alignment boxes.
+///
+/// Epaint centers a fallback's line box inside the primary face's line box.
+/// Fonts with generous leading (notably Hiragino Sans GB) therefore acquire a
+/// different effective baseline unless the distance from that centered box to
+/// the baseline is restored as a visual offset.
+pub(crate) fn baseline_offset_factor(
+    reference_bytes: &[u8],
+    reference_index: u32,
+    fallback_bytes: &[u8],
+    fallback_index: u32,
+) -> Option<f32> {
+    let reference = skrifa::FontRef::from_index(reference_bytes, reference_index).ok()?;
+    let fallback = skrifa::FontRef::from_index(fallback_bytes, fallback_index).ok()?;
+    let offset = center_to_baseline(&reference) - center_to_baseline(&fallback);
+    offset.is_finite().then_some(offset)
+}
+
+fn center_to_baseline(font: &skrifa::FontRef<'_>) -> f32 {
+    use skrifa::instance::{LocationRef, Size};
+
+    let metrics = font.metrics(Size::new(1.0), LocationRef::default());
+    center_to_baseline_from_metrics(metrics.ascent, metrics.descent, metrics.leading)
+}
+
+fn center_to_baseline_from_metrics(ascent: f32, descent: f32, leading: f32) -> f32 {
+    ascent - (ascent - descent + leading) / 2.0
 }
 
 /// The face Winamp's playlists were drawn in, or the nearest this desktop
@@ -316,9 +355,17 @@ fn probe_file(path: &Path, han: &str, best: &mut BTreeMap<&str, Candidate>) {
         for (script, probe, hint) in FALLBACK_SCRIPTS {
             // A face must draw the character, not merely map it: a bitmap or
             // colour-only font passes the charmap and renders nothing.
-            let covers = charmap
-                .map(*probe)
-                .is_some_and(|glyph| outlines.get(glyph).is_some());
+            let default_probe = [*probe];
+            let probes = if *script == "han" {
+                han_probes(han)
+            } else {
+                &default_probe
+            };
+            let covers = probes.iter().all(|probe| {
+                charmap
+                    .map(*probe)
+                    .is_some_and(|glyph| outlines.get(glyph).is_some())
+            });
             if !covers {
                 continue;
             }
@@ -382,15 +429,36 @@ fn face_score(family: &str, weight: f32, han: &str, hint: &str) -> u32 {
     // shape and a Chinese one and the font decides which a reader sees. A
     // pan-CJK family names its regional cut last ("Noto Sans CJK SC",
     // "PingFang TC"); prefer the cut this locale reads.
-    if let Some(region) = family
+    if hint == "cjk" {
+        match han_family_region(family) {
+            Some(region) if region != han => score += 40,
+            Some(_) => {}
+            // A locale-specific cut should beat a generic face which happens
+            // to contain the probe glyphs. This is what selects Hiragino Sans
+            // GB over Hiragino Sans W4 for Simplified Chinese on macOS.
+            None => score += 20,
+        }
+    }
+    score
+}
+
+fn han_family_region(family: &str) -> Option<&str> {
+    family
         .rsplit(' ')
         .next()
         .filter(|region| HAN_REGION_NAMES.contains(region))
-        && region != han
-    {
-        score += 40;
+        // Hiragino predates the SC/TC suffix convention and calls its
+        // Simplified Chinese cut "GB" instead.
+        .or_else(|| family.starts_with("hiragino sans gb").then_some("sc"))
+}
+
+fn han_probes(region: &str) -> &'static [char] {
+    match region {
+        "tc" | "hk" => HAN_TC_PROBES,
+        "jp" => HAN_JP_PROBES,
+        "kr" => HAN_KR_PROBES,
+        _ => HAN_SC_PROBES,
     }
-    score
 }
 
 /// The user's locale, lowercased, or an empty string when none is set. A
@@ -501,6 +569,47 @@ mod tests {
             simplified,
             "each locale ranks its own cut the same"
         );
+    }
+
+    #[test]
+    fn simplified_chinese_picks_hiragino_gb_over_generic_hiragino() {
+        let simplified = face_score("hiragino sans gb", 300.0, "sc", "cjk");
+        let generic = face_score("hiragino sans w4", 400.0, "sc", "cjk");
+        assert!(simplified < generic);
+        assert!(
+            generic < face_score("hiragino sans gb", 300.0, "jp", "cjk"),
+            "the GB alias must still lose outside a Simplified Chinese locale"
+        );
+    }
+
+    #[test]
+    fn han_coverage_is_locale_specific() {
+        assert_eq!(han_probes("sc"), ['中', '文', '测', '试']);
+        assert_eq!(han_probes("tc"), ['中', '文', '測', '試']);
+        assert_eq!(han_probes("hk"), han_probes("tc"));
+        assert_eq!(han_probes("jp"), ['日', '本', '語']);
+        assert_eq!(han_probes("kr"), ['韓', '國', '語']);
+    }
+
+    #[test]
+    fn baseline_offset_uses_centered_line_metrics() {
+        let inter = include_bytes!("../assets/fonts/InterVariable.ttf");
+        let offset = baseline_offset_factor(inter, 0, inter, 0).expect("Inter parses");
+        assert_eq!(offset, 0.0);
+
+        let font = skrifa::FontRef::from_index(inter, 0).expect("Inter parses");
+        let center = center_to_baseline(&font);
+        assert!(
+            (center - 0.363_77).abs() < 0.001,
+            "unexpected Inter centered baseline: {center}"
+        );
+
+        // Metrics measured at 100 px from the two faces involved in the
+        // reported macOS regression. Scaling them to em units must produce a
+        // size-independent 0.2338-em correction.
+        let inter_center = center_to_baseline_from_metrics(0.968_75, -0.241_21, 0.0);
+        let hiragino_center = center_to_baseline_from_metrics(0.88, -0.12, 0.5);
+        assert!((inter_center - hiragino_center - 0.233_77).abs() < 0.001);
     }
 
     #[test]

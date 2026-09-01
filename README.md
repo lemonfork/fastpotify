@@ -1,156 +1,87 @@
 # Fastpotify
 
-**Spotify, native and fast.** Fastpotify is a Spotify client written in
-Rust with [egui](https://github.com/emilk/egui). It plays music through
-[librespot](https://github.com/librespot-org/librespot). It typically uses
-100–250 MB of RAM, while Spotify's desktop app often uses 600 MB to over 1 GB.
-It runs on Linux, macOS, and Windows, starts in well under a second, and has no
-browser engine.
+**Your music server, native and fast.** Fastpotify is a small desktop client
+for [Navidrome](https://www.navidrome.org/) and compatible
+[OpenSubsonic](https://opensubsonic.netlify.app/) servers. It is written in
+Rust with [egui](https://github.com/emilk/egui), runs on Linux, macOS, and
+Windows, and has no embedded browser engine.
 
-**Playback needs Spotify Premium.** Free accounts can browse and search, but
-cannot play music through Fastpotify on this computer or another device.
-
-![Fastpotify showing a playlist, with the queue open and a track playing on a remote speaker](docs/screenshot.png)
+![Fastpotify showing a playlist with the queue open and a track playing](docs/screenshot.png)
 
 See [fastpotify.rocks](https://fastpotify.rocks/) for installation, setup,
 everyday use, and connection details.
 
-## What it does
+## Features
 
-- **Plays music on this computer.** Fastpotify appears as a Spotify Connect
-  device. Select it from your phone or play music in the app. Playback is
-  gapless and supports up to 320 kbps, with
-  optional volume normalisation and an on-disk audio cache.
-- **Controls other devices.** Move playback to a speaker, a phone, or
-  another computer from the device picker, and keep controlling it: play,
-  pause, skip, seek, shuffle, repeat, volume.
-- **Finds speakers on your network.** Fastpotify finds librespot, spotifyd,
-  and supported hardware receivers over mDNS. Once connected, they appear as
-  Spotify Connect devices.
-- **Library.** Browse playlists, Liked Songs, saved albums, followed artists,
-  podcasts, and saved episodes. Filter, pin, and reorder sidebar items.
-- **Search** across songs, artists, albums, playlists, podcasts, and episodes,
-  with a top result and per-type views.
-- **Home** with Made for you, Recently played, your top artists and songs, and
-  recommendations.
-- **Artist pages** with popular songs, a filterable discography, and related
-  artists. **Album**, **playlist**, and **podcast** pages support playback
-  from any row.
-- **Edit your playlists.** Create, rename, describe, reorder, and delete them.
-  Add songs from a row menu or drag them to a playlist in the sidebar.
-- **Queue** as a side panel or a page; add anything to it from a row menu.
-- **Resumes the last session.** On startup, the last song is paused where it
-  stopped. Play resumes it, and the other playback controls work before it
-  starts.
-- **Album-art colour.** Pages and the player bar take a tint from the cover
-  of what you are looking at or listening to. Turn it off in Settings.
-- **Light and dark**, or follow the system.
-- **Winamp mini player.** `Ctrl+M` opens a small player for classic `.wsz`
-  skins, drawn at 1x to 4x scale. It includes a spectrum analyser, playlist,
-  and equalizer. Drop a skin from the
-  [Winamp Skin Museum](https://skins.webamp.org) on either window to add it.
+- **Local playback.** Stream from the active server with play, pause, seek,
+  next, previous, shuffle, repeat, volume, output-device, and buffer controls.
+- **Authoritative local queue.** Manually queued songs play before the current
+  album or playlist. Duplicate occurrences remain distinct, and stale stream
+  or decoder work cannot roll the queue back.
+- **Library and search.** Browse artists, albums, playlists, and favorites;
+  search songs, artists, albums, and playlists on the server.
+- **Stable Home shelves.** Recently added and frequently played albums, local
+  recent songs, random songs, and user playlists.
+- **Playlist editing.** Create, rename, describe, add/remove songs, drag rows
+  into a new order, and delete. Reordering replaces the complete ordered song
+  list in one OpenSubsonic request, preserving duplicate occurrences.
+- **Optimistic interactions.** Playing, queueing, and favorite changes appear
+  immediately while backend work catches up.
+- **Album-art color**, light/dark/system themes, keyboard shortcuts, tray
+  playback, and desktop media controls.
+- **Winamp mini player.** Classic `.wsz` skins, spectrum analyser,
+  oscilloscope, playlist, and ten-band equalizer. Visualizers receive the
+  signal after EQ and before volume, so zero volume still dances.
 
-  ![The mini player wearing the built-in skin](docs/assets/images/winamp.png)
-- **Equalizer.** Winamp's ten bands and presets over the music played on
-  this computer, in Settings and in the skin.
-- **MilkDrop.** The visualiser, powered by
-  [projectM](https://github.com/projectM-visualizer/projectm), runs in its own
-  window and process. It supports fullscreen and `.milk` presets.
-- **Keyboard-first.** Every common action has a shortcut (`Ctrl+/` or `?` lists
-  them).
-- **Keeps playing when you close the window.** Fastpotify stays in the system
-  tray. Use the tray icon or media controls to reopen it, and quit from the
-  tray menu or with `Ctrl+Q`. You can make the close button quit in Settings.
-  On macOS, the Dock icon also reopens the window.
-- **Visible network activity.** Pages show a spinner while loading. The top
-  bar also shows slow or rate-limited Spotify requests.
-- **One instance.** Launching it again brings the existing window forward
-  instead of starting a second copy, on every platform.
-- **Desktop integration.** MPRIS on Linux, so media keys, the shell, and
-  `playerctl` see Fastpotify like any other player. On macOS and Windows,
-  `fastpotify next` and its siblings drive the running app from a terminal,
-  a launcher, or a hotkey.
+Fastpotify intentionally does not present Navidrome Jukebox or saved play
+queues as remote speaker control. The initial local pipeline does not claim
+gapless playback, loudness normalization, or an on-disk audio cache.
 
 ## Install
 
-On Arch Linux, Fastpotify is in the AUR:
+On Arch Linux:
 
-```bash
-yay -S fastpotify-bin      # the released build, ready made
-yay -S fastpotify          # the release, built from source
-yay -S fastpotify-git      # built from the latest commit
+```sh
+yay -S fastpotify-bin
 ```
 
-On macOS, with [Homebrew](https://brew.sh):
+On macOS with [Homebrew](https://brew.sh):
 
 ```sh
 brew install --cask crmne/tap/fastpotify
 ```
 
-Everywhere else, build the single binary with Rust 1.95 or newer:
+Or build the repository with its pinned Rust toolchain:
 
-```bash
+```sh
 cargo install --path .
 ```
 
-MilkDrop uses libprojectM, which is built from source. This needs CMake, a C++
-compiler, and libclang. To build without MilkDrop or those tools, run
-`cargo install --path . --no-default-features`. On Linux, you also need the
-development packages for ALSA, PulseAudio or PipeWire, and the windowing
-libraries. On Arch:
+Linux also needs the GUI and audio development packages. On Arch:
 
-```bash
-sudo pacman -S --needed alsa-lib libpulse libxkbcommon wayland cmake clang
+```sh
+sudo pacman -S --needed alsa-lib libpulse libxkbcommon wayland
 ```
 
-and on Debian or Ubuntu:
+On Debian or Ubuntu:
 
-```bash
-sudo apt install libasound2-dev libpulse-dev libxkbcommon-dev libwayland-dev \
-  cmake clang libclang-dev
+```sh
+sudo apt install libasound2-dev libpulse-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev
 ```
 
-On Windows, libprojectM is built with Visual Studio 2022, CMake, LLVM, and
-vcpkg (`vcpkg install glew:x64-windows-static-md`, with
-`VCPKG_INSTALLATION_ROOT` pointing at the vcpkg folder).
+`nix develop` provides the repository toolchain and native dependencies.
 
-With [Nix](https://nixos.org), `nix develop` provides all of it, along with
-the exact toolchain `rust-toolchain.toml` pins.
+## Connect a server
 
-Fastpotify uses system fonts for scripts not covered by its interface font,
-including Chinese, Japanese, Korean, Arabic, Hebrew, Thai, and Indic scripts.
-macOS and Windows include common fonts. On Linux, install `noto-fonts` and
-`noto-fonts-cjk` (Arch) or `fonts-noto` and `fonts-noto-cjk` (Debian or
-Ubuntu) if titles appear as empty boxes.
+Enter the Navidrome/OpenSubsonic base URL, username, and password in the app.
+Fastpotify verifies the account and server capabilities before saving it.
+Use HTTPS outside a network you fully trust.
 
-A desktop entry is provided in `packaging/applications/fastpotify.desktop`.
-
-## Sign in
-
-Press **Sign in with Spotify**. Your browser opens Spotify's consent page
-(Authorization Code with PKCE), so Fastpotify never sees your password. The
-app stores a refresh token in the platform's state directory
-(`~/.local/state/fastpotify` on Linux). You usually sign in once per machine.
-
-Playing music **on this computer** needs a second, one-time browser approval.
-Spotify handles streaming separately from library access. Start it from the
-device menu (**Set up playback here**) or Settings. It needs Spotify
-Premium, and librespot stores a reusable credential for later sessions.
-
-The Web API uses a shared app by default. You can add a personal Spotify
-Development Mode app in Settings → Account for a separate quota. Fastpotify
-still uses the shared app for requests that personal apps do not support.
-
-## Account safety
-
-We are not aware of a Spotify account being suspended for using Fastpotify
-or another librespot player with Premium. Sign-in happens on Spotify's own
-pages, audio uses the quality included with Premium, DRM stays intact, and
-Fastpotify does not rip tracks or block ads.
-
-Reported suspensions usually involve modded apps that remove ads from free
-accounts, track ripping, or stream manipulation. Fastpotify does none of
-those things, and [CONTRIBUTING.md](CONTRIBUTING.md) prohibits them.
+The credential lives separately from settings in the platform state
+directory and is owner-only on Unix. API requests use a fresh salted token;
+passwords and authenticated URLs never enter media references, artwork cache
+keys, logs, or desktop-control metadata. See
+[How It Connects](docs/_reference/how-it-connects.md).
 
 ## Keyboard shortcuts
 
@@ -166,102 +97,73 @@ those things, and [CONTRIBUTING.md](CONTRIBUTING.md) prohibits them.
 | `Ctrl+F` or `/` | Search |
 | `Ctrl+B` | Show or hide the sidebar |
 | `Alt+←` / `Alt+→` | Back or forward |
-| `Ctrl+H` / `Ctrl+L` | Home / Liked Songs |
+| `Ctrl+H` / `Ctrl+L` | Home / Favorites |
 | `Ctrl+Shift+A` / `Ctrl+Shift+B` | Playing artist / album |
-| `Ctrl+M` | Winamp mini player |
-| `Ctrl+Shift+K` | MilkDrop |
+| `Ctrl+M` (`Cmd+Shift+M` on macOS) | Winamp mini player |
 | `Ctrl+,` | Settings |
 | `Ctrl+/` or `?` | All shortcuts |
 | `Ctrl+Q` | Quit |
 
-On macOS, `Cmd` replaces `Ctrl`.
+On macOS, Cmd replaces Ctrl where appropriate.
 
-## Controlling it from outside
+## Desktop control
 
-On Linux, Fastpotify is an MPRIS player, so `playerctl --player=fastpotify
-play-pause` already works.
+Linux exposes MPRIS, so `playerctl --player=fastpotify play-pause` works.
+On macOS and Windows, subcommands control the running instance:
 
-macOS and Windows have no such bus, so the same verbs are subcommands. They
-talk to the instance already running and print nothing on success:
-
-```
+```text
 fastpotify play-pause          fastpotify volume 40
-fastpotify play                fastpotify volume-up [percent]
-fastpotify pause               fastpotify volume-down [percent]
+fastpotify play                fastpotify volume-up 10
+fastpotify pause               fastpotify volume-down 10
 fastpotify next                fastpotify mute
-fastpotify previous            fastpotify shuffle [on|off]
-fastpotify seek 15             fastpotify repeat [off|context|track]
-fastpotify seek -- -15         fastpotify like
-fastpotify seek-to 90          fastpotify play-uri spotify:playlist:37i9…
-fastpotify show                fastpotify transfer <device-id>
-fastpotify now-playing [--raw] fastpotify devices [--raw]
+fastpotify previous            fastpotify shuffle on
+fastpotify seek 15             fastpotify repeat context
+fastpotify seek -- -15         fastpotify favorite
+fastpotify seek-to 90          fastpotify play-ref <fastpotify:...>
+fastpotify show                fastpotify now-playing --raw
 ```
 
-`shuffle` and `repeat` toggle when used without an argument. Pass a state to
-set it directly. `like` adds or removes the playing track from your library.
+`play-ref` and MPRIS OpenUri accept only canonical, secret-free Fastpotify
+media references.
 
-`now-playing` prints one readable line. `--raw` prints tab-separated fields:
-state, title, artists, album, position_ms, duration_ms, volume, shuffle,
-repeat, art_url, saved, and device. `saved` is `yes`, `no`, or `unknown` while
-loading. New fields are appended to keep older scripts working.
+## Settings and files
 
-`devices` lists Spotify Connect devices with the ID first and the active one
-marked with `*`. `--raw` prints JSON. The command refreshes the device list,
-so the first call after startup may be empty. Run it again if needed.
+Preferences remain in the existing Fastpotify application directories so an
+upgrade keeps themes, layout, shortcuts, and Winamp skins. Server credentials
+are in state, while artwork and lyrics are disposable caches. Session and
+history files are scoped to a non-secret server/user profile fingerprint.
+See [Settings & Files](docs/_reference/settings-and-files.md).
 
-A verb exits non-zero when Fastpotify is not running.
+## Architecture
 
-Launchers such as Raycast or Alfred can use these commands. The Stream Deck
-plugin uses the same interface.
+- `src/api/`: OpenSubsonic wire DTOs, provider-neutral domain models,
+  authentication, metadata, artwork, and stream requests.
+- `src/player.rs`: local authoritative queue, bounded streaming, decode
+  generations, and playback state.
+- `src/sink.rs`, `src/eq.rs`, `src/vis.rs`: output, EQ, and the post-EQ,
+  pre-volume visualizer tap.
+- `src/backend.rs`: async runtime and UI channels.
+- `src/app.rs`, `src/model.rs`, `src/ui/`: state, optimistic actions,
+  navigation, and views.
 
-## Settings
+The UI thread never performs network or playback work.
 
-Settings live in one readable JSON file (`~/.config/fastpotify/settings.json`
-on Linux). They include the Connect device name, bitrate, normalisation,
-autoplay, gapless playback, the audio backend (PulseAudio/PipeWire or ALSA on
-Linux), audio cache size, theme, sidebar state, whether pages take colour
-from artwork, and the mini player's skin and size.
-Playback settings apply when you press **Apply and restart playback**.
+## Demo and tests
 
-Caches (audio, artwork) live under the cache directory and can be deleted at
-any time without signing you out.
+Demo mode renders deterministic sample data without connecting to a server:
 
-## How it is built
-
-- `src/player.rs`: librespot playback, mixing, and Spotify Connect state.
-- `src/api/`: shared and personal Web API sessions, routing, concurrency, and
-  rate limits.
-- `src/backend.rs`: the tokio runtime and channels used by the interface.
-- `src/images.rs`: album art loading, caching, and accent-colour extraction.
-- `src/app.rs`, `src/model.rs`, `src/ui/`: state, navigation, and views.
-- `src/mpris.rs`: Linux media controls.
-
-Fastpotify pins its Rust toolchain in `rust-toolchain.toml`; `cargo test`
-covers the API models, dual-session routing, PKCE, the player state machine,
-and a headless render of every page, panel, and dialog.
-
-To look at the interface without a Spotify account, build with the `demo`
-feature and start it with sample data:
-
-```bash
+```sh
 cargo run --features demo -- --demo --demo-page playlist:pl1 --demo-show queue
 ```
 
-Demo mode never writes settings. `--demo-shot <PATH>` writes the window to a
-PNG and exits, which is how the screenshot above is made.
-
-## Contributing
-
-Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening an issue or pull
-request. It covers project scope and required checks.
+`--demo-shot <PATH>` writes a screenshot. Contribution checks and product
+boundaries are in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Acknowledgements
 
-Fastpotify uses [librespot](https://github.com/librespot-org/librespot),
-[egui](https://github.com/emilk/egui), the [Inter](https://rsms.me/inter/)
-typeface (OFL), and [Lucide](https://lucide.dev) icons (ISC).
-
-Fastpotify is an independent project and is not affiliated with Spotify.
-Spotify is a trademark of Spotify AB.
+Fastpotify uses [egui](https://github.com/emilk/egui),
+[Symphonia](https://github.com/pdeljanov/Symphonia), the
+[Inter](https://rsms.me/inter/) typeface (OFL), and
+[Lucide](https://lucide.dev) icons (ISC).
 
 Licensed under the [MIT License](LICENSE).

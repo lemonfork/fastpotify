@@ -12,12 +12,15 @@ pub(super) const fn platform_shortcut(ctrl: &'static str, cmd: &'static str) -> 
 pub(super) const SIDEBAR_SHORTCUT: &str = platform_shortcut("Ctrl+B", "Cmd+B");
 pub(super) const QUIT_SHORTCUT: &str = platform_shortcut("Ctrl+Q", "Cmd+Q");
 pub(super) const WINAMP_SHORTCUT: &str = platform_shortcut("Ctrl+M", "Cmd+Shift+M");
-pub(super) const MILKDROP_SHORTCUT: &str = platform_shortcut("Ctrl+Shift+K", "Cmd+Shift+K");
 
 pub fn handle(app: &mut App, ctx: &egui::Context) {
     let typing = ctx.memory(|memory| memory.focused().is_some());
     let mut actions = Vec::new();
+    let mut open_current_artist = false;
+    let mut open_current_album = false;
     ctx.input_mut(|input| {
+        open_current_artist = input.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::A);
+        open_current_album = input.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::B);
         let mut key = |modifiers: Modifiers, key: Key, action: Action| {
             if input.consume_key(modifiers, key) {
                 actions.push(action);
@@ -42,7 +45,7 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
         } else {
             key(Modifiers::COMMAND, Key::H, Action::Open(Page::Home));
         }
-        key(Modifiers::COMMAND, Key::L, Action::Open(Page::LikedSongs));
+        key(Modifiers::COMMAND, Key::L, Action::Open(Page::Favorites));
         // Cmd+M minimises on macOS.
         if cfg!(target_os = "macos") {
             key(
@@ -53,12 +56,6 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
         } else {
             key(Modifiers::COMMAND, Key::M, Action::ToggleWinampWindow);
         }
-        // Winamp's key for starting and stopping the visualisation plug-in.
-        key(
-            Modifiers::COMMAND | Modifiers::SHIFT,
-            Key::K,
-            Action::ToggleWinampMilkdrop,
-        );
         key(
             Modifiers::COMMAND,
             Key::Slash,
@@ -70,16 +67,6 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
         key(Modifiers::COMMAND, Key::ArrowRight, Action::Next);
         key(Modifiers::COMMAND, Key::ArrowUp, Action::VolumeBy(5));
         key(Modifiers::COMMAND, Key::ArrowDown, Action::VolumeBy(-5));
-        key(
-            Modifiers::COMMAND | Modifiers::SHIFT,
-            Key::A,
-            Action::OpenUri("artist".into()),
-        );
-        key(
-            Modifiers::COMMAND | Modifiers::SHIFT,
-            Key::B,
-            Action::OpenUri("album".into()),
-        );
         // Cmd+Shift+Q is Log Out, taken by the window server.
         if cfg!(target_os = "macos") {
             key(Modifiers::COMMAND, Key::U, Action::ToggleQueuePanel);
@@ -112,28 +99,20 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
             key(Modifiers::NONE, Key::Slash, Action::FocusSearch);
         }
     });
-    // Resolve the "open current artist/album" placeholders.
-    for action in actions {
-        match action {
-            Action::OpenUri(kind) if kind == "artist" => {
-                if let Some(id) = app
-                    .now_playing()
-                    .and_then(|now| now.artists.first().and_then(|artist| artist.id.clone()))
-                {
-                    app.actions.push(Action::Open(Page::Artist(id)));
-                }
-            }
-            Action::OpenUri(kind) if kind == "album" => {
-                if let Some(now) = app.now_playing() {
-                    if let Some(id) = now.album_id {
-                        app.actions.push(Action::Open(Page::Album(id)));
-                    } else if let Some(id) = now.show_id {
-                        app.actions.push(Action::Open(Page::Show(id)));
-                    }
-                }
-            }
-            other => app.actions.push(other),
-        }
+    app.actions.extend(actions);
+    if open_current_artist
+        && let Some(id) = app
+            .now_playing()
+            .and_then(|now| now.song.artists.first()?.id.clone())
+    {
+        app.actions.push(Action::Open(Page::Artist(id)));
+    }
+    if open_current_album
+        && let Some(id) = app
+            .now_playing()
+            .and_then(|now| now.song.album.map(|album| album.id))
+    {
+        app.actions.push(Action::Open(Page::Album(id)));
     }
     // Map mouse back and forward buttons to navigation.
     let (back, forward) = ctx.input(|input| {
@@ -148,12 +127,8 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
     if forward {
         app.actions.push(Action::Forward);
     }
-    if ctx.input(|input| input.key_pressed(Key::Escape)) {
-        if app.dialog.is_some() {
-            app.actions.push(Action::CloseDialog);
-        } else if app.show_devices {
-            app.show_devices = false;
-        }
+    if ctx.input(|input| input.key_pressed(Key::Escape)) && app.dialog.is_some() {
+        app.actions.push(Action::CloseDialog);
     }
 }
 
@@ -177,7 +152,7 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     (SIDEBAR_SHORTCUT, "Show or hide the sidebar"),
     ("Alt+←  /  Alt+→", "Back or forward"),
     (platform_shortcut("Ctrl+H", "Cmd+Shift+H"), "Home"),
-    (platform_shortcut("Ctrl+L", "Cmd+L"), "Liked Songs"),
+    (platform_shortcut("Ctrl+L", "Cmd+L"), "Favorites"),
     (
         platform_shortcut("Ctrl+Shift+A", "Cmd+Shift+A"),
         "Go to the playing artist",
@@ -187,12 +162,6 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
         "Go to the playing album",
     ),
     (WINAMP_SHORTCUT, "Winamp mini player"),
-    (MILKDROP_SHORTCUT, "MilkDrop, under the mini player"),
-    ("F  or  double-click", "MilkDrop: fill the screen"),
-    ("→  /  N", "MilkDrop: next preset"),
-    ("←  /  P", "MilkDrop: previous preset"),
-    ("L", "MilkDrop: keep this preset"),
-    ("Esc", "MilkDrop: leave full screen, or close"),
     (platform_shortcut("Ctrl+,", "Cmd+,"), "Settings"),
     (
         platform_shortcut("Ctrl+/ or ?", "Cmd+/ or ?"),
@@ -209,19 +178,11 @@ mod tests {
     #[test]
     fn shortcut_constants_name_the_platform_modifier() {
         let expected = if cfg!(target_os = "macos") {
-            ["Cmd+B", "Cmd+Q", "Cmd+Shift+M", "Cmd+Shift+K"]
+            ["Cmd+B", "Cmd+Q", "Cmd+Shift+M"]
         } else {
-            ["Ctrl+B", "Ctrl+Q", "Ctrl+M", "Ctrl+Shift+K"]
+            ["Ctrl+B", "Ctrl+Q", "Ctrl+M"]
         };
-        assert_eq!(
-            [
-                SIDEBAR_SHORTCUT,
-                QUIT_SHORTCUT,
-                WINAMP_SHORTCUT,
-                MILKDROP_SHORTCUT,
-            ],
-            expected
-        );
+        assert_eq!([SIDEBAR_SHORTCUT, QUIT_SHORTCUT, WINAMP_SHORTCUT], expected);
     }
 
     #[test]

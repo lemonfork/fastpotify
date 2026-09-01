@@ -18,12 +18,15 @@ pub mod media;
 #[cfg(target_os = "linux")]
 #[path = "mpris.rs"]
 pub mod media_controls;
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
 #[path = "media_native.rs"]
 pub mod media_controls;
-pub mod milkdrop;
+#[cfg(target_os = "macos")]
+#[path = "media_macos.rs"]
+pub mod media_controls;
 pub mod model;
 pub mod opener;
+mod opus;
 pub mod paths;
 pub mod player;
 pub mod resample;
@@ -43,4 +46,3 @@ pub mod updates;
 pub mod util;
 pub mod vis;
 pub mod winamp;
-pub mod zeroconf;

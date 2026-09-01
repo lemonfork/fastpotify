@@ -1,6 +1,6 @@
 ---
 title: Settings & Files
-description: Where Fastpotify keeps configuration, credentials, and caches, and what is safe to delete.
+description: Where Fastpotify keeps configuration, Navidrome credentials, profile state, and caches.
 nav_order: 0
 ---
 
@@ -10,107 +10,80 @@ Fastpotify follows each platform's conventions. On Linux:
 
 | What | Where | Safe to delete? |
 | --- | --- | --- |
-| Settings | `~/.config/fastpotify/settings.json` | Yes, you lose preferences |
+| Settings | `~/.config/fastpotify/settings.json` | Yes, preferences reset |
 | Winamp skins | `~/.config/fastpotify/skins/` | Yes, you add them again |
-| MilkDrop presets | `~/.config/fastpotify/milkdrop/` | Yes, you fetch them again |
-| Shared Web API sign-in | `~/.local/state/fastpotify/shared_web_api_token.json` | Yes, you sign in again |
-| Personal Web API sign-in | `~/.local/state/fastpotify/personal_web_api_token.json` | Yes, the personal app is disabled |
-| Playback credential | `~/.local/state/fastpotify/credentials/` | Yes, you approve playback again |
-| Last session | `~/.local/state/fastpotify/session.json` | Yes |
-| Play history | `~/.local/state/fastpotify/history.json` | Yes |
-| Audio cache | `~/.cache/fastpotify/audio/` | Always |
+| Active server credential | `~/.local/state/fastpotify/navidrome.json` | Yes, you sign in again |
+| Profile session | `~/.local/state/fastpotify/profiles/<profile>/session.json` | Yes |
+| Profile play history | `~/.local/state/fastpotify/profiles/<profile>/history.json` | Yes |
 | Artwork cache | `~/.cache/fastpotify/art/` | Always |
 | Lyrics cache | `~/.cache/fastpotify/lyrics/` | Always |
-| Account-scoped playlist cache | `~/.cache/fastpotify/playlists/<account-id>/` | Always |
 | Last run's log | `~/.local/state/fastpotify/fastpotify.log` | Always |
 | Crash log | `~/.local/state/fastpotify/panic.log` | Always |
 
-Clearing caches never signs you out; credentials live in *state*, not
-*cache*. Web API token files are written with owner-only permissions.
-Signing out from Settings deletes both Web API grants and the separate
-playback credential.
+The credential file contains the server URL, username, and password. It is
+separate from settings and caches, atomically replaced, and owner-only on
+Unix. Signing out deletes it. Logs, sessions, media references, and artwork
+cache keys never contain request authentication parameters.
 
-On macOS, settings, state, and the logs are in
-`~/Library/Application Support/me.paolino.fastpotify` and the caches in
+Profile directories use a non-secret fingerprint of the normalized server
+URL and username. This prevents opaque OpenSubsonic IDs from one server being
+restored against another. The existing application/config directory names
+remain `fastpotify` so upgrades do not create a second set of preferences.
+
+On macOS, settings, state, and logs are in
+`~/Library/Application Support/me.paolino.fastpotify` and caches in
 `~/Library/Caches/me.paolino.fastpotify`. On Windows, settings are in
-`%APPDATA%\paolino\fastpotify\config`, state and the logs in
-`%LOCALAPPDATA%\paolino\fastpotify\data`, and the caches in
+`%APPDATA%\paolino\fastpotify\config`, state and logs in
+`%LOCALAPPDATA%\paolino\fastpotify\data`, and caches in
 `%LOCALAPPDATA%\paolino\fastpotify\cache`.
 
 ## settings.json
 
-Settings are stored in one readable JSON file and written atomically. Its
-main fields are:
+Settings are readable JSON and are written atomically. Unknown fields from an
+older release are ignored, so removing an obsolete integration does not make
+the file unreadable. Main fields include:
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `device_name` | `Fastpotify` | Name on Spotify Connect |
-| `bitrate` | `320` | 96, 160, or 320 kbps |
-| `normalisation` | `false` | Volume normalisation |
-| `autoplay` | `true` | Keep playing similar music at the end |
-| `gapless` | `true` | Gapless playback |
-| `audio_backend` | platform | `pulseaudio` or `rodio` on Linux |
-| `audio_cache_mb` | `1024` | On-disk audio cache budget |
+| `bitrate` | `320` | Preferred server transcoding ceiling in kbps; an empty transcode falls back to the original file |
+| `audio_device` | system default | Local output device |
+| `audio_buffer_ms` | `100` | Output buffer; lower is more responsive, higher tolerates load |
 | `theme` | `dark` | `dark`, `light`, or `system` |
 | `accent_from_art` | `true` | Tint pages with album art |
-| `sidebar_compact` | `false` | Names only in the library sidebar, no covers |
-| `tracklist_compact` | `false` | One-line track rows without covers |
-| `winamp_window` | `false` | The window is the Winamp mini player |
-| `skin` | none | File or folder name in the skins folder; blank uses the built-in skin |
+| `volume` | `70%` | Last local volume |
+| `sidebar_visible` | `true` | Show the library sidebar |
+| `sidebar_compact` | `false` | Names only in the sidebar, without covers |
+| `tracklist_compact` | `false` | One-line song rows without covers |
+| `keep_playing_in_background` | `true` | Closing the main window keeps playback in the tray |
+| `check_for_updates` | `true` | Ask GitHub once a day for a newer release |
+| `pinned_contexts` | empty | Server-scoped media references pinned in the sidebar |
+| `winamp_window` | `false` | Use the Winamp mini-player window |
+| `skin` | built in | Winamp skin file or folder name |
 | `skin_scale` | by display | Screen pixels per skin pixel, 1 to 4 |
 | `winamp_on_top` | `false` | Keep the mini player above other windows |
-| `vis` | `bars` | The mini player's visualiser: `bars`, `scope`, or `off` |
-| `playlist_open` | `false` | The playlist window is open under the mini player |
-| `playlist_height` | `174` | The playlist window's height in skin pixels |
-| `eq_open` | `false` | The equalizer window is open under the mini player |
-| `eq_on` | `false` | The equalizer shapes local playback |
-| `eq_preamp_db` | `0` | The preamp, in decibels, -12 to 12 |
-| `eq_bands_db` | ten zeros | The bands from 60 Hz to 16 kHz, in decibels, -12 to 12 |
-| `balance` | `0` | Left to right, -1 to 1, for local playback |
+| `vis` | `bars` | `bars`, `scope`, or `off` |
+| `eq_on` | `false` | Apply the ten-band equalizer |
+| `eq_preamp_db` | `0` | Equalizer preamp in dB |
+| `eq_bands_db` | ten zeros | Bands from 60 Hz to 16 kHz in dB |
+| `balance` | `0` | Left/right balance from -1 to 1 |
 | `mono` | `false` | Play both channels the same |
-| `playlist_shaded` | `false` | The playlist window is rolled up to its title bar |
-| `winamp_shaded` | `false` | The main window is rolled up to its title bar |
-| `milkdrop_open` | `false` | The MilkDrop window is open |
-| `milkdrop_seconds` | `30` | How long each MilkDrop preset plays |
-| `milkdrop_fps` | `60` | MilkDrop frame rate; `0` is uncapped |
-| `milkdrop_screen_hz` | `0` | Last reported display refresh rate |
-| `milkdrop_fullscreen` | `false` | The MilkDrop window fills the screen |
-| `milkdrop_size` | `640, 480` | The MilkDrop window's size in points |
-| `keep_playing_in_background` | `true` | Close to tray |
-| `check_for_updates` | `true` | Ask GitHub once a day for a newer release |
-| `web_client_id` | none | Optional personal Spotify app id used alongside shared coverage |
 
 ## Command line
 
-```
-fastpotify [OPTIONS]
+Run `fastpotify --help` for the complete list. Starting without a subcommand
+opens or raises the app. Desktop-control verbs include `play`, `pause`,
+`play-pause`, `next`, `previous`, `seek`, `seek-to`, `volume`, `mute`,
+`shuffle`, `repeat`, `favorite`, `play-ref`, `now-playing`, and `show`.
 
-  --device-name <NAME>  Spotify Connect name for this session
-  -v, --verbose         More logs from librespot and the API client
-```
+`play-ref` accepts only a canonical, secret-free `fastpotify:` media
+reference. On Linux the running app uses MPRIS; other platforms send commands
+to the existing instance over its loopback control socket.
 
-Attach `fastpotify.log` from the state directory to bug reports. It contains
-the last run's output, including extra lines from `fastpotify -v`. After a
-crash, attach `panic.log` too.
+Attach `fastpotify.log` to bug reports. It contains the last run's output and
+must not contain credentials. After a crash, attach `panic.log` too.
 
 ## Demo mode
 
-Builds made with `cargo build --features demo` accept `--demo`, which loads
-sample data for screenshots and interface work. Demo mode never writes
-settings.
-
-`--demo-page` opens a page, such as `home`, `playlist:pl1`, or `artist:art0`,
-and `--demo-show` adds surfaces on top of it: a comma separated list of
-`queue`, `devices`, `shortcuts`, `premium`, `create`, `light`, `focus`, `winamp`,
-`playlist`, `eq`, `eq-shade`, and `compact`.
-
-`--demo-shot <PATH>` writes the window to a PNG and exits, which is how the
-screenshots in these pages are made:
-
-```
-cargo run --release --features demo -- \
-  --demo-shot docs/screenshot.png --demo-page playlist:pl1 --demo-show queue
-```
-
-The image uses the current window size. `--demo-shot-delay <MS>` sets how long
-to wait for cover art before taking it.
+Builds made with `cargo build --features demo` accept `--demo`, sample pages,
+and `--demo-shot <PATH>` for deterministic UI screenshots. Demo mode does not
+connect to a server or write settings.

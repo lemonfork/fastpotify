@@ -6,7 +6,7 @@ use egui::{
 
 use crate::api::models::*;
 use crate::app::App;
-use crate::model::{Action, Dialog, DragEntry, DragTrack, Page, RowContext, RowPick};
+use crate::model::{Action, Dialog, DragTrack, Page, RowContext, RowPick};
 use crate::theme::{self, Icon, Palette};
 use crate::util;
 
@@ -248,12 +248,12 @@ pub fn menu_frame(palette: &Palette) -> egui::Frame {
 /// Context menu for actions on selected tracks.
 ///
 /// Tracks stay in table order rather than selection order.
-pub fn picked_menu(ui: &mut Ui, app: &mut App, songs: &[(String, String)]) {
+pub fn picked_menu(ui: &mut Ui, app: &mut App, songs: &[Song]) {
     let palette = app.palette;
     ui.set_min_width(220.0);
     ui.set_max_width(300.0);
     let count = songs.len();
-    let uris: Vec<String> = songs.iter().map(|(uri, _)| uri.clone()).collect();
+    let ids: Vec<MediaId> = songs.iter().map(|song| song.id.clone()).collect();
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.add_space(10.0);
@@ -271,16 +271,16 @@ pub fn picked_menu(ui: &mut Ui, app: &mut App, songs: &[(String, String)]) {
         });
     }
     // Set one explicit saved state for the full selection.
-    let all_saved = uris.iter().all(|uri| app.is_saved(uri).unwrap_or(false));
+    let all_saved = ids.iter().all(|id| app.is_saved(id).unwrap_or(false));
     let (icon, text) = if all_saved {
-        (Icon::HeartFilled, "Remove from Liked Songs")
+        (Icon::HeartFilled, "Remove from Favorites")
     } else {
-        (Icon::Heart, "Save to Liked Songs")
+        (Icon::Heart, "Add to Favorites")
     };
     if menu_item(ui, &palette, Some(icon), text) {
-        app.actions.push(Action::SetSavedMany {
-            uris: uris.clone(),
-            saved: !all_saved,
+        app.actions.push(Action::SetFavoriteMany {
+            ids: ids.clone(),
+            favorite: !all_saved,
         });
     }
     let playlists = app.editable_playlists();
@@ -291,7 +291,7 @@ pub fn picked_menu(ui: &mut Ui, app: &mut App, songs: &[(String, String)]) {
             app.actions.push(Action::ShowDialog(Dialog::CreatePlaylist {
                 name: String::new(),
                 public: false,
-                add_uris: uris.clone(),
+                songs: songs.to_vec(),
             }));
         }
         if !playlists.is_empty() {
@@ -305,7 +305,7 @@ pub fn picked_menu(ui: &mut Ui, app: &mut App, songs: &[(String, String)]) {
                         app.actions.push(Action::AddToPlaylist {
                             playlist_id: id.clone(),
                             playlist_name: name.clone(),
-                            uris: uris.clone(),
+                            songs: songs.to_vec(),
                         });
                     }
                 }
@@ -318,179 +318,131 @@ pub fn item_menu(
     app: &mut App,
     item: &PlayableItem,
     context: Option<&RowContext>,
-    index: Option<usize>,
+    index: Option<u32>,
 ) {
     let palette = app.palette;
     ui.set_min_width(220.0);
     ui.set_max_width(300.0);
-    let uri = item.uri().to_string();
-    let label = item.name().to_string();
+    let song = item.as_track();
     if menu_item(ui, &palette, Some(Icon::ListEnd), "Play next") {
         app.actions.push(Action::AddToQueue {
-            uri: uri.clone(),
-            label: label.clone(),
+            song: song.clone(),
+            label: song.name.clone(),
         });
     }
-    if item.is_track() {
-        let saved = app.is_saved(&uri).unwrap_or(false);
-        let (icon, text) = if saved {
-            (Icon::HeartFilled, "Remove from Liked Songs")
-        } else {
-            (Icon::Heart, "Save to Liked Songs")
-        };
-        if menu_item(ui, &palette, Some(icon), text) {
-            app.actions.push(Action::ToggleSaved(uri.clone()));
+    let favorite = app.is_saved(&song.id).unwrap_or(song.starred);
+    let (icon, text) = if favorite {
+        (Icon::HeartFilled, "Remove from Favorites")
+    } else {
+        (Icon::Heart, "Add to Favorites")
+    };
+    if menu_item(ui, &palette, Some(icon), text) {
+        app.actions.push(Action::ToggleFavorite(song.id.clone()));
+    }
+    let playlists = app.editable_playlists();
+    ui.menu_button("Add to playlist", |ui| {
+        ui.set_min_width(220.0);
+        ui.set_max_width(300.0);
+        if menu_item(ui, &palette, Some(Icon::Plus), "New playlist") {
+            app.actions.push(Action::ShowDialog(Dialog::CreatePlaylist {
+                name: String::new(),
+                public: false,
+                songs: vec![song.clone()],
+            }));
         }
-        let playlists = app.editable_playlists();
-        ui.menu_button("Add to playlist", |ui| {
-            ui.set_min_width(220.0);
-            ui.set_max_width(300.0);
-            if menu_item(ui, &palette, Some(Icon::Plus), "New playlist") {
-                app.actions.push(Action::ShowDialog(Dialog::CreatePlaylist {
-                    name: String::new(),
-                    public: false,
-                    add_uris: vec![uri.clone()],
-                }));
-            }
-            if !playlists.is_empty() {
-                menu_separator(ui, &palette);
-            }
-            egui::ScrollArea::vertical()
-                .max_height(320.0)
-                .show(ui, |ui| {
-                    for (id, name) in &playlists {
-                        if menu_item(ui, &palette, Some(Icon::ListMusic), name) {
-                            app.actions.push(Action::AddToPlaylist {
-                                playlist_id: id.clone(),
-                                playlist_name: name.clone(),
-                                uris: vec![uri.clone()],
-                            });
-                        }
+        if !playlists.is_empty() {
+            menu_separator(ui, &palette);
+        }
+        egui::ScrollArea::vertical()
+            .max_height(320.0)
+            .show(ui, |ui| {
+                for (id, name) in &playlists {
+                    if menu_item(ui, &palette, Some(Icon::ListMusic), name) {
+                        app.actions.push(Action::AddToPlaylist {
+                            playlist_id: id.clone(),
+                            playlist_name: name.clone(),
+                            songs: vec![song.clone()],
+                        });
                     }
-                });
-        });
-    } else if menu_item(ui, &palette, Some(Icon::Bookmark), "Save episode") {
-        app.actions.push(Action::ToggleSaved(uri.clone()));
-    }
+                }
+            });
+    });
     if let Some(RowContext::Context {
-        editable_playlist: Some((playlist_id, _)),
+        editable_playlist: Some(playlist_id),
         ..
     }) = context
+        && let Some(index) = index
+        && menu_item(ui, &palette, Some(Icon::Minus), "Remove from this playlist")
     {
-        if let Some(index) = index {
-            if index > 0 && menu_item(ui, &palette, Some(Icon::ChevronUp), "Move up") {
-                app.actions.push(Action::MoveInPlaylist {
-                    playlist_id: playlist_id.clone(),
-                    from: index as u32,
-                    to: index as u32 - 1,
-                });
-            }
-            if menu_item(ui, &palette, Some(Icon::ChevronDown), "Move down") {
-                app.actions.push(Action::MoveInPlaylist {
-                    playlist_id: playlist_id.clone(),
-                    from: index as u32,
-                    to: index as u32 + 2,
-                });
-            }
-        }
-        if menu_item(ui, &palette, Some(Icon::Minus), "Remove from this playlist") {
-            app.actions.push(Action::RemoveFromPlaylist {
-                playlist_id: playlist_id.clone(),
-                uris: vec![uri.clone()],
-            });
-        }
+        app.actions.push(Action::RemoveFromPlaylist {
+            playlist_id: playlist_id.clone(),
+            row_indices: vec![index],
+        });
     }
     menu_separator(ui, &palette);
-    match item {
-        PlayableItem::Track(track) => {
-            if menu_item(ui, &palette, Some(Icon::Radio), "Go to song radio") {
-                app.actions.push(Action::PlayTrackRadio(uri.clone()));
-            }
-            let artists: Vec<&ArtistRef> = track
-                .artists
-                .iter()
-                .filter(|artist| artist.id.is_some())
-                .collect();
-            if artists.len() == 1 {
-                if menu_item(ui, &palette, Some(Icon::User), "Go to artist") {
-                    app.actions.push(Action::Open(Page::Artist(
-                        artists[0].id.clone().unwrap_or_default(),
-                    )));
+    let artists: Vec<&ArtistRef> = song
+        .artists
+        .iter()
+        .filter(|artist| artist.id.is_some())
+        .collect();
+    if artists.len() == 1 {
+        if menu_item(ui, &palette, Some(Icon::User), "Go to artist") {
+            app.actions
+                .push(Action::Open(Page::Artist(artists[0].id.clone().unwrap())));
+        }
+    } else if artists.len() > 1 {
+        ui.menu_button("Go to artist", |ui| {
+            ui.set_min_width(200.0);
+            for artist in &artists {
+                if menu_item(ui, &palette, Some(Icon::User), &artist.name) {
+                    app.actions
+                        .push(Action::Open(Page::Artist(artist.id.clone().unwrap())));
                 }
-            } else if artists.len() > 1 {
-                ui.menu_button("Go to artist", |ui| {
-                    ui.set_min_width(200.0);
-                    for artist in &artists {
-                        if menu_item(ui, &palette, Some(Icon::User), &artist.name) {
-                            app.actions.push(Action::Open(Page::Artist(
-                                artist.id.clone().unwrap_or_default(),
-                            )));
-                        }
-                    }
-                });
             }
-            if let Some(album) = &track.album
-                && !album.id.is_empty()
-                && menu_item(ui, &palette, Some(Icon::Disc), "Go to album")
-            {
-                app.actions
-                    .push(Action::Open(Page::Album(album.id.clone())));
-            }
-        }
-        PlayableItem::Episode(episode) => {
-            if let Some(show) = &episode.show
-                && menu_item(ui, &palette, Some(Icon::Mic), "Go to podcast")
-            {
-                app.actions.push(Action::Open(Page::Show(show.id.clone())));
-            }
-        }
+        });
+    }
+    if let Some(album) = &song.album
+        && menu_item(ui, &palette, Some(Icon::Disc), "Go to album")
+    {
+        app.actions
+            .push(Action::Open(Page::Album(album.id.clone())));
     }
     menu_separator(ui, &palette);
     if menu_item(ui, &palette, Some(Icon::Copy), "Copy link") {
-        app.actions.push(Action::CopyLink(uri.clone()));
-    }
-    if menu_item(ui, &palette, Some(Icon::ExternalLink), "Open in Spotify") {
-        app.actions.push(Action::OpenInSpotify(uri));
+        app.actions.push(Action::CopyLink(song.id.clone()));
     }
 }
 
-/// Menu for a context (playlist, album, artist, show).
+/// Menu for an artist, album, or playlist context.
 pub fn context_menu_items(
     ui: &mut Ui,
     app: &mut App,
-    uri: &str,
-    name: &str,
+    media: &MediaId,
     owned_playlist: Option<&Playlist>,
 ) {
     let palette = app.palette;
     ui.set_min_width(200.0);
     ui.set_max_width(300.0);
-    let kind = util::uri_kind(uri).unwrap_or("");
     if menu_item(ui, &palette, Some(Icon::Play), "Play") {
         app.actions.push(Action::PlayContext {
-            uri: uri.to_string(),
-            offset_uri: None,
+            context: media.clone(),
+            offset: None,
             offset_index: None,
         });
     }
-    if kind != "artist" && menu_item(ui, &palette, Some(Icon::Shuffle), "Shuffle play") {
-        app.actions.push(Action::ShufflePlay(uri.to_string()));
+    if media.kind != MediaKind::Artist
+        && menu_item(ui, &palette, Some(Icon::Shuffle), "Shuffle play")
+    {
+        app.actions.push(Action::ShufflePlay(media.clone()));
     }
-    if kind == "album" && menu_item(ui, &palette, Some(Icon::ListEnd), "Play next") {
-        app.actions.push(Action::AddToQueue {
-            uri: uri.to_string(),
-            label: name.to_string(),
-        });
-    }
-    let saved = app.is_saved(uri).unwrap_or(false);
-    let (icon, text) = match (kind, saved) {
-        ("artist", true) => (Icon::CircleX, "Unfollow"),
-        ("artist", false) => (Icon::CirclePlus, "Follow"),
-        (_, true) => (Icon::CircleX, "Remove from Your Library"),
-        (_, false) => (Icon::CirclePlus, "Add to Your Library"),
+    let favorite = app.is_saved(media).unwrap_or(false);
+    let (icon, text) = if favorite {
+        (Icon::HeartFilled, "Remove from Favorites")
+    } else {
+        (Icon::Heart, "Add to Favorites")
     };
-    if owned_playlist.is_none() && menu_item(ui, &palette, Some(icon), text) {
-        app.actions.push(Action::ToggleSaved(uri.to_string()));
+    if media.kind != MediaKind::Playlist && menu_item(ui, &palette, Some(icon), text) {
+        app.actions.push(Action::ToggleFavorite(media.clone()));
     }
     if let Some(playlist) = owned_playlist {
         if menu_item(ui, &palette, Some(Icon::Pencil), "Edit details") {
@@ -510,16 +462,12 @@ pub fn context_menu_items(
                 .push(Action::ShowDialog(Dialog::ConfirmDeletePlaylist {
                     id: playlist.id.clone(),
                     name: playlist.name.clone(),
-                    owned: true,
                 }));
         }
     }
     menu_separator(ui, &palette);
     if menu_item(ui, &palette, Some(Icon::Copy), "Copy link") {
-        app.actions.push(Action::CopyLink(uri.to_string()));
-    }
-    if menu_item(ui, &palette, Some(Icon::ExternalLink), "Open in Spotify") {
-        app.actions.push(Action::OpenInSpotify(uri.to_string()));
+        app.actions.push(Action::CopyLink(media.clone()));
     }
 }
 
@@ -532,9 +480,9 @@ pub struct TrackRow<'a> {
     pub show_cover: bool,
     pub show_album: bool,
     pub added_at: Option<&'a str>,
-    /// Who put the song here, on playlists made together.
-    pub added_by: Option<&'a str>,
-    pub show_added_by: bool,
+    /// Original server row for safe OpenSubsonic playlist removal. This is
+    /// independent of sorting, filtering, and the display index.
+    pub playlist_index: Option<u32>,
     pub compact: bool,
     /// One line for the name and the artists in a shorter row without the
     /// cover: the compact track list. `compact` stays the queue's narrow row.
@@ -544,14 +492,12 @@ pub struct TrackRow<'a> {
     pub shift: f32,
     /// Whether this row is one of the picked-out ones.
     pub picked: bool,
-    /// Every picked-out song in this table, as uri and name, in the order
-    /// they sit in it, so the menu on a picked row can act on all of them
-    /// and the queue can show their names before Spotify answers. Empty
-    /// where a list does not offer picking.
-    pub picked_songs: &'a [(String, String)],
+    /// Picked songs in table order for batch queue, favorite, and playlist
+    /// actions. Empty where a list does not offer picking.
+    pub picked_songs: &'a [Song],
 }
 
-/// Draw each credited artist separately so its Spotify id remains clickable.
+/// Draw each credited artist separately so its typed id remains clickable.
 pub(crate) fn artist_links(
     ui: &mut Ui,
     app: &mut App,
@@ -581,7 +527,6 @@ struct Columns {
     number: f32,
     cover: f32,
     album: f32,
-    added_by: f32,
     added: f32,
     heart: f32,
     duration: f32,
@@ -589,7 +534,6 @@ struct Columns {
 }
 
 fn columns(width: f32, row: &TrackRow<'_>) -> Columns {
-    let extra_wide = width > 920.0;
     let wide = width > 760.0;
     let medium = width > 560.0;
     Columns {
@@ -601,11 +545,6 @@ fn columns(width: f32, row: &TrackRow<'_>) -> Columns {
         },
         album: if row.show_album && medium {
             (width * 0.28).clamp(140.0, 360.0)
-        } else {
-            0.0
-        },
-        added_by: if row.show_added_by && extra_wide {
-            130.0
         } else {
             0.0
         },
@@ -626,6 +565,7 @@ fn columns(width: f32, row: &TrackRow<'_>) -> Columns {
 /// the display index because sorting and filtering change row positions.
 pub fn track_row(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) -> Option<RowPick> {
     let palette = app.palette;
+    let song = row.item.as_track();
     let row_height = if row.thin {
         theme::THIN_ROW_HEIGHT
     } else if row.compact {
@@ -640,21 +580,19 @@ pub fn track_row(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) -> Option<RowPic
         return None;
     }
     // Start a sidebar drag only after egui's drag threshold.
-    if row.item.is_track() && response.drag_started_by(egui::PointerButton::Primary) {
-        // Keep the source index for moves within an editable playlist.
+    if response.drag_started_by(egui::PointerButton::Primary) {
+        // Keep the original server row for safe removal after a drop.
         let from = match row.context {
             RowContext::Context {
-                editable_playlist: Some((id, _)),
+                editable_playlist: Some(id),
                 ..
-            } => Some((id.clone(), row.index as u32)),
+            } => row.playlist_index.map(|index| (id.clone(), index)),
             _ => None,
         };
         egui::DragAndDrop::set_payload(
             ui.ctx(),
             DragTrack {
-                uri: row.item.uri().to_string(),
-                title: row.item.name().to_string(),
-                image: row.item.image(64).map(str::to_string),
+                song: song.clone(),
                 from,
             },
         );
@@ -662,16 +600,10 @@ pub fn track_row(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) -> Option<RowPic
     // A queue row is a position, not the song itself: the same song can
     // sit in the queue while it plays (a repeat wrapping around, a song
     // queued twice), and only the Now playing row is the playing one.
-    let is_current = !matches!(row.context, RowContext::Queue)
-        && app
-            .current_track_uri()
-            .is_some_and(|uri| uri == row.item.uri());
+    let is_current = !matches!(row.context, RowContext::Queue(_))
+        && app.current_song_id().is_some_and(|id| id == &song.id);
     let playing = is_current && app.believed_playing();
     let hovered = ui.rect_contains_pointer(rect);
-    let unavailable = match row.item {
-        PlayableItem::Track(track) => track.is_playable == Some(false) || track.is_local,
-        PlayableItem::Episode(_) => false,
-    };
 
     if row.picked {
         // Picked rows read as a block, so a run of them looks like one
@@ -700,14 +632,14 @@ pub fn track_row(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) -> Option<RowPic
     // Number / play.
     if cols.number > 0.0 {
         let cell = Rect::from_min_size(pos2(x, rect.top()), vec2(cols.number, row_height));
-        if app.play_pending(row.item.uri()) {
+        if app.play_pending(&song.id) {
             let mut child = ui.new_child(
                 UiBuilder::new()
                     .max_rect(cell)
                     .layout(Layout::centered_and_justified(egui::Direction::LeftToRight)),
             );
             theme::spinner(&mut child, 16.0, palette.accent);
-        } else if hovered && !unavailable {
+        } else if hovered {
             let icon = if playing {
                 Icon::PauseFilled
             } else {
@@ -746,11 +678,7 @@ pub fn track_row(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) -> Option<RowPic
             row.item.image(64),
             cover_rect,
             4.0,
-            if row.item.is_track() {
-                Icon::Music
-            } else {
-                Icon::Mic
-            },
+            Icon::Music,
         );
         // Without a number column the cover carries the play control:
         // hover shows it, a click uses it, and what plays shows there.
@@ -762,7 +690,7 @@ pub fn track_row(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) -> Option<RowPic
                     Color32::from_black_alpha(alpha),
                 );
             };
-            if app.play_pending(row.item.uri()) {
+            if app.play_pending(&song.id) {
                 scrim(140);
                 let mut child = ui.new_child(
                     UiBuilder::new()
@@ -770,7 +698,7 @@ pub fn track_row(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) -> Option<RowPic
                         .layout(Layout::centered_and_justified(egui::Direction::LeftToRight)),
                 );
                 theme::spinner(&mut child, 16.0, Color32::WHITE);
-            } else if hovered && !unavailable {
+            } else if hovered {
                 scrim(140);
                 let icon = if playing {
                     Icon::PauseFilled
@@ -786,14 +714,12 @@ pub fn track_row(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) -> Option<RowPic
         x += cols.cover;
     }
     let right_fixed = cols.heart + cols.duration + cols.more + 8.0;
-    let text_right = rect.right() - right_fixed - cols.added - cols.added_by - cols.album;
+    let text_right = rect.right() - right_fixed - cols.added - cols.album;
     let title_rect =
         Rect::from_min_max(pos2(x, rect.top()), pos2(text_right - 12.0, rect.bottom()));
 
     // Title and artists.
-    let title_color = if unavailable {
-        palette.dim
-    } else if is_current {
+    let title_color = if is_current {
         palette.accent
     } else {
         palette.text
@@ -817,79 +743,33 @@ pub fn track_row(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) -> Option<RowPic
             theme::medium(14.0),
             title_color,
         );
-        match row.item {
-            PlayableItem::Track(track) => {
-                if track.explicit {
-                    explicit_badge(&mut child, &palette);
-                }
-                theme::text(
-                    &mut child,
-                    "•",
-                    theme::regular(12.0),
-                    palette.secondary.gamma_multiply(0.6),
-                );
-                artist_links(
-                    &mut child,
-                    app,
-                    &track.artists,
-                    theme::regular(13.0),
-                    subtitle_color,
-                );
-                if let Some(added) = row.added_at.filter(|a| !a.starts_with("1970-01-01"))
-                    && cols.added == 0.0
-                {
-                    let label = util::format_relative_date(added, jiff::Timestamp::now());
-                    theme::text(
-                        &mut child,
-                        "•",
-                        theme::regular(12.0),
-                        palette.secondary.gamma_multiply(0.6),
-                    );
-                    theme::text(&mut child, &label, theme::regular(12.0), palette.secondary);
-                    if label.ends_with(" ago") {
-                        ui.ctx()
-                            .request_repaint_after(std::time::Duration::from_secs(1));
-                    }
-                }
-            }
-            PlayableItem::Episode(episode) => {
-                let subtitle = episode
-                    .show
-                    .as_ref()
-                    .map(|show| show.name.clone())
-                    .unwrap_or_default();
-                if !subtitle.is_empty() {
-                    theme::text(
-                        &mut child,
-                        "•",
-                        theme::regular(12.0),
-                        palette.secondary.gamma_multiply(0.6),
-                    );
-                    let show_id = episode.show.as_ref().map(|show| show.id.clone());
-                    let response =
-                        theme::link(&mut child, subtitle, theme::regular(13.0), subtitle_color);
-                    if response.clicked()
-                        && let Some(id) = show_id
-                    {
-                        app.actions.push(Action::Open(Page::Show(id)));
-                    }
-                }
-                if let Some(added) = row.added_at.filter(|a| !a.starts_with("1970-01-01"))
-                    && cols.added == 0.0
-                {
-                    theme::text(
-                        &mut child,
-                        "•",
-                        theme::regular(12.0),
-                        palette.secondary.gamma_multiply(0.6),
-                    );
-                    let label = util::format_relative_date(added, jiff::Timestamp::now());
-                    theme::text(&mut child, &label, theme::regular(12.0), palette.secondary);
-                    if label.ends_with(" ago") {
-                        ui.ctx()
-                            .request_repaint_after(std::time::Duration::from_secs(1));
-                    }
-                }
+        theme::text(
+            &mut child,
+            "•",
+            theme::regular(12.0),
+            palette.secondary.gamma_multiply(0.6),
+        );
+        artist_links(
+            &mut child,
+            app,
+            &song.artists,
+            theme::regular(13.0),
+            subtitle_color,
+        );
+        if let Some(added) = row.added_at
+            && cols.added == 0.0
+        {
+            let label = util::format_relative_date(added, jiff::Timestamp::now());
+            theme::text(
+                &mut child,
+                "•",
+                theme::regular(12.0),
+                palette.secondary.gamma_multiply(0.6),
+            );
+            theme::text(&mut child, &label, theme::regular(12.0), palette.secondary);
+            if label.ends_with(" ago") {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_secs(1));
             }
         }
     } else {
@@ -909,64 +789,21 @@ pub fn track_row(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) -> Option<RowPic
         });
         child.horizontal(|ui| {
             ui.set_max_width(title_rect.width());
-            match row.item {
-                PlayableItem::Track(track) => {
-                    if track.explicit {
-                        explicit_badge(ui, &palette);
-                    }
-                    artist_links(
-                        ui,
-                        app,
-                        &track.artists,
-                        theme::regular(12.5),
-                        subtitle_color,
-                    );
-                    if let Some(added) = row.added_at.filter(|a| !a.starts_with("1970-01-01"))
-                        && cols.added == 0.0
-                    {
-                        theme::text(
-                            ui,
-                            "•",
-                            theme::regular(12.0),
-                            palette.secondary.gamma_multiply(0.6),
-                        );
-                        let label = util::format_relative_date(added, jiff::Timestamp::now());
-                        theme::text(ui, &label, theme::regular(12.0), palette.secondary);
-                        if label.ends_with(" ago") {
-                            ui.ctx()
-                                .request_repaint_after(std::time::Duration::from_secs(1));
-                        }
-                    }
-                }
-                PlayableItem::Episode(episode) => {
-                    let subtitle = episode
-                        .show
-                        .as_ref()
-                        .map(|show| show.name.clone())
-                        .unwrap_or_default();
-                    let show_id = episode.show.as_ref().map(|show| show.id.clone());
-                    let response = theme::link(ui, subtitle, theme::regular(12.5), subtitle_color);
-                    if response.clicked()
-                        && let Some(id) = show_id
-                    {
-                        app.actions.push(Action::Open(Page::Show(id)));
-                    }
-                    if let Some(added) = row.added_at.filter(|a| !a.starts_with("1970-01-01"))
-                        && cols.added == 0.0
-                    {
-                        theme::text(
-                            ui,
-                            "•",
-                            theme::regular(12.0),
-                            palette.secondary.gamma_multiply(0.6),
-                        );
-                        let label = util::format_relative_date(added, jiff::Timestamp::now());
-                        theme::text(ui, &label, theme::regular(12.0), palette.secondary);
-                        if label.ends_with(" ago") {
-                            ui.ctx()
-                                .request_repaint_after(std::time::Duration::from_secs(1));
-                        }
-                    }
+            artist_links(ui, app, &song.artists, theme::regular(12.5), subtitle_color);
+            if let Some(added) = row.added_at
+                && cols.added == 0.0
+            {
+                theme::text(
+                    ui,
+                    "•",
+                    theme::regular(12.0),
+                    palette.secondary.gamma_multiply(0.6),
+                );
+                let label = util::format_relative_date(added, jiff::Timestamp::now());
+                theme::text(ui, &label, theme::regular(12.0), palette.secondary);
+                if label.ends_with(" ago") {
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_secs(1));
                 }
             }
         });
@@ -975,9 +812,7 @@ pub fn track_row(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) -> Option<RowPic
 
     // Album.
     if cols.album > 0.0 {
-        if let PlayableItem::Track(track) = row.item
-            && let Some(album) = &track.album
-        {
+        if let Some(album) = &song.album {
             let album_rect = Rect::from_min_max(
                 pos2(x, rect.top()),
                 pos2(x + cols.album - 12.0, rect.bottom()),
@@ -994,41 +829,16 @@ pub fn track_row(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) -> Option<RowPic
                 theme::regular(13.0),
                 subtitle_color,
             );
-            if response.clicked() && !album.id.is_empty() {
+            if response.clicked() {
                 app.actions
                     .push(Action::Open(Page::Album(album.id.clone())));
             }
         }
         x += cols.album;
     }
-    // Added by.
-    if cols.added_by > 0.0 {
-        if let Some(adder) = row.added_by {
-            let cell = Rect::from_min_max(
-                pos2(x, rect.top()),
-                pos2(x + cols.added_by - 12.0, rect.bottom()),
-            );
-            let clipped = painter.with_clip_rect(cell.intersect(ui.clip_rect()));
-            crate::bidi::paint_line(
-                &clipped,
-                cell.left(),
-                cell.right(),
-                cell.center().y,
-                adder,
-                theme::regular(13.0),
-                palette.secondary,
-            );
-        }
-        x += cols.added_by;
-    }
     // Date added.
     if cols.added > 0.0 {
-        // Spotify stamps the epoch on dates it never recorded; an empty
-        // cell is truer than January 1970.
-        if let Some(added) = row
-            .added_at
-            .filter(|added| !added.starts_with("1970-01-01"))
-        {
+        if let Some(added) = row.added_at {
             let cell = Rect::from_min_size(pos2(x, rect.top()), vec2(cols.added, row_height));
             let label = util::format_relative_date(added, jiff::Timestamp::now());
             painter.text(
@@ -1050,27 +860,26 @@ pub fn track_row(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) -> Option<RowPic
 
     // Heart.
     if cols.heart > 0.0 {
-        let saved = app.is_saved(row.item.uri());
+        let saved = app.is_saved(&song.id).unwrap_or(song.starred);
         let heart_rect = Rect::from_min_size(pos2(x, rect.top()), vec2(cols.heart, row_height));
-        if row.item.is_track() && (hovered || saved == Some(true)) {
+        if hovered || saved {
             let mut child = ui.new_child(
                 UiBuilder::new()
                     .max_rect(heart_rect)
                     .layout(Layout::centered_and_justified(egui::Direction::LeftToRight)),
             );
-            let (icon, color) = if saved == Some(true) {
+            let (icon, color) = if saved {
                 (Icon::HeartFilled, palette.accent)
             } else {
                 (Icon::Heart, palette.secondary)
             };
-            let tooltip = if saved == Some(true) {
-                "Remove from Liked Songs"
+            let tooltip = if saved {
+                "Remove from Favorites"
             } else {
-                "Save to Liked Songs"
+                "Add to Favorites"
             };
             if theme::icon_button(&mut child, icon, 16.0, color, palette.text, tooltip).clicked() {
-                app.actions
-                    .push(Action::ToggleSaved(row.item.uri().to_string()));
+                app.actions.push(Action::ToggleFavorite(song.id.clone()));
             }
         }
         x += cols.heart;
@@ -1110,17 +919,13 @@ pub fn track_row(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) -> Option<RowPic
         egui::Popup::menu(&more)
             .id(menu_id)
             .frame(menu_frame(&palette))
-            .show(|ui| item_menu(ui, app, row.item, Some(row.context), Some(row.index)));
+            .show(|ui| item_menu(ui, app, row.item, Some(row.context), row.playlist_index));
     }
 
     // Row interactions.
     let mut pick = None;
-    if response.double_clicked() && !unavailable {
-        app.actions.push(Action::PlayFromRow {
-            context: row.context.clone(),
-            uri: row.item.uri().to_string(),
-            index: row.index as u32,
-        });
+    if response.double_clicked() {
+        play_track_row(app, &row, song);
     } else if response.clicked() {
         // The cell that holds the play control: the number column when
         // there is one, the cover when there is not.
@@ -1137,15 +942,11 @@ pub fn track_row(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) -> Option<RowPic
                 .interact_pointer_pos()
                 .is_some_and(|pos| control_rect.contains(pos))
         });
-        if on_control && !unavailable {
+        if on_control {
             if is_current {
                 app.actions.push(Action::TogglePlay);
             } else {
-                app.actions.push(Action::PlayFromRow {
-                    context: row.context.clone(),
-                    uri: row.item.uri().to_string(),
-                    index: row.index as u32,
-                });
+                play_track_row(app, &row, song);
             }
         } else if !on_control {
             // The body of the row, which plays nothing on a single click.
@@ -1168,21 +969,31 @@ pub fn track_row(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) -> Option<RowPic
             if row.picked && row.picked_songs.len() > 1 {
                 picked_menu(ui, app, row.picked_songs);
             } else {
-                item_menu(ui, app, row.item, Some(row.context), Some(row.index));
+                item_menu(ui, app, row.item, Some(row.context), row.playlist_index);
             }
         });
     pick
 }
 
+fn play_track_row(app: &mut App, row: &TrackRow<'_>, song: &Song) {
+    match row.context {
+        RowContext::Queue(occurrence) => app.actions.push(Action::PlayQueueOccurrence(*occurrence)),
+        _ => app.actions.push(Action::PlayFromRow {
+            context: row.context.clone(),
+            song: song.clone(),
+            index: row.index as u32,
+        }),
+    }
+}
+
 /// The chip that rides the pointer while a song is being dragged.
 pub fn drag_ghost(ctx: &egui::Context, palette: &Palette) {
-    // A song and a sidebar row ride the pointer the same way.
-    let chip = egui::DragAndDrop::payload::<DragTrack>(ctx)
-        .map(|track| (track.title.clone(), track.image.clone()))
-        .or_else(|| {
-            egui::DragAndDrop::payload::<DragEntry>(ctx)
-                .map(|entry| (entry.title.clone(), entry.image.clone()))
-        });
+    let chip = egui::DragAndDrop::payload::<DragTrack>(ctx).map(|track| {
+        (
+            track.song.name.clone(),
+            track.song.image(64).map(str::to_string),
+        )
+    });
     let Some((title, image)) = chip else {
         return;
     };
@@ -1229,29 +1040,14 @@ pub fn drag_ghost(ctx: &egui::Context, palette: &Palette) {
         });
 }
 
-pub fn explicit_badge(ui: &mut Ui, palette: &Palette) {
-    let (rect, _) = ui.allocate_exact_size(vec2(15.0, 15.0), Sense::hover());
-    ui.painter()
-        .rect_filled(rect, CornerRadius::same(2), palette.secondary);
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        "E",
-        theme::bold(9.5),
-        palette.window,
-    );
-}
-
 /// The header row above a track table.
 /// The column headings above a track table. Answers with the heading that
 /// was clicked, so the table can sort by it.
-#[expect(clippy::fn_params_excessive_bools)]
 pub fn table_header(
     ui: &mut Ui,
     palette: &Palette,
     show_album: bool,
     show_added: bool,
-    show_added_by: bool,
     show_cover: bool,
     sort: Option<crate::model::TableSort>,
 ) -> Option<crate::model::SortColumn> {
@@ -1366,21 +1162,11 @@ pub fn table_header(
         0.0
     };
     let added_width = if show_added && wide { 120.0 } else { 0.0 };
-    let extra_wide = width > 920.0;
-    let added_by_width = if show_added_by && extra_wide {
-        130.0
-    } else {
-        0.0
-    };
     let right_fixed = 36.0 + 56.0 + 36.0 + 8.0;
-    let mut cx = rect.right() - right_fixed - added_width - added_by_width - album_width;
+    let mut cx = rect.right() - right_fixed - added_width - album_width;
     if album_width > 0.0 {
         heading(ui, cx, "ALBUM", SortColumn::Album);
         cx += album_width;
-    }
-    if added_by_width > 0.0 {
-        heading(ui, cx, "ADDED BY", SortColumn::AddedBy);
-        cx += added_by_width;
     }
     if added_width > 0.0 {
         heading(ui, cx, "DATE ADDED", SortColumn::Added);

@@ -84,8 +84,8 @@ pub(super) fn show(app: &mut App, view: &mut View, now: Option<&NowPlaying>, foc
     {
         app.actions.push(Action::ToggleEq);
     }
-    // Winamp's AUTO loaded a preset per song, which Spotify has no
-    // equivalent for; here the button lays the bands flat.
+    // Winamp's AUTO loaded a preset per song. The server does not expose
+    // per-song EQ presets, so here the button lays the bands flat.
     let auto = view.button(
         layout::EQ_AUTO,
         sprites::EQ_AUTO_OFF,
@@ -143,7 +143,7 @@ fn shade(app: &mut App, view: &mut View, now: Option<&NowPlaying>, focused: bool
     // Volume, as the main window's slider does it.
     let volume = now
         .map(|now| now.volume_percent)
-        .unwrap_or_else(|| crate::app::volume_to_percent(app.local.volume));
+        .unwrap_or_else(|| crate::app::volume_to_percent(app.settings.volume));
     let track = layout::EQ_SHADE_VOLUME;
     let (response, event) = view.slider(track, "eq-shade-volume", layout::EQ_SHADE_THUMB);
     let notches = super::super::widgets::wheel_notches(view.ui, &response);
@@ -153,11 +153,9 @@ fn shade(app: &mut App, view: &mut View, now: Option<&NowPlaying>, focused: bool
     }
     match event {
         SliderEvent::Dragging(value) => {
-            app.volume_preview = Some(value);
-            if now.is_none_or(|now| now.local) {
-                app.actions
-                    .push(Action::PreviewVolume((value * 100.0).round() as u8));
-            }
+            let percent = (value * 100.0).round() as u8;
+            app.volume_preview = Some(percent);
+            app.actions.push(Action::PreviewVolume(percent));
         }
         SliderEvent::Committed(value) => {
             app.volume_preview = None;
@@ -166,10 +164,7 @@ fn shade(app: &mut App, view: &mut View, now: Option<&NowPlaying>, focused: bool
         }
         SliderEvent::None => {}
     }
-    let shown = match app.volume_preview {
-        Some(fraction) => (fraction * 100.0).round() as u32,
-        None => u32::from(volume),
-    };
+    let shown = u32::from(app.volume_preview.unwrap_or(volume));
     let thumb = look(
         shown as f32 / 100.0,
         [

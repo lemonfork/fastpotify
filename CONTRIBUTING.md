@@ -1,7 +1,8 @@
 # Contributing to Fastpotify
 
-Fastpotify is a native Spotify client. Changes should improve the
-desktop app without adding a browser, fallback services, or another backend.
+Fastpotify is a native Navidrome/OpenSubsonic client. Changes should improve
+the desktop app without adding a browser, fallback catalogues, or a hosted
+Fastpotify service.
 
 ## Before opening an issue
 
@@ -13,14 +14,16 @@ For a feature, explain the user problem. Discuss large changes in an issue
 before writing code. Existing code does not guarantee that a feature fits the
 project.
 
-Some boundaries come from Spotify or from upstream libraries:
+Some boundaries come from OpenSubsonic, Navidrome, and the local audio stack:
 
-- Local playback requires Spotify Premium because librespot requires it.
-- Spotify Lossless is not available through librespot. Fastpotify will
-  reconsider it if librespot gains lawful upstream support; proposals that
-  depend on bypassing Spotify's DRM are out of scope.
-- Spotify tracks must come from Spotify. Substituting audio from YouTube,
-  Piped, `yt-dlp`, or another catalogue is out of scope.
+- Music and artwork must come from the server the listener signed into.
+  Substituting media from YouTube, Piped, `yt-dlp`, or another catalogue is
+  out of scope.
+- Do not claim gapless playback, normalization, lossless output, or codec
+  support unless Fastpotify's complete streaming and output pipeline supports
+  and tests it.
+- Server credentials and salted request authentication must never enter logs,
+  public media references, artwork cache keys, or desktop-control metadata.
 - Fastpotify will not embed a browser engine, add telemetry, or introduce a
   Fastpotify-operated service.
 
@@ -33,9 +36,9 @@ explanation.
    are product features. Keep the UI thread free of network and disk waits.
 2. **Focused.** Prefer a complete, coherent workflow over a collection of
    settings, modes, and speculative features.
-3. **Honest integrations.** Use Spotify's Web API and librespot for what they
-   support. Do not scrape, impersonate capabilities, bypass technical
-   protections, or silently replace one service with another.
+3. **Honest integrations.** Use the documented OpenSubsonic API for what the
+   active server supports. Do not scrape private endpoints, invent remote
+   playback semantics, or silently replace one media source with another.
 4. **Cross-platform by default.** Linux, macOS, and Windows are supported
    products. Platform-specific code must be isolated and the other targets
    must keep compiling.
@@ -74,12 +77,8 @@ RUSTDOCFLAGS='-D warnings' cargo doc --locked --all-features --no-deps
 ```
 
 Linux needs the development packages listed in the README; `nix develop`
-provides the complete development environment. MilkDrop builds libprojectM
-from source, so every platform also needs CMake, a C++ compiler, and
-libclang (on Windows, vcpkg with `glew:x64-windows-static-md` installed and
-`VCPKG_INSTALLATION_ROOT` pointing at it); `--no-default-features` leaves
-MilkDrop out and needs none of that. CI repeats the test suite on Linux,
-macOS, and Windows. Passing CI is required, but does not replace review
+provides the complete development environment. CI repeats the test suite on
+Linux, macOS, and Windows. Passing CI is required, but does not replace review
 for correctness, product fit, maintainability, or security.
 
 By contributing, you agree that your contribution is licensed under the

@@ -4,9 +4,9 @@ version = "0.5.0-rc1"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
-description = "A native Spotify client"
+description = "A small native Navidrome and OpenSubsonic music client"
 repository = "https://github.com/crmne/fastpotify"
-keywords = ["spotify", "music", "egui", "librespot", "player"]
+keywords = ["navidrome", "opensubsonic", "music", "egui", "player"]
 categories = ["multimedia::audio"]
 
 [lib]
@@ -47,84 +47,50 @@ flate2 = "1"
 # text (src/ui/winamp/pixel_text.rs). Already compiled for the SVG icons
 # through egui_extras and resvg, so this adds no code to the build.
 tiny-skia = "0.11"
-# MilkDrop, as libprojectM reimplements it, for the MilkDrop window
-# (src/milkdrop.rs). Built into the binary, so it stays one file.
-projectm-sys = { version = "1.2.2", default-features = false, features = ["static"], optional = true }
-# The MilkDrop window runs as a child process with its own winit event loop
-# and OpenGL context (src/milkdrop/child.rs), because winit allows one event
-# loop per process and eframe owns the app's. These are the same versions
-# eframe already pulls in, so they add no build. Only compiled with the
-# milkdrop feature.
-winit = { version = "0.30", optional = true }
-glutin = { version = "0.32", optional = true }
-glutin-winit = { version = "0.5", optional = true }
-raw-window-handle = { version = "0.6", optional = true }
-# Spotify playback and Connect. rustls everywhere so the client links one TLS
-# stack and builds without OpenSSL on every platform.
-#
-# librespot-core depends on hyper-proxy2 for HTTP proxy support, whose only
-# published release (0.1.0) pins rustls 0.22 and so drags in rustls-webpki
-# 0.102, which carries advisories against its CRL and name-constraint
-# handling. Fastpotify never configures a proxy (SessionConfig.proxy stays
-# None), so that TLS client is compiled in but never used to verify anything.
-# Every connection this app actually makes (the Web API through reqwest, and
-# librespot's own sessions) goes through rustls 0.23 with a patched
-# rustls-webpki. Removing the old copy needs a release of hyper-proxy2, or a
-# librespot that stops depending on it.
-librespot-core = { version = "0.8", default-features = false, features = ["rustls-tls-native-roots"] }
-librespot-playback = { version = "0.8", default-features = false, features = ["rodio-backend", "rustls-tls-native-roots"] }
-librespot-connect = { version = "0.8", default-features = false }
-librespot-metadata = { version = "0.8", default-features = false }
-librespot-protocol = { version = "0.8", default-features = false }
-# Parses the rootlist's playlist4 protobuf, the same crate librespot generates with.
-protobuf = "3"
-# Local playback's audio sink is this crate's own (src/sink.rs): librespot's
-# rodio backend unwraps the device open on the player thread, and a release
-# build aborts on panic. Same rodio and cpal versions librespot-playback uses,
-# so nothing new is compiled.
+# Local audio output. The project owns device selection and error handling so
+# a missing output device remains a visible playback error rather than a panic.
 rodio = { version = "0.21", default-features = false, features = ["playback"] }
 cpal = "0.16"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json", "gzip", "http2", "blocking"] }
-# `fs` is used by the playlist cache in `backend.rs`. On Linux the
-# mpris-server dependency happens to turn it on, which is why leaving it out
-# built there and nowhere else.
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "fs"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json", "gzip", "http2", "stream"] }
+# The runtime hosts API work and stream downloads; the UI thread never blocks.
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+# SHA-1 scopes disposable cache entries and produces a non-secret profile
+# fingerprint. OpenSubsonic's required salted request token uses MD5.
 sha1 = "0.10"
-sha2 = "0.10"
+md5 = "0.7"
+# Opaque media/artwork references encode arbitrary server string IDs.
 base64 = "0.22"
 rand = "0.9"
+# Symphonia decodes common server originals and the requested MP3 transcode.
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "aac", "alac", "isomp4", "flac", "ogg", "vorbis"] }
+# Symphonia can demux Ogg Opus but has no Opus decoder. Keep the fallback in
+# pure Rust so every desktop target uses the same codec implementation.
+opus-pure = "0.2.1"
 open = "5"
-percent-encoding = "2"
-urlencoding = "2"
 jiff = "0.2"
-mdns-sd = "0.21"
 unicode-bidi = "0.3"
-hmac = "0.12"
-pbkdf2 = "0.12"
-aes = "0.8"
-ctr = "0.9"
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
-# The tray item and the desktop's media controls on Windows and macOS, so
-# closing the window keeps the music playing there too. Linux has ksni and
-# mpris-server below.
+# The tray item on Windows and macOS. Linux has ksni below.
 tray-icon = { version = "0.24", default-features = false }
-souvlaki = { version = "0.8", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Serving AppKit while no window exists: the status item and Dock reopen
 # callback live on the main thread.
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSEvent", "NSMenu", "NSMenuItem", "NSResponder", "NSRunningApplication"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSDate", "NSObjCRuntime", "NSRunLoop", "NSString"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSDate", "NSDictionary", "NSObjCRuntime", "NSObject", "NSRunLoop", "NSString", "NSValue"] }
+# Generated bindings let macOS use MediaPlayer.framework directly without
+# souvlaki's obsolete Cocoa/block dependency or a Swift runtime dependency.
+objc2-media-player = { version = "0.3", default-features = false, features = ["MPMediaItem", "MPNowPlayingInfoCenter", "MPRemoteCommand", "MPRemoteCommandCenter", "MPRemoteCommandEvent"] }
 
 [target.'cfg(windows)'.dependencies]
 # A hidden window for the media controls to belong to, and message loops.
+souvlaki = { version = "0.8", default-features = false }
 windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_Com", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = { version = "0.3", features = ["blocking"] }
-librespot-playback = { version = "0.8", default-features = false, features = ["rodio-backend", "pulseaudio-backend", "rustls-tls-native-roots"] }
 mpris-server = { version = "0.10", features = ["tokio"] }
 
 # The icon and version information Windows shows for the executable.
@@ -132,13 +98,9 @@ mpris-server = { version = "0.10", features = ["tokio"] }
 winresource = "0.1"
 
 [features]
-default = ["milkdrop"]
+default = []
 # Sample data and screenshot flags; never part of a release build.
 demo = []
-# MilkDrop, through libprojectM: a C++ library that CMake builds into the
-# binary at compile time, so building needs cmake, a C++ compiler, and
-# libclang. `--no-default-features` leaves it out.
-milkdrop = ["dep:projectm-sys", "dep:winit", "dep:glutin", "dep:glutin-winit", "dep:raw-window-handle"]
 
 [profile.release]
 lto = "thin"
@@ -151,27 +113,3 @@ panic = "abort"
 # application crate itself stays incremental.
 [profile.dev.package."*"]
 opt-level = 2
-
-# projectm-sys names the library it links after Rust's profile (a `d` suffix
-# for dev) but CMake names what it builds after the optimisation level, so an
-# optimised dev build would look for a library that was never made. A debug
-# build of libprojectM is fine to develop against; releases are optimised.
-[profile.dev.package.projectm-sys]
-opt-level = 0
-
-# projectm-sys 1.2.2 hardcodes the Visual Studio 17 2022 CMake generator,
-# which GitHub's windows-latest images no longer carry; the fork lets an
-# explicit CMAKE_GENERATOR win. Drop when upstream takes the change.
-[patch.crates-io]
-projectm-sys = { git = "https://github.com/crmne/projectm-rs", branch = "respect-cmake-generator" }
-# librespot 0.8.0 plus one patch: the loaded track's normalisation factor
-# is reported through PlayerConfig, so the visualisers can undo it the way
-# Winamp's analyser did. Every librespot crate comes from the fork so one
-# copy exists. Drop when upstream takes the change.
-librespot-audio = { git = "https://github.com/crmne/librespot", branch = "fastpotify-0.8" }
-librespot-connect = { git = "https://github.com/crmne/librespot", branch = "fastpotify-0.8" }
-librespot-core = { git = "https://github.com/crmne/librespot", branch = "fastpotify-0.8" }
-librespot-metadata = { git = "https://github.com/crmne/librespot", branch = "fastpotify-0.8" }
-librespot-oauth = { git = "https://github.com/crmne/librespot", branch = "fastpotify-0.8" }
-librespot-playback = { git = "https://github.com/crmne/librespot", branch = "fastpotify-0.8" }
-librespot-protocol = { git = "https://github.com/crmne/librespot", branch = "fastpotify-0.8" }

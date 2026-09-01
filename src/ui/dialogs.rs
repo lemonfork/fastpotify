@@ -34,23 +34,17 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
             match dialog {
                 Dialog::CreatePlaylist { .. } => create_playlist(app, ui),
                 Dialog::EditPlaylist { .. } => edit_playlist(app, ui),
-                Dialog::ConfirmDeletePlaylist { id, name, owned } => {
+                Dialog::ConfirmDeletePlaylist { id, name } => {
                     theme::text(
                         ui,
-                        if owned {
-                            "Delete playlist?"
-                        } else {
-                            "Remove from Your Library?"
-                        },
+                        "Permanently delete playlist?",
                         theme::bold(20.0),
                         palette.text,
                     );
                     ui.add_space(8.0);
-                    let body = if owned {
-                        format!("Delete “{name}”? You can recover it from Spotify for 90 days.")
-                    } else {
-                        format!("“{name}” will no longer appear in Your Library.")
-                    };
+                    let body = format!(
+                        "“{name}” and its playlist order will be deleted from your server. This cannot be undone here. Your audio files are not affected."
+                    );
                     ui.add(
                         egui::Label::new(
                             egui::RichText::new(body)
@@ -64,7 +58,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                         if theme::pill_button(
                             ui,
                             &palette,
-                            if owned { "Delete" } else { "Remove" },
+                            "Delete permanently",
                             true,
                         )
                         .clicked()
@@ -121,32 +115,6 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                         }
                     });
                 }
-                Dialog::PremiumNeeded => {
-                    theme::text(
-                        ui,
-                        "This account cannot play music here",
-                        theme::bold(20.0),
-                        palette.text,
-                    );
-                    ui.add_space(8.0);
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(
-                                "Playback needs Spotify Premium. Free accounts can browse \
-                                 and search, but cannot play music through Fastpotify.",
-                            )
-                            .font(theme::regular(14.0))
-                            .color(palette.secondary),
-                        )
-                        .wrap(),
-                    );
-                    ui.add_space(20.0);
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if theme::pill_button(ui, &palette, "OK", true).clicked() {
-                            app.actions.push(Action::CloseDialog);
-                        }
-                    });
-                }
             }
         });
     app.dialog_rect = Some(response.response.rect);
@@ -190,7 +158,7 @@ fn create_playlist(app: &mut App, ui: &mut egui::Ui) {
     let Some(Dialog::CreatePlaylist {
         name,
         public,
-        add_uris,
+        songs,
     }) = &mut app.dialog
     else {
         return;
@@ -204,9 +172,9 @@ fn create_playlist(app: &mut App, ui: &mut egui::Ui) {
         super::widgets::switch(ui, &palette, public);
         theme::text(ui, "Public playlist", theme::regular(14.0), palette.text);
     });
-    if !add_uris.is_empty() {
+    if !songs.is_empty() {
         ui.add_space(6.0);
-        let count = add_uris.len();
+        let count = songs.len();
         theme::text(
             ui,
             format!(
@@ -221,7 +189,7 @@ fn create_playlist(app: &mut App, ui: &mut egui::Ui) {
     let submit = field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
     let name_value = name.trim().to_string();
     let public_value = *public;
-    let uris = add_uris.clone();
+    let songs = songs.clone();
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
         if busy {
             theme::spinner(ui, 18.0, palette.accent);
@@ -231,7 +199,7 @@ fn create_playlist(app: &mut App, ui: &mut egui::Ui) {
                 app.actions.push(Action::CreatePlaylist {
                     name: name_value.clone(),
                     public: public_value,
-                    add_uris: uris.clone(),
+                    songs: songs.clone(),
                 });
             }
             if theme::pill_button(ui, &palette, "Cancel", false).clicked() {

@@ -2,11 +2,11 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use fastpotify::{app, backend, paths, settings, single_instance, util};
+use fastpotify::{app, backend, media, paths, settings, single_instance, util};
 
 use clap::Parser;
 
-/// A fast, native Spotify client.
+/// A fast, native Navidrome client.
 #[derive(Debug, Parser)]
 #[command(name = "fastpotify", version, about)]
 struct Cli {
@@ -14,15 +14,11 @@ struct Cli {
     #[command(subcommand)]
     control: Option<Control>,
 
-    /// Spotify Connect device name for this session.
-    #[arg(long)]
-    device_name: Option<String>,
-
-    /// Log more from librespot and the Web API client.
+    /// Log more from Fastpotify's network and playback internals.
     #[arg(short, long)]
     verbose: bool,
 
-    /// Start with sample data and no Spotify connection (for screenshots).
+    /// Start with sample data and no server connection (for screenshots).
     #[cfg(feature = "demo")]
     #[arg(long)]
     demo: bool,
@@ -32,8 +28,8 @@ struct Cli {
     #[arg(long)]
     demo_page: Option<String>,
 
-    /// Extra demo surfaces: a comma-separated list of `queue`, `devices`,
-    /// `shortcuts`, `create`, `light`, `focus`.
+    /// Extra demo surfaces: a comma-separated list including `queue`,
+    /// `shortcuts`, `create`, `scripts`, `light`, or `focus`.
     #[cfg(feature = "demo")]
     #[arg(long)]
     demo_show: Option<String>,
@@ -95,23 +91,20 @@ enum Control {
     Shuffle { state: Option<OnOff> },
     /// Cycle the repeat mode, or set it outright
     Repeat { mode: Option<Repeat> },
-    /// Save the playing track to your library, or take it back out
-    Like,
-    /// Play a Spotify URI: a track, album, playlist, artist, or show
-    PlayUri { uri: String },
-    /// List the Spotify Connect devices
-    Devices {
-        /// Print the JSON the running instance sent instead.
-        #[arg(long)]
-        raw: bool,
+    /// Favorite the playing track, or take it back out
+    #[command(alias = "like")]
+    Favorite,
+    /// Play a secret-free Fastpotify media reference
+    #[command(alias = "play-uri")]
+    PlayRef {
+        #[arg(value_name = "REF", value_parser = parse_media_ref)]
+        media_ref: String,
     },
-    /// Move playback to a device, by the id `devices` prints
-    Transfer { device_id: String },
     /// Print the playing track
     NowPlaying {
         /// Print the fields tab-separated instead: state, title, artists,
         /// album, position_ms, duration_ms, volume, shuffle, repeat,
-        /// art_url, saved, device.
+        /// artwork_ref, favorite, device. The final field is empty or local.
         #[arg(long)]
         raw: bool,
     },
@@ -139,10 +132,7 @@ enum Repeat {
 /// single-instance loopback socket, which Linux does not have.
 #[cfg(not(target_os = "linux"))]
 fn run_control(control: Control) -> i32 {
-    let raw = matches!(
-        control,
-        Control::NowPlaying { raw: true } | Control::Devices { raw: true }
-    );
+    let raw = matches!(control, Control::NowPlaying { raw: true });
     let verb = match control {
         Control::PlayPause => "playpause".to_owned(),
         Control::Play => "play".to_owned(),
@@ -172,10 +162,8 @@ fn run_control(control: Control) -> i32 {
             };
             format!("repeat-set {mode}")
         }
-        Control::Like => "save-toggle".to_owned(),
-        Control::PlayUri { uri } => format!("play-uri {uri}"),
-        Control::Devices { .. } => "devices".to_owned(),
-        Control::Transfer { device_id } => format!("transfer {device_id}"),
+        Control::Favorite => "favorite-toggle".to_owned(),
+        Control::PlayRef { media_ref } => format!("play-ref {media_ref}"),
         Control::NowPlaying { .. } => "nowplaying".to_owned(),
         Control::Show => "show".to_owned(),
     };
@@ -186,14 +174,6 @@ fn run_control(control: Control) -> i32 {
                 println!("{snapshot}");
             } else {
                 println!("{}", format_now_playing(&snapshot));
-            }
-            0
-        }
-        Ok(single_instance::Reply::Devices(snapshot)) => {
-            if raw {
-                println!("{snapshot}");
-            } else {
-                print!("{}", format_devices(&snapshot));
             }
             0
         }
@@ -237,43 +217,13 @@ fn format_now_playing(snapshot: &str) -> String {
     }
 }
 
-/// The `devices` snapshot as one line per device, the active one marked.
-/// The id comes first because `fastpotify transfer` is what it is for.
-#[cfg(not(target_os = "linux"))]
-fn format_devices(snapshot: &str) -> String {
-    let Ok(devices) = serde_json::from_str::<Vec<serde_json::Value>>(snapshot) else {
-        return String::new();
-    };
-    let field =
-        |device: &serde_json::Value, key: &str| device[key].as_str().unwrap_or_default().to_owned();
-    devices
-        .iter()
-        .map(|device| {
-            format!(
-                "{}{}\t{}\t{}\n",
-                if device["active"].as_bool().unwrap_or(false) {
-                    "* "
-                } else {
-                    "  "
-                },
-                field(device, "id"),
-                field(device, "name"),
-                field(device, "kind"),
-            )
-        })
-        .collect()
+fn parse_media_ref(value: &str) -> Result<String, &'static str> {
+    media::is_media_ref(value)
+        .then(|| value.to_owned())
+        .ok_or("expected a secret-free fastpotify: media reference")
 }
 
 fn main() -> eframe::Result<()> {
-    // A MilkDrop child launch is a bare visualiser window, not the app: it has
-    // its own event loop and OpenGL context, reads the sound from a shared
-    // buffer, and never touches the app's state. Handle it before anything
-    // else, including the argument parser, which does not know its flags.
-    #[cfg(feature = "milkdrop")]
-    if let Some(args) = fastpotify::milkdrop::child::Args::parse() {
-        std::process::exit(fastpotify::milkdrop::child::run(args));
-    }
-
     let cli = Cli::parse();
     // A control launch is a client, not a second app: talk to the running
     // instance and exit before touching the log file it is writing to.
@@ -281,7 +231,7 @@ fn main() -> eframe::Result<()> {
         std::process::exit(run_control(control));
     }
     let default_filter = if cli.verbose {
-        "info,librespot=info,fastpotify=debug"
+        "info,fastpotify=debug"
     } else {
         "warn,fastpotify=info"
     };
@@ -302,12 +252,9 @@ fn main() -> eframe::Result<()> {
         log::warn!("unable to create the application directories: {error}");
     }
     log_panics(dirs.panic_log());
-    let mut settings = settings::Settings::load(&dirs.settings_file());
-    if let Some(name) = cli.device_name {
-        settings.device_name = name;
-    }
+    let settings = settings::Settings::load(&dirs.settings_file());
 
-    // The application (audio engine, Web API, MPRIS, tray) outlives any
+    // The application (audio engine, Navidrome client, MPRIS, tray) outlives any
     // window. Closing to the tray destroys the window and this loop creates
     // a new one when the tray or MPRIS asks for it. Plain window lifecycle,
     // portable across desktops.
@@ -338,11 +285,12 @@ fn main() -> eframe::Result<()> {
     #[allow(unused_mut)]
     let mut options = app::AppOptions::default();
     #[cfg(feature = "demo")]
-    if cli.demo_shot.is_some() {
-        options = app::AppOptions {
-            media_controls: false,
-            tray: false,
-        };
+    {
+        options.offline = demo;
+        if cli.demo_shot.is_some() {
+            options.media_controls = false;
+            options.tray = false;
+        }
     }
     #[allow(unused_mut)]
     let mut app = app::App::new(&waker, dirs, settings, options);
@@ -538,9 +486,8 @@ fn native_options(fullscreen: bool, mini: Option<MiniWindow>) -> eframe::NativeO
             } else {
                 egui::WindowLevel::Normal
             };
-            // See-through, for skins that are not rectangles; the skin
-            // paints every pixel that is the window. MilkDrop runs in its own
-            // process, so nothing else shares this window's surface.
+            // See-through, for skins that are not rectangles; the skin paints
+            // every pixel that is the window.
             let viewport = viewport
                 .with_decorations(false)
                 .with_transparent(true)
@@ -667,7 +614,7 @@ impl eframe::App for Shell {
                     MenuCommand::ToggleMute => Action::ToggleMute,
                     MenuCommand::Home => Action::Open(Page::Home),
                     MenuCommand::Search => Action::FocusSearch,
-                    MenuCommand::LikedSongs => Action::Open(Page::LikedSongs),
+                    MenuCommand::Favorites => Action::Open(Page::Favorites),
                     MenuCommand::Sidebar => Action::ToggleSidebar,
                     MenuCommand::Queue => Action::ToggleQueuePanel,
                     MenuCommand::Settings => Action::Open(Page::Settings),
@@ -755,5 +702,38 @@ fn app_icon() -> egui::IconData {
         rgba: util::app_icon_rgba(SIZE),
         width: SIZE as u32,
         height: SIZE as u32,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SONG_REF: &str = "fastpotify:song:0123456789abcdef0123456789abcdef01234567:dHJhY2stMQ";
+
+    #[test]
+    fn cli_exposes_favorite_and_secret_free_media_refs() {
+        let favorite = Cli::try_parse_from(["fastpotify", "favorite"]).unwrap();
+        assert!(matches!(favorite.control, Some(Control::Favorite)));
+
+        let play = Cli::try_parse_from(["fastpotify", "play-ref", SONG_REF]).unwrap();
+        assert!(matches!(
+            play.control,
+            Some(Control::PlayRef { media_ref }) if media_ref == SONG_REF
+        ));
+    }
+
+    #[test]
+    fn deprecated_command_aliases_do_not_restore_provider_uris() {
+        let play = Cli::try_parse_from(["fastpotify", "play-uri", SONG_REF]).unwrap();
+        assert!(matches!(play.control, Some(Control::PlayRef { .. })));
+        assert!(Cli::try_parse_from(["fastpotify", "play-uri", "legacy:track:old-id",]).is_err());
+    }
+
+    #[test]
+    fn connect_commands_and_device_name_are_gone() {
+        assert!(Cli::try_parse_from(["fastpotify", "devices"]).is_err());
+        assert!(Cli::try_parse_from(["fastpotify", "transfer", "local"]).is_err());
+        assert!(Cli::try_parse_from(["fastpotify", "--device-name", "Kitchen"]).is_err());
     }
 }

@@ -1,8 +1,7 @@
-//! Sample rate conversion for an output that will not take 44.1 kHz.
+//! Sample rate conversion into the output pipeline's canonical rate.
 //!
-//! Spotify audio is stereo 44.1 kHz, but many shared Windows devices run at
-//! 48 kHz. rodio resets its resampler at each chunk boundary, which can cause
-//! crackle. This converter preserves state across chunks.
+//! Server streams use many sample rates. Resetting a resampler at each chunk
+//! boundary can cause crackle, so this converter preserves state across them.
 //!
 //! It uses a polyphase windowed-sinc filter and computes only the taps needed
 //! for each output sample.

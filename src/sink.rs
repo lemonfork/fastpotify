@@ -1,54 +1,57 @@
-//! Audio output for local playback.
+//! Native PCM output for local Navidrome playback.
 //!
-//! librespot's rodio sink panics if no output device is available. Release
-//! builds abort on that panic. This sink opens the device when playback starts
-//! and reports failures through the UI. Fastpotify can then remain available
-//! as a Connect remote until an output appears.
+//! The player gives this module interleaved stereo at 44.1 kHz. Device
+//! discovery and stream creation stay here, off the UI thread. A new decode
+//! generation clears queued sound immediately, and every blocking drain loop
+//! observes the shared generation so Next, Seek, and shutdown can interrupt it.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait};
-use librespot_playback::audio_backend::{Sink, SinkError, SinkResult};
-use librespot_playback::convert::Converter;
-use librespot_playback::decoder::AudioPacket;
-use librespot_playback::mixer::VolumeGetter;
-use librespot_playback::{NUM_CHANNELS, SAMPLE_RATE};
 
 use crate::resample::Resampler;
 
-/// The backend name Settings uses for this sink.
+/// The canonical format between the decoder, DSP stages, and output.
+pub const PCM_SAMPLE_RATE: u32 = 44_100;
+pub const PCM_CHANNELS: usize = 2;
+
+/// The backend name retained for settings migration and diagnostics.
 pub const NAME: &str = "rodio";
 
-/// Told about output failures, with a message fit for the interface.
-pub type ErrorHook = Arc<dyn Fn(String) + Send + Sync>;
+/// Maximum queued rodio chunks. Decoder blocks remain small, keeping the
+/// audible queue bounded while leaving enough slack for scheduler jitter.
+const QUEUE_LIMIT: usize = 6;
 
-/// Maximum queued rodio chunks before `write` blocks, about 200 ms of audio.
-const QUEUE_LIMIT: usize = 12;
+/// How often a blocked writer checks cancellation and device health.
+const CANCEL_POLL: Duration = Duration::from_millis(5);
 
-/// Maximum time `stop` waits for the queue to drain.
-const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+/// Maximum time natural EOF waits for already queued audio to be heard.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// How often playback looks at which output the system calls its default.
 const DEFAULT_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Default device buffer length in milliseconds.
-///
-/// Small platform defaults can click under load (#88). A 100 ms buffer avoids
-/// these underruns while keeping controls responsive.
 pub const DEFAULT_BUFFER_MS: u32 = 100;
 
 /// Allowed device buffer range. Lower values can click; higher values delay
 /// playback controls.
 pub const BUFFER_MS_RANGE: std::ops::RangeInclusive<u32> = 20..=500;
 
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum OutputError {
+    #[error("audio output was cancelled")]
+    Cancelled,
+    #[error("PCM must contain complete stereo frames")]
+    InvalidPcm,
+    #[error("{0}")]
+    Unavailable(String),
+}
+
 /// The buffer to ask the device for, in frames.
-///
-/// Clamp to the reported range because CoreAudio rejects unsupported sizes.
-/// If a device reports no range, request the configured size; `open_stream`
-/// can retry without a fixed size.
 fn engine_buffer(
     sample_rate: u32,
     ms: u32,
@@ -65,29 +68,18 @@ fn engine_buffer(
 }
 
 pub struct RodioSink {
-    /// The output device name from Settings; `None` means the default.
+    /// The output device name from Settings; `None` follows the default.
     device: Option<String>,
     output: Option<Output>,
-    on_error: ErrorHook,
-    /// Player volume, applied at output so changes affect queued audio.
-    volume: Box<dyn VolumeGetter + Send>,
-    applied_volume: f32,
-    /// Watches for changes to the default output.
     watch: Option<DefaultWatch>,
-    /// How much sound to ask the device to hold, in milliseconds. Taken
-    /// when the stream opens, so a change lands with the next restart.
     buffer_ms: u32,
 }
 
 struct Output {
     sink: rodio::Sink,
     _stream: rodio::OutputStream,
-    /// The name of the device the stream was opened on.
     device_name: Option<String>,
-    /// Set from the audio thread when the stream dies (device unplugged).
     failed: Arc<AtomicBool>,
-    /// The rate the stream runs at, and the converter to it when that is
-    /// not Spotify's.
     sample_rate: u32,
     resampler: Option<Resampler>,
 }
@@ -96,32 +88,24 @@ impl Output {
     fn failed(&self) -> bool {
         self.failed.load(Ordering::Relaxed)
     }
+
+    fn reset(&mut self) {
+        self.sink.clear();
+        self.resampler = Resampler::new(PCM_SAMPLE_RATE, self.sample_rate, PCM_CHANNELS);
+    }
 }
 
 impl RodioSink {
-    pub fn new(
-        device: Option<String>,
-        on_error: ErrorHook,
-        volume: Box<dyn VolumeGetter + Send>,
-        buffer_ms: u32,
-    ) -> Self {
+    pub fn new(device: Option<String>, buffer_ms: u32) -> Self {
         Self {
             device,
             output: None,
-            on_error,
-            volume,
-            applied_volume: -1.0,
             watch: None,
             buffer_ms,
         }
     }
 
     /// Follows the system default output when no device is selected.
-    ///
-    /// Windows and macOS need explicit polling. PipeWire and PulseAudio move
-    /// streams themselves, while ALSA's answer does not change. Polling runs
-    /// off the player thread. `at_once` requests a fresh value at playback
-    /// start.
     fn follow_default(&mut self, at_once: bool) {
         if cfg!(target_os = "linux") || self.device.is_some() {
             return;
@@ -140,18 +124,7 @@ impl RodioSink {
         }
     }
 
-    fn apply_volume(&mut self) {
-        let factor = self.volume.attenuation_factor() as f32;
-        if let Some(output) = &self.output
-            && factor != self.applied_volume
-        {
-            output.sink.set_volume(factor);
-            self.applied_volume = factor;
-        }
-    }
-
-    /// Opens the output if it is not open, or if it died since.
-    fn ensure_open(&mut self) -> SinkResult<()> {
+    fn ensure_open(&mut self) -> Result<(), OutputError> {
         if self.output.as_ref().is_some_and(Output::failed) {
             log::warn!("the audio output stopped working; reopening it");
             self.output = None;
@@ -159,88 +132,150 @@ impl RodioSink {
         if self.output.is_some() {
             return Ok(());
         }
-        match open_output(self.device.as_deref(), self.buffer_ms) {
-            Ok(output) => {
-                self.output = Some(output);
-                self.applied_volume = -1.0;
-                Ok(())
-            }
-            Err(error) => {
-                let message = error.to_string();
-                log::error!("{message}");
-                (self.on_error)(message.clone());
-                Err(SinkError::ConnectionRefused(message))
-            }
-        }
+        self.output = Some(
+            open_output(self.device.as_deref(), self.buffer_ms)
+                .map_err(|error| OutputError::Unavailable(error.to_string()))?,
+        );
+        Ok(())
     }
-}
 
-impl Sink for RodioSink {
-    fn start(&mut self) -> SinkResult<()> {
+    /// Starts a fresh decode generation and drops every old queued sample.
+    pub fn begin(&mut self) -> Result<(), OutputError> {
         take_precedence();
         self.follow_default(true);
         self.ensure_open()?;
-        self.apply_volume();
+        if let Some(output) = &mut self.output {
+            output.reset();
+            output.sink.play();
+        }
+        Ok(())
+    }
+
+    pub fn pause(&mut self) {
+        if let Some(output) = &self.output {
+            output.sink.pause();
+        }
+    }
+
+    pub fn resume(&mut self) -> Result<(), OutputError> {
+        self.ensure_open()?;
         if let Some(output) = &self.output {
             output.sink.play();
         }
         Ok(())
     }
 
-    /// Never fails: librespot exits the process when a sink cannot stop.
-    fn stop(&mut self) -> SinkResult<()> {
-        if let Some(output) = &self.output {
-            let deadline = Instant::now() + DRAIN_TIMEOUT;
-            while !output.sink.empty() && !output.failed() && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(10));
-            }
+    /// Clears immediately; unlike natural EOF this never drains old PCM.
+    pub fn clear(&mut self) {
+        if let Some(output) = &mut self.output {
+            output.reset();
             output.sink.pause();
+        }
+    }
+
+    /// Writes one canonical PCM block. A changed generation interrupts both
+    /// resampling and back-pressure waits before stale samples can be queued.
+    pub fn write(
+        &mut self,
+        samples: &[f32],
+        generation: u64,
+        current_generation: &AtomicU64,
+    ) -> Result<(), OutputError> {
+        if !samples.len().is_multiple_of(PCM_CHANNELS) {
+            return Err(OutputError::InvalidPcm);
+        }
+        if current_generation.load(Ordering::Acquire) != generation {
+            return Err(OutputError::Cancelled);
+        }
+        self.follow_default(false);
+        self.ensure_open()?;
+        let Some(output) = &mut self.output else {
+            return Err(OutputError::Unavailable(
+                "The audio output is not open".into(),
+            ));
+        };
+        let converted = match &mut output.resampler {
+            Some(resampler) => resampler.process(samples),
+            None => samples.to_vec(),
+        };
+        if current_generation.load(Ordering::Acquire) != generation {
+            return Err(OutputError::Cancelled);
+        }
+        output.sink.append(rodio::buffer::SamplesBuffer::new(
+            PCM_CHANNELS as rodio::ChannelCount,
+            output.sample_rate as rodio::SampleRate,
+            converted,
+        ));
+        while output.sink.len() > QUEUE_LIMIT {
+            if current_generation.load(Ordering::Acquire) != generation {
+                return Err(OutputError::Cancelled);
+            }
+            if output.failed() {
+                return Err(OutputError::Unavailable(
+                    "The audio output stopped working".into(),
+                ));
+            }
+            thread::sleep(CANCEL_POLL);
         }
         Ok(())
     }
 
-    fn write(&mut self, packet: AudioPacket, converter: &mut Converter) -> SinkResult<()> {
-        let samples = packet
-            .samples()
-            .map_err(|error| SinkError::OnWrite(error.to_string()))?;
-        let samples = converter.f64_to_f32(samples);
-        self.follow_default(false);
-        self.ensure_open()?;
-        self.apply_volume();
-        let Some(output) = &mut self.output else {
-            return Err(SinkError::NotConnected(
-                "the audio output is not open".into(),
-            ));
-        };
-        let samples = match &mut output.resampler {
-            Some(resampler) => resampler.process(&samples),
-            None => samples,
-        };
-        output.sink.append(rodio::buffer::SamplesBuffer::new(
-            NUM_CHANNELS as rodio::ChannelCount,
-            output.sample_rate as rodio::SampleRate,
-            samples,
-        ));
-        // Let rodio drain a little; without this the whole track would be
-        // decoded into memory at once.
-        while output.sink.len() > QUEUE_LIMIT {
-            if output.failed() {
-                let message = "The audio output stopped working".to_string();
-                (self.on_error)(message.clone());
-                return Err(SinkError::OnWrite(message));
-            }
-            thread::sleep(Duration::from_millis(10));
+    /// Waits for natural EOF to become audible, but never delays a newer
+    /// command. Cancellation is distinct from a current output failure so the
+    /// player cannot silently leave the queue stuck in `Playing`.
+    pub fn drain(
+        &self,
+        generation: u64,
+        current_generation: &AtomicU64,
+    ) -> Result<(), OutputError> {
+        if current_generation.load(Ordering::Acquire) != generation {
+            return Err(OutputError::Cancelled);
         }
-        Ok(())
+        let Some(output) = &self.output else {
+            return Ok(());
+        };
+        let deadline = Instant::now() + DRAIN_TIMEOUT;
+        loop {
+            if let Some(result) = drain_poll(
+                generation,
+                current_generation.load(Ordering::Acquire),
+                output.failed(),
+                output.sink.empty(),
+                Instant::now() >= deadline,
+            ) {
+                return result;
+            }
+            thread::sleep(CANCEL_POLL);
+        }
     }
 }
 
-/// Opens the stream at Spotify's stereo 44.1 kHz, so nothing is converted,
-/// else at the device's own rate, which Windows insists on for a shared
-/// device, else at whatever rodio can find.
-///
-/// The first two attempts request the configured buffer. The fallback lets
-/// the driver choose its buffer size.
+fn drain_poll(
+    generation: u64,
+    current_generation: u64,
+    output_failed: bool,
+    output_empty: bool,
+    timed_out: bool,
+) -> Option<Result<(), OutputError>> {
+    if current_generation != generation {
+        Some(Err(OutputError::Cancelled))
+    } else if output_failed {
+        Some(Err(OutputError::Unavailable(
+            "The audio output stopped working".into(),
+        )))
+    } else if output_empty {
+        Some(Ok(()))
+    } else if timed_out {
+        Some(Err(OutputError::Unavailable(
+            "The audio output did not finish playing in time".into(),
+        )))
+    } else {
+        None
+    }
+}
+
+/// Opens the stream at canonical stereo 44.1 kHz, else at the device's own
+/// rate, else at whatever rodio can negotiate.
 fn open_stream(
     device: &cpal::Device,
     on_error: impl FnMut(cpal::StreamError) + Send + Clone + 'static,
@@ -252,7 +287,7 @@ fn open_stream(
         .unwrap_or(cpal::SupportedBufferSize::Unknown);
     let builder = |sample_rate: u32, buffer: bool| -> Result<_, rodio::StreamError> {
         let builder = rodio::OutputStreamBuilder::from_device(device.clone())?
-            .with_channels(NUM_CHANNELS as rodio::ChannelCount)
+            .with_channels(PCM_CHANNELS as rodio::ChannelCount)
             .with_sample_rate(sample_rate as rodio::SampleRate)
             .with_error_callback(on_error.clone());
         Ok(if buffer {
@@ -261,7 +296,7 @@ fn open_stream(
             builder
         })
     };
-    if let Ok(stream) = builder(SAMPLE_RATE, true)?.open_stream() {
+    if let Ok(stream) = builder(PCM_SAMPLE_RATE, true)?.open_stream() {
         return Ok(stream);
     }
     if let Ok(config) = device.default_output_config()
@@ -269,20 +304,16 @@ fn open_stream(
     {
         return Ok(stream);
     }
-    builder(SAMPLE_RATE, false)?.open_stream_or_fallback()
+    builder(PCM_SAMPLE_RATE, false)?.open_stream_or_fallback()
 }
 
-/// Raises the Windows decoder thread one step above normal to prevent queued
-/// audio from running out under load (#88).
-///
-/// Linux requires rtkit for this; macOS would require a QoS class.
+/// Raises the Windows audio thread one step above normal to prevent underruns.
 #[cfg(windows)]
 fn take_precedence() {
     use windows_sys::Win32::System::Threading::{
         GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
     };
-    // SAFETY: the current thread's pseudo-handle needs no closing, and the
-    // call takes nothing else.
+    // SAFETY: the current thread's pseudo-handle needs no closing.
     unsafe {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     }
@@ -291,7 +322,7 @@ fn take_precedence() {
 #[cfg(not(windows))]
 fn take_precedence() {}
 
-/// Last default-output name, polled on a worker thread because Windows device
+/// Last default-output name, polled away from the audio actor because device
 /// enumeration can block. The thread ends when the sink is dropped.
 struct DefaultWatch(Arc<Mutex<Option<String>>>);
 
@@ -315,7 +346,6 @@ impl DefaultWatch {
         Self(shared)
     }
 
-    /// Last polled name, or `None` before the first poll.
     fn name(&self) -> Option<String> {
         self.0
             .lock()
@@ -323,7 +353,6 @@ impl DefaultWatch {
             .clone()
     }
 
-    /// Asks right now, on this thread.
     fn ask(&self) -> Option<String> {
         let name = default_output_name();
         *self.0.lock().unwrap_or_else(PoisonError::into_inner) = name.clone();
@@ -357,7 +386,7 @@ fn open_output(preferred: Option<&str>, buffer_ms: u32) -> Result<Output, OpenEr
             match chosen {
                 Some(device) => device,
                 None => {
-                    log::warn!("audio device {name:?} is not available; using the default");
+                    log::warn!("configured audio device is unavailable; using the default");
                     host.default_output_device().ok_or(OpenError::NoDevice)?
                 }
             }
@@ -379,10 +408,10 @@ fn open_output(preferred: Option<&str>, buffer_ms: u32) -> Result<Output, OpenEr
     let mut stream = open_stream(&device, on_error, buffer_ms)?;
     stream.log_on_drop(false);
     let sample_rate = stream.config().sample_rate();
-    let resampler = Resampler::new(SAMPLE_RATE, sample_rate, NUM_CHANNELS as usize);
+    let resampler = Resampler::new(PCM_SAMPLE_RATE, sample_rate, PCM_CHANNELS);
     if resampler.is_some() {
         log::info!(
-            "the output runs at {sample_rate} Hz; the music is converted from {SAMPLE_RATE} Hz"
+            "the output runs at {sample_rate} Hz; PCM is converted from {PCM_SAMPLE_RATE} Hz"
         );
     }
     let sink = rodio::Sink::connect_new(stream.mixer());
@@ -398,20 +427,18 @@ fn open_output(preferred: Option<&str>, buffer_ms: u32) -> Result<Output, OpenEr
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
-    /// Converts the configured buffer duration to device frames.
     #[test]
     fn the_buffer_follows_the_setting_and_the_rate() {
         let unknown = cpal::SupportedBufferSize::Unknown;
         assert_eq!(
             engine_buffer(44_100, 100, unknown),
-            cpal::BufferSize::Fixed(4410),
-            "a tenth of a second at 44.1 kHz"
+            cpal::BufferSize::Fixed(4410)
         );
         assert_eq!(
             engine_buffer(48_000, 100, unknown),
-            cpal::BufferSize::Fixed(4800),
-            "the same tenth of a second at 48 kHz"
+            cpal::BufferSize::Fixed(4800)
         );
         assert_eq!(
             engine_buffer(44_100, 20, unknown),
@@ -419,19 +446,12 @@ mod tests {
         );
     }
 
-    /// Clamps the buffer to the device range required by CoreAudio.
     #[test]
-    fn a_device_that_states_its_range_is_kept_inside_it() {
+    fn a_device_range_is_respected() {
         let range = cpal::SupportedBufferSize::Range { min: 64, max: 2048 };
         assert_eq!(
             engine_buffer(44_100, 100, range),
-            cpal::BufferSize::Fixed(2048),
-            "held down to what the device can take"
-        );
-        assert_eq!(
-            engine_buffer(44_100, 20, range),
-            cpal::BufferSize::Fixed(882),
-            "and left alone when it fits"
+            cpal::BufferSize::Fixed(2048)
         );
         let tiny = cpal::SupportedBufferSize::Range {
             min: 4096,
@@ -439,15 +459,12 @@ mod tests {
         };
         assert_eq!(
             engine_buffer(44_100, 20, tiny),
-            cpal::BufferSize::Fixed(4096),
-            "and brought up to a device that will not go smaller"
+            cpal::BufferSize::Fixed(4096)
         );
     }
 
-    /// Rule: a settings file with a wild number in it still opens a
-    /// stream. The range is the range whoever wrote the file thought of.
     #[test]
-    fn a_number_from_outside_the_range_is_brought_back_in() {
+    fn wild_buffer_values_are_clamped() {
         let unknown = cpal::SupportedBufferSize::Unknown;
         assert_eq!(
             engine_buffer(44_100, 0, unknown),
@@ -458,29 +475,26 @@ mod tests {
             engine_buffer(44_100, *BUFFER_MS_RANGE.end(), unknown)
         );
     }
-    use super::*;
-    use std::sync::Mutex;
 
-    /// A machine without audio (CI, a PC with nothing plugged in) must get
-    /// an error and a message for the interface, never a panic. A machine
-    /// with audio opens its default device.
     #[test]
-    fn starting_without_a_device_is_an_error_not_a_panic() {
-        let reported: Arc<Mutex<Option<String>>> = Arc::default();
-        let store = Arc::clone(&reported);
-        let mut sink = RodioSink::new(
-            Some("no such device".into()),
-            Arc::new(move |message| *store.lock().unwrap() = Some(message)),
-            Box::new(librespot_playback::mixer::NoOpVolume),
-            DEFAULT_BUFFER_MS,
+    fn drain_distinguishes_cancellation_from_current_output_failure() {
+        assert_eq!(
+            drain_poll(7, 8, false, false, false),
+            Some(Err(OutputError::Cancelled))
         );
-        match sink.start() {
-            Ok(()) => assert!(reported.lock().unwrap().is_none()),
-            Err(SinkError::ConnectionRefused(message)) => {
-                assert_eq!(reported.lock().unwrap().as_deref(), Some(message.as_str()));
-            }
-            Err(other) => panic!("unexpected error: {other}"),
-        }
-        assert!(sink.stop().is_ok());
+        assert_eq!(
+            drain_poll(7, 7, true, false, false),
+            Some(Err(OutputError::Unavailable(
+                "The audio output stopped working".into()
+            )))
+        );
+        assert_eq!(
+            drain_poll(7, 7, false, false, true),
+            Some(Err(OutputError::Unavailable(
+                "The audio output did not finish playing in time".into()
+            )))
+        );
+        assert_eq!(drain_poll(7, 7, false, true, false), Some(Ok(())));
+        assert_eq!(drain_poll(7, 7, false, false, false), None);
     }
 }

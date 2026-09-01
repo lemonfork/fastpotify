@@ -2,7 +2,7 @@
 <component type="desktop-application">
   <id>rocks.fastpotify.Fastpotify</id>
   <name>Fastpotify</name>
-  <summary>A native Spotify client</summary>
+  <summary>A native Navidrome music client</summary>
   <developer id="me.paolino">
     <name>Carmine Paolino</name>
   </developer>
@@ -10,15 +10,13 @@
   <project_license>MIT</project_license>
   <description>
     <p>
-      A Spotify client written in Rust with no browser engine. It starts
-      in well under a second, plays music on this computer, and controls other
-      Spotify Connect devices.
+      A native music client written in Rust with no browser engine. It starts
+      in well under a second and plays music from your Navidrome server.
     </p>
     <p>
-      Browse your library, search Spotify, edit playlists, manage the queue,
+      Browse your library, search your music, edit playlists, manage the queue,
       and view lyrics. It also has keyboard shortcuts, media-key support,
       background playback, and a mini player for classic Winamp skins.
-      Playback needs Spotify Premium.
     </p>
   </description>
   <launchable type="desktop-id">rocks.fastpotify.Fastpotify.desktop</launchable>
@@ -28,7 +26,7 @@
   <url type="vcs-browser">https://github.com/crmne/fastpotify</url>
   <screenshots>
     <screenshot type="default">
-      <caption>A playlist, with the queue open and a track playing on a remote speaker</caption>
+      <caption>A playlist, with the queue open and a track playing</caption>
       <image>https://raw.githubusercontent.com/crmne/fastpotify/main/docs/screenshot.png</image>
     </screenshot>
     <screenshot>
@@ -37,8 +35,8 @@
     </screenshot>
   </screenshots>
   <branding>
-    <color type="primary" scheme_preference="light">#1ed760</color>
-    <color type="primary" scheme_preference="dark">#144a2a</color>
+    <color type="primary" scheme_preference="light">#5b8cff</color>
+    <color type="primary" scheme_preference="dark">#172a5e</color>
   </branding>
   <content_rating type="oars-1.1" />
   <requires>

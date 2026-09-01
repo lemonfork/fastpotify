@@ -26,6 +26,7 @@ modules:
       - install -Dm644 packaging/icons/fastpotify.svg /app/share/icons/hicolor/scalable/apps/rocks.fastpotify.Fastpotify.svg
       - install -Dm644 packaging/flatpak/rocks.fastpotify.Fastpotify.metainfo.xml /app/share/metainfo/rocks.fastpotify.Fastpotify.metainfo.xml
       - install -Dm644 LICENSE /app/share/licenses/fastpotify/LICENSE
+      - install -Dm644 THIRD_PARTY_NOTICES.md /app/share/licenses/fastpotify/THIRD_PARTY_NOTICES.md
     sources:
       - type: dir
         path: built

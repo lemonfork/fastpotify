@@ -1,26 +1,21 @@
 //! Audio tap and Winamp-style spectrum and oscilloscope data.
 //!
-//! The tap wraps the active sink and stores half a second of post-EQ,
-//! pre-volume audio. The analyser uses Winamp's constants and behavior from
+//! The player feeds the tap half a second of post-EQ, pre-volume audio. The
+//! analyser uses Winamp's constants and behavior from
 //! `classic_vis.cpp`, with FFT details cross-checked against Webamp's
-//! `VisPainter.ts` and `FFTNullsoft.ts`. MilkDrop receives stereo samples;
-//! the spectrum and scope use mono samples.
+//! `VisPainter.ts` and `FFTNullsoft.ts`.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use librespot_playback::audio_backend::{Sink, SinkResult};
-use librespot_playback::convert::Converter;
-use librespot_playback::decoder::AudioPacket;
-use librespot_playback::mixer::VolumeGetter;
-use librespot_playback::{NUM_CHANNELS, SAMPLE_RATE};
+use crate::sink::{PCM_CHANNELS, PCM_SAMPLE_RATE};
 
 /// Half a second of audio.
-const KEPT: usize = SAMPLE_RATE as usize / 2;
+const KEPT: usize = PCM_SAMPLE_RATE as usize / 2;
 /// How far behind the newest sample the visualiser looks, so that it shows
 /// what the speaker is playing rather than what the sink has queued.
-pub const LAG: usize = SAMPLE_RATE as usize * 3 / 20;
+pub const LAG: usize = PCM_SAMPLE_RATE as usize * 3 / 20;
 /// Samples that go into one spectrum.
 pub const FFT_SAMPLES: usize = 512;
 const SPECTRUM_BINS: usize = FFT_SAMPLES / 2;
@@ -47,14 +42,9 @@ const CHANNEL_SUM: f32 = 2.0;
 const SPEC_SCALE: f32 = 0.5;
 
 /// The last half second of sound, shared between the player's thread and
-/// the visualiser. The mono mix stays in this process for the skin's
-/// analyser; the stereo sound goes to a shared-memory ring for the MilkDrop
-/// child process, when one is running.
+/// the visualiser.
 pub struct AudioTap {
     samples: Mutex<VecDeque<f32>>,
-    /// The ring the MilkDrop child reads, attached while its window is open.
-    #[cfg(feature = "milkdrop")]
-    shm: Mutex<Option<std::sync::Arc<crate::milkdrop::shm::Ring>>>,
 }
 
 impl std::fmt::Debug for AudioTap {
@@ -67,8 +57,6 @@ impl Default for AudioTap {
     fn default() -> Self {
         Self {
             samples: Mutex::new(VecDeque::with_capacity(KEPT)),
-            #[cfg(feature = "milkdrop")]
-            shm: Mutex::new(None),
         }
     }
 }
@@ -78,40 +66,16 @@ impl AudioTap {
         Arc::new(Self::default())
     }
 
-    /// Connects the tap to MilkDrop's shared-memory ring. `None` detaches it.
-    #[cfg(feature = "milkdrop")]
-    pub fn set_shm(&self, ring: Option<std::sync::Arc<crate::milkdrop::shm::Ring>>) {
-        *self.shm.lock().unwrap_or_else(|p| p.into_inner()) = ring;
-    }
-
-    /// Adds scaled stereo samples to the mono analyser buffer and, when
-    /// attached, MilkDrop's stereo shared-memory ring.
-    pub fn push(&self, interleaved: &[f64], gain: f32) {
+    /// Adds post-EQ stereo samples to the mono analyser buffer.
+    pub fn push(&self, interleaved: &[f64]) {
         let mut samples = self.samples.lock().unwrap_or_else(|p| p.into_inner());
-        let (frames, _) = interleaved.as_chunks::<{ NUM_CHANNELS as usize }>();
-        #[cfg(feature = "milkdrop")]
-        let shm = self.shm.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        #[cfg(feature = "milkdrop")]
-        let mut stereo: Vec<f32> = if shm.is_some() {
-            Vec::with_capacity(frames.len() * 2)
-        } else {
-            Vec::new()
-        };
+        let (frames, _) = interleaved.as_chunks::<PCM_CHANNELS>();
         for frame in frames {
-            let mono = frame.iter().sum::<f64>() as f32 / frame.len() as f32 * gain;
+            let mono = frame.iter().sum::<f64>() as f32 / frame.len() as f32;
             if samples.len() == KEPT {
                 samples.pop_front();
             }
             samples.push_back(mono);
-            #[cfg(feature = "milkdrop")]
-            if shm.is_some() {
-                stereo.push(frame[0] as f32 * gain);
-                stereo.push(frame[1] as f32 * gain);
-            }
-        }
-        #[cfg(feature = "milkdrop")]
-        if let Some(ring) = &shm {
-            ring.push(&stereo);
         }
     }
 
@@ -140,101 +104,50 @@ impl AudioTap {
     }
 }
 
-/// Runs the equalizer and taps the signal before passing it to the real sink.
-pub struct Tapped {
-    inner: Box<dyn Sink>,
+/// The project's ordinary PCM processing stage.
+///
+/// Input is interleaved stereo at [`PCM_SAMPLE_RATE`]. The order is part of
+/// the UI contract: equalizer, visualizer tap, limiter, then dynamic volume.
+/// The returned samples are ready for the output sink.
+pub struct PcmProcessor {
     tap: Arc<AudioTap>,
     eq: crate::eq::Processor,
-    /// Player volume, used to calculate the limiter ceiling.
-    volume: Box<dyn VolumeGetter + Send>,
-    /// Whether this wrapper applies volume after the tap. Otherwise the inner
-    /// sink applies it, still after the tap and to already queued audio.
-    applies_volume: bool,
-    /// Final limiter, placed here because this stage knows the output volume.
     limiter: crate::limiter::Limiter,
-    /// Track normalization factor. The tap removes it so visualizers show the
-    /// source dynamics, as Winamp's analyser did.
-    normalisation: Arc<std::sync::atomic::AtomicU64>,
 }
 
-impl Tapped {
-    pub fn new(
-        inner: Box<dyn Sink>,
-        tap: Arc<AudioTap>,
-        volume: Box<dyn VolumeGetter + Send>,
-        applies_volume: bool,
-        eq: crate::eq::SharedEq,
-        normalisation: Arc<std::sync::atomic::AtomicU64>,
-    ) -> Self {
+impl PcmProcessor {
+    pub fn new(tap: Arc<AudioTap>, eq: crate::eq::SharedEq) -> Self {
         Self {
-            inner,
             tap,
             eq: crate::eq::Processor::new(eq),
-            volume,
-            applies_volume,
-            limiter: crate::limiter::Limiter::new(f64::from(SAMPLE_RATE)),
-            normalisation,
+            limiter: crate::limiter::Limiter::new(f64::from(PCM_SAMPLE_RATE)),
+        }
+    }
+
+    /// Processes one interleaved stereo block in place.
+    pub fn process(&mut self, samples: &mut [f64], volume: u16) {
+        self.eq.process(samples);
+        // Volume never changes the picture, including at zero volume.
+        self.tap.push(samples);
+        let attenuation = volume_factor(volume);
+        if let Some(ceiling) = full_scale_before_volume(attenuation) {
+            self.limiter.process(samples, ceiling);
+        }
+        for sample in samples {
+            *sample *= attenuation;
         }
     }
 }
 
-/// Full-scale level for samples leaving `Tapped`.
-///
-/// This is 1.0 after volume is applied. Before volume, it is the level that
-/// becomes 1.0 after the inner sink applies volume.
-fn full_scale(volume: f64, applied: bool) -> Option<f64> {
-    if applied {
-        Some(1.0)
-    } else if volume > f64::EPSILON {
-        Some(1.0 / volume)
-    } else {
-        // At zero volume, no finite pre-volume ceiling is needed.
-        None
-    }
+/// The same cubic volume curve used by the old native player, but owned by
+/// this project rather than by a playback SDK.
+pub fn volume_factor(volume: u16) -> f64 {
+    (f64::from(volume) / f64::from(u16::MAX)).powi(3)
 }
 
-impl Sink for Tapped {
-    fn start(&mut self) -> SinkResult<()> {
-        self.inner.start()
-    }
-
-    fn stop(&mut self) -> SinkResult<()> {
-        self.tap.clear();
-        self.inner.stop()
-    }
-
-    fn write(&mut self, packet: AudioPacket, converter: &mut Converter) -> SinkResult<()> {
-        let packet = match packet {
-            AudioPacket::Samples(mut samples) => {
-                self.eq.process(&mut samples);
-                // Post-EQ, pre-volume, pre-normalisation: the equalizer
-                // shapes what the bars show; the volume knob and the
-                // loudness housekeeping never move them.
-                let factor = f64::from_bits(
-                    self.normalisation
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                );
-                let restore = if factor > 0.05 && factor < 20.0 {
-                    (1.0 / factor).clamp(0.125, 8.0) as f32
-                } else {
-                    1.0
-                };
-                self.tap.push(&samples, restore);
-                let attenuation = self.volume.attenuation_factor();
-                if self.applies_volume {
-                    for sample in &mut samples {
-                        *sample *= attenuation;
-                    }
-                }
-                if let Some(full_scale) = full_scale(attenuation, self.applies_volume) {
-                    self.limiter.process(&mut samples, full_scale);
-                }
-                AudioPacket::Samples(samples)
-            }
-            raw => raw,
-        };
-        self.inner.write(packet, converter)
-    }
+/// The pre-volume level that lands on full scale after attenuation.
+fn full_scale_before_volume(volume: f64) -> Option<f64> {
+    (volume > f64::EPSILON).then(|| 1.0 / volume)
 }
 
 /// The classic analyser's FFT, as Winamp's own source has it: 512
@@ -511,7 +424,9 @@ mod tests {
 
     fn sine(hz: f32, amplitude: f32, count: usize) -> Vec<f32> {
         (0..count)
-            .map(|i| amplitude * (i as f32 / SAMPLE_RATE as f32 * hz * std::f32::consts::TAU).sin())
+            .map(|i| {
+                amplitude * (i as f32 / PCM_SAMPLE_RATE as f32 * hz * std::f32::consts::TAU).sin()
+            })
             .collect()
     }
 
@@ -519,9 +434,9 @@ mod tests {
     fn the_tap_mixes_stereo_down_and_pads_with_silence() {
         let tap = AudioTap::new();
         let interleaved: Vec<f64> = vec![0.5, -0.5, 1.0, 0.0, 0.2, 0.2];
-        tap.push(&interleaved, 2.0);
-        assert_eq!(tap.window(5, 0), [0.0, 0.0, 0.0, 1.0, 0.4]);
-        assert_eq!(tap.window(2, 1), [0.0, 1.0]);
+        tap.push(&interleaved);
+        assert_eq!(tap.window(5, 0), [0.0, 0.0, 0.0, 0.5, 0.2]);
+        assert_eq!(tap.window(2, 1), [0.0, 0.5]);
         tap.clear();
         assert_eq!(tap.window(2, 0), [0.0, 0.0]);
     }
@@ -530,7 +445,7 @@ mod tests {
     fn the_tap_keeps_half_a_second_at_most() {
         let tap = AudioTap::new();
         let interleaved = vec![0.25f64; 2 * (KEPT + 100)];
-        tap.push(&interleaved, 1.0);
+        tap.push(&interleaved);
         let samples = tap.samples.lock().unwrap();
         assert_eq!(samples.len(), KEPT);
     }
@@ -547,7 +462,7 @@ mod tests {
         let loudest = (0..SPECTRUM_BINS)
             .max_by(|a, b| out[*a].total_cmp(&out[*b]))
             .unwrap();
-        let expected = (1000.0 / SAMPLE_RATE as f32 * FFT_SAMPLES as f32).round() as usize;
+        let expected = (1000.0 / PCM_SAMPLE_RATE as f32 * FFT_SAMPLES as f32).round() as usize;
         assert!(
             loudest.abs_diff(expected) <= 1,
             "peak at bin {loudest}, tone at {expected}"
@@ -594,7 +509,7 @@ mod tests {
         let mut tick = clock();
         let loud: Vec<f32> = (0..FFT_SAMPLES)
             .map(|i| {
-                let t = i as f32 / SAMPLE_RATE as f32 * std::f32::consts::TAU;
+                let t = i as f32 / PCM_SAMPLE_RATE as f32 * std::f32::consts::TAU;
                 0.3 * ((t * 100.0).sin() + (t * 800.0).sin() + (t * 5000.0).sin())
             })
             .collect();
@@ -637,16 +552,19 @@ mod tests {
         assert_eq!(scope_shade(15), 4);
     }
 
-    /// Rule: full scale is one when the volume is already in, and the
-    /// level that lands on one when the output has yet to apply it.
-    /// Getting this wrong would hold a quiet listener to a quarter of
-    /// what their speaker could have had. The limiting itself is
-    /// [`crate::limiter`]'s, and tested there.
+    /// A muted output still supplies the exact same post-EQ signal to the
+    /// visualizer. Volume is the last operation in the PCM processor.
     #[test]
-    fn full_scale_follows_the_volume_still_to_come() {
-        assert_eq!(full_scale(0.5, true), Some(1.0), "already applied: one");
-        assert_eq!(full_scale(0.25, false), Some(4.0), "a quarter to come");
-        assert_eq!(full_scale(1.0, false), Some(1.0), "full volume to come");
-        assert_eq!(full_scale(0.0, false), None, "silence has no ceiling");
+    fn pcm_order_is_eq_tap_limiter_then_volume() {
+        let tap = AudioTap::new();
+        let mut processor = PcmProcessor::new(Arc::clone(&tap), crate::eq::shared());
+        let mut samples = vec![0.25, -0.25, 0.5, 0.0];
+        processor.process(&mut samples, 0);
+        assert_eq!(tap.window(2, 0), [0.0, 0.25]);
+        assert!(samples.iter().all(|sample| *sample == 0.0));
+
+        assert_eq!(full_scale_before_volume(0.25), Some(4.0));
+        assert_eq!(full_scale_before_volume(1.0), Some(1.0));
+        assert_eq!(full_scale_before_volume(0.0), None);
     }
 }

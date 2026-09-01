@@ -2,7 +2,6 @@
 
 use egui::{Align, CornerRadius, Frame, Layout, Margin, Stroke, Vec2};
 
-use crate::api::models::pick_image;
 use crate::app::App;
 use crate::model::{Action, Dialog};
 use crate::settings::ThemeChoice;
@@ -48,42 +47,23 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         .unwrap_or(false);
     let mut changed = false;
 
-    section(ui, &palette, "Account", |ui| {
+    section(ui, &palette, "Server account", |ui| {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 14.0;
-            let avatar = app
-                .user
-                .as_ref()
-                .and_then(|user| pick_image(&user.images, 64).map(str::to_string));
-            widgets::cover(ui, &palette, avatar.as_deref(), 56.0, 28.0, Icon::User);
+            widgets::cover(ui, &palette, None, 56.0, 28.0, Icon::User);
             ui.vertical(|ui| {
                 let name = app
                     .user
                     .as_ref()
                     .map(|user| user.name().to_string())
-                    .unwrap_or_default();
+                    .unwrap_or_else(|| "OpenSubsonic user".to_string());
                 theme::text(ui, name, theme::semibold(16.0), palette.text);
-                let product = app
-                    .user
-                    .as_ref()
-                    .and_then(|user| user.product.clone())
-                    .map(|product| match product.as_str() {
-                        "premium" => "Spotify Premium".to_string(),
-                        "free" | "open" => "Spotify Free, local playback needs Premium".to_string(),
-                        other => other.to_string(),
-                    })
-                    .unwrap_or_default();
-                theme::text(ui, product, theme::regular(13.0), palette.secondary);
-                if let Some(username) = app.local.connected.then(|| app.local.username.clone())
-                    && !username.is_empty()
-                {
-                    theme::text(
-                        ui,
-                        format!("Connected as {username}"),
-                        theme::regular(12.0),
-                        palette.dim,
-                    );
-                }
+                theme::text(
+                    ui,
+                    "Signed in to your music server",
+                    theme::regular(13.0),
+                    palette.secondary,
+                );
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if theme::pill_button(ui, &palette, "Sign out", false).clicked() {
@@ -91,164 +71,14 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 }
             });
         });
-        ui.add_space(10.0);
-        let mut client_id = app.settings.web_client_id.clone().unwrap_or_default();
-        widgets::setting_row(
-            ui,
-            &palette,
-            "Personal Spotify app",
-            "Use a personal Development Mode app for a separate API quota. The shared app stays active.",
-            |ui| {
-                let response = Frame::new()
-                    .fill(palette.surface)
-                    .corner_radius(CornerRadius::same(6))
-                    .inner_margin(Margin::symmetric(10, 6))
-                    .show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut client_id)
-                                .hint_text(egui::RichText::new("Client ID").color(palette.dim))
-                                .font(theme::regular(13.0))
-                                .frame(egui::Frame::NONE)
-                                .desired_width(200.0),
-                        )
-                    })
-                    .inner;
-                if response.changed() {
-                    let trimmed = client_id.trim().to_string();
-                    app.settings.web_client_id = (!trimmed.is_empty()).then_some(trimmed);
-                    changed = true;
-                }
-            },
-        );
-        widgets::setting_row(
-            ui,
-            &palette,
-            "Create an app",
-            "Create one for free in Spotify's developer dashboard.",
-            |ui| {
-                if theme::pill_button(ui, &palette, "Setup guide", false).clicked() {
-                    app.actions.push(Action::OpenUrl(
-                        "https://fastpotify.rocks/make-it-even-faster/".into(),
-                    ));
-                }
-            },
-        );
-        let wanted = app
-            .settings
-            .web_client_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-            .map(str::to_string);
-        let in_use = wanted
-            .as_deref()
-            .is_some_and(|wanted| app.web_app.as_deref() == Some(wanted));
-        if in_use {
-            widgets::setting_row(
-                ui,
-                &palette,
-                "Personal app ready",
-                "Supported requests use your app. Other requests use the shared app.",
-                |ui| {
-                    if theme::pill_button(ui, &palette, "Remove", false).clicked() {
-                        app.settings.web_client_id = None;
-                        app.actions.push(Action::ConfigurePersonalWebApp);
-                    }
-                },
-            );
-        } else if wanted.is_some() {
-            widgets::setting_row(
-                ui,
-                &palette,
-                "Authorize your personal app",
-                "Spotify opens in your browser to verify the account.",
-                |ui| {
-                    if theme::pill_button(ui, &palette, "Authorize", true).clicked() {
-                        app.actions.push(Action::ConfigurePersonalWebApp);
-                    }
-                },
-            );
-        } else if app.web_app.is_some() {
-            widgets::setting_row(
-                ui,
-                &palette,
-                "Remove personal app",
-                "Shared access remains signed in.",
-                |ui| {
-                    if theme::pill_button(ui, &palette, "Remove", false).clicked() {
-                        app.actions.push(Action::ConfigurePersonalWebApp);
-                    }
-                },
-            );
-        }
     });
 
-    section(ui, &palette, "Playback on this computer", |ui| {
-        let (status, detail, action) = match &app.local_playback {
-            crate::backend::LocalPlayback::Ready { .. } => (
-                "Ready",
-                "This computer is a Spotify Connect device.".to_string(),
-                None,
-            ),
-            crate::backend::LocalPlayback::Authorizing => (
-                "Setting up",
-                "Finish authorizing in your browser.".to_string(),
-                None,
-            ),
-            crate::backend::LocalPlayback::Connecting => {
-                ("Connecting", "Connecting to Spotify…".to_string(), None)
-            }
-            crate::backend::LocalPlayback::Failed(message) => {
-                ("Unavailable", message.clone(), Some("Try again"))
-            }
-            crate::backend::LocalPlayback::Unavailable => (
-                "Not set up",
-                "Requires Spotify Premium and a one-time browser sign-in.".to_string(),
-                Some("Enable playback here"),
-            ),
-        };
-        widgets::setting_row(ui, &palette, &format!("Status: {status}"), &detail, |ui| {
-            if let Some(label) = action {
-                if theme::pill_button(ui, &palette, label, true).clicked() {
-                    app.actions.push(Action::EnablePlayback);
-                }
-            } else if app.local_ready
-                && theme::soft_button(ui, &palette, Some(Icon::Refresh), "Reconnect", false)
-                    .clicked()
-            {
-                app.actions.push(Action::RestartEngine);
-            }
-        });
+    section(ui, &palette, "Playback", |ui| {
         widgets::setting_row(
             ui,
             &palette,
-            "Device name",
-            "How this computer appears in Spotify Connect.",
-            |ui| {
-                let response = Frame::new()
-                    .fill(palette.surface)
-                    .corner_radius(CornerRadius::same(6))
-                    .inner_margin(Margin::symmetric(10, 6))
-                    .show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut app.settings.device_name)
-                                .font(theme::regular(14.0))
-                                .frame(egui::Frame::NONE)
-                                .desired_width(200.0),
-                        )
-                    })
-                    .inner;
-                if response.changed() {
-                    changed = true;
-                    playback_dirty = true;
-                }
-            },
-        );
-        widgets::setting_row(
-            ui,
-            &palette,
-            "Audio quality",
-            "Higher bitrates use more data and cache space.",
+            "Maximum streaming bitrate",
+            "Your server may transcode above-limit songs. Lower values use less network data.",
             |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
@@ -275,37 +105,30 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 });
             },
         );
+        let mut output = app.settings.audio_device.clone().unwrap_or_default();
         widgets::setting_row(
             ui,
             &palette,
-            "Normalize volume",
-            "Keep loud and quiet tracks at a similar level.",
+            "Audio output",
+            "Leave empty to follow the system default output device.",
             |ui| {
-                if widgets::switch(ui, &palette, &mut app.settings.normalisation).changed() {
-                    changed = true;
-                    playback_dirty = true;
-                }
-            },
-        );
-        widgets::setting_row(
-            ui,
-            &palette,
-            "Autoplay",
-            "Keep playing similar songs when your music ends.",
-            |ui| {
-                if widgets::switch(ui, &palette, &mut app.settings.autoplay).changed() {
-                    changed = true;
-                    playback_dirty = true;
-                }
-            },
-        );
-        widgets::setting_row(
-            ui,
-            &palette,
-            "Gapless playback",
-            "Play tracks without silence between them.",
-            |ui| {
-                if widgets::switch(ui, &palette, &mut app.settings.gapless).changed() {
+                let response = Frame::new()
+                    .fill(palette.surface)
+                    .corner_radius(CornerRadius::same(6))
+                    .inner_margin(Margin::symmetric(10, 6))
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut output)
+                                .hint_text(egui::RichText::new("System default").color(palette.dim))
+                                .font(theme::regular(13.0))
+                                .frame(egui::Frame::NONE)
+                                .desired_width(220.0),
+                        )
+                    })
+                    .inner;
+                if response.changed() {
+                    let output = output.trim().to_string();
+                    app.settings.audio_device = (!output.is_empty()).then_some(output);
                     changed = true;
                     playback_dirty = true;
                 }
@@ -338,38 +161,6 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 }
             },
         );
-        if cfg!(target_os = "linux") {
-            widgets::setting_row(
-                ui,
-                &palette,
-                "Audio output",
-                "PulseAudio also covers PipeWire. Rodio talks to ALSA directly.",
-                |ui| {
-                    let current = app
-                        .settings
-                        .platform_backend()
-                        .unwrap_or_else(|| "rodio".into());
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        for backend in ["rodio", "pulseaudio"] {
-                            let label = if backend == "pulseaudio" {
-                                "PulseAudio / PipeWire"
-                            } else {
-                                "ALSA (rodio)"
-                            };
-                            if theme::soft_button(ui, &palette, None, label, current == backend)
-                                .clicked()
-                                && current != backend
-                            {
-                                app.settings.audio_backend = Some(backend.to_string());
-                                changed = true;
-                                playback_dirty = true;
-                            }
-                        }
-                    });
-                },
-            );
-        }
         widgets::setting_row(
             ui,
             &palette,
@@ -387,41 +178,6 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                             app.settings.audio_buffer_ms = ms;
                             changed = true;
                             playback_dirty = true;
-                        }
-                    }
-                });
-            },
-        );
-        widgets::setting_row(
-            ui,
-            &palette,
-            "Audio cache",
-            "Save downloaded audio for later playback.",
-            |ui| {
-                // The control area lays out right-to-left: add the rightmost item first.
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    if widgets::switch(ui, &palette, &mut app.settings.audio_cache).changed() {
-                        changed = true;
-                        playback_dirty = true;
-                    }
-                    if app.settings.audio_cache {
-                        ui.add_space(6.0);
-                        for (mb, label) in [(4096u64, "4 GB"), (1024, "1 GB"), (512, "512 MB")] {
-                            if theme::soft_button(
-                                ui,
-                                &palette,
-                                None,
-                                label,
-                                app.settings.audio_cache_mb == mb,
-                            )
-                            .clicked()
-                                && app.settings.audio_cache_mb != mb
-                            {
-                                app.settings.audio_cache_mb = mb;
-                                changed = true;
-                                playback_dirty = true;
-                            }
                         }
                     }
                 });
@@ -640,169 +396,12 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         );
     });
 
-    section(ui, &palette, "MilkDrop", |ui| {
-        widgets::setting_row(
-            ui,
-            &palette,
-            "MilkDrop window",
-            super::keys::platform_shortcut(
-                "A projectM visualiser for local playback. Open it here, from the top bar, with Ctrl+Shift+K, or from the mini player's V menu. Press ? or F1 for its shortcuts.",
-                "A projectM visualiser for local playback. Open it here, from the top bar, with Cmd+Shift+K, or from the mini player's V menu. Press ? or F1 for its shortcuts.",
-            ),
-            |ui| {
-                let mut open = app.settings.milkdrop_open;
-                if widgets::switch(ui, &palette, &mut open).changed() {
-                    app.actions.push(Action::ToggleWinampMilkdrop);
-                }
-            },
-        );
-        let folder = app.dirs.milkdrop_dir();
-        app.winamp.presets.refresh(&folder);
-        let count = app.winamp.presets.count();
-        let downloading = app.winamp.presets.downloading();
-        widgets::setting_row(
-            ui,
-            &palette,
-            "Presets",
-            &format!(
-                "{} in {}. Add .milk files here. Fastpotify downloads presets when MilkDrop first opens with an empty folder.",
-                match count {
-                    0 => "None yet".to_string(),
-                    1 => "One preset".to_string(),
-                    n => format!("{n} presets"),
-                },
-                folder.display(),
-            ),
-            |_ui| {},
-        );
-        // Three buttons are wider than a row's control slot; they get a
-        // line of their own under the words.
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            for (index, pack) in crate::milkdrop::PACKS.iter().enumerate() {
-                let label = match downloading {
-                    Some(name) if name == pack.name => "Fetching...".to_string(),
-                    _ => format!("Get {}", pack.name),
-                };
-                if theme::soft_button(ui, &palette, Some(Icon::Globe), &label, false)
-                    .on_hover_text(pack.note)
-                    .clicked()
-                    && downloading.is_none()
-                {
-                    app.actions.push(Action::DownloadMilkdropPack(index));
-                }
-            }
-            if theme::soft_button(ui, &palette, Some(Icon::ExternalLink), "Open folder", false)
-                .clicked()
-            {
-                app.actions.push(Action::OpenMilkdropFolder);
-            }
-        });
-        ui.add_space(10.0);
-        widgets::setting_row(
-            ui,
-            &palette,
-            "Time per preset",
-            "How long each preset plays before the next fades in.",
-            |ui| {
-                let mut seconds = app.settings.milkdrop_seconds.clamp(2, 300);
-                let slider = egui::Slider::new(&mut seconds, 2..=300)
-                    .logarithmic(true)
-                    .suffix(" s");
-                if ui.add(slider).changed() {
-                    app.actions.push(Action::SetMilkdropSeconds(seconds));
-                }
-            },
-        );
-        let screen_hz = app.settings.milkdrop_screen_hz;
-        widgets::setting_row(
-            ui,
-            &palette,
-            "Frame rate",
-            &match screen_hz {
-                0 => "Lower rates use fewer resources. Uncapped draws as fast as possible."
-                    .to_string(),
-                hz => format!(
-                    "Your screen refreshes at {hz} Hz. Higher rates do not add visible frames. Uncapped draws as fast as possible."
-                ),
-            },
-            |ui| {
-                let fps = app.settings.milkdrop_fps;
-                // The dial stops at the rates worth having and passes
-                // through nothing in between, the way a gear lever does.
-                let stops = crate::milkdrop::fps_stops(screen_hz, fps);
-                let last = stops.len().saturating_sub(1);
-                let mut at = stops.iter().position(|rate| *rate == fps).unwrap_or(1);
-                let labels: Vec<String> = stops
-                    .iter()
-                    .map(|rate| crate::milkdrop::fps_label(*rate, screen_hz))
-                    .collect();
-                let shown = labels.clone();
-                let typed = stops.clone();
-                let slider = egui::Slider::new(&mut at, 0..=last)
-                    .step_by(1.0)
-                    .custom_formatter(move |value, _| {
-                        shown
-                            .get((value.round().max(0.0) as usize).min(shown.len() - 1))
-                            .cloned()
-                            .unwrap_or_default()
-                    })
-                    .custom_parser(move |text| {
-                        // A rate typed in lands on the nearest stop, since
-                        // the stops are all this dial can hold.
-                        let text = text.trim().to_lowercase();
-                        if text.starts_with("un") {
-                            return Some(typed.len().saturating_sub(1) as f64);
-                        }
-                        let wanted: u32 = text
-                            .trim_end_matches("fps")
-                            .trim()
-                            .split(',')
-                            .next()?
-                            .trim()
-                            .parse()
-                            .ok()?;
-                        typed
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, rate)| **rate > 0)
-                            .min_by_key(|(_, rate)| rate.abs_diff(wanted))
-                            .map(|(index, _)| index as f64)
-                    });
-                if ui.add(slider).changed()
-                    && let Some(rate) = stops.get(at)
-                {
-                    app.actions.push(Action::SetMilkdropFps(*rate));
-                }
-            },
-        );
-        widgets::setting_row(
-            ui,
-            &palette,
-            "Resolution",
-            "Half and Quarter use fewer resources and scale the image back up.",
-            |ui| {
-                let current = app.settings.milkdrop_scale.max(1);
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    for (scale, label) in [(1u32, "Full"), (2, "Half"), (4, "Quarter")] {
-                        if theme::soft_button(ui, &palette, None, label, scale == current).clicked()
-                            && scale != current
-                        {
-                            app.actions.push(Action::SetMilkdropScale(scale));
-                        }
-                    }
-                });
-            },
-        );
-    });
-
     section(ui, &palette, "Equalizer", |ui| {
         widgets::setting_row(
             ui,
             &palette,
             "Equalizer",
-            "A ten-band equalizer for playback on this computer. It does not affect other devices.",
+            "A ten-band equalizer for playback on this computer.",
             |ui| {
                 let mut on = app.settings.eq_on;
                 if widgets::switch(ui, &palette, &mut on).changed() {
@@ -858,18 +457,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         widgets::setting_row(
             ui,
             &palette,
-            "Audio cache",
-            &format!("Stored in {}", app.dirs.audio_cache_dir().display()),
-            |_| {},
-        );
-        widgets::setting_row(
-            ui,
-            &palette,
             "Play history",
-            &format!(
-                "Tracks played here are stored in {}. This file is never uploaded.",
-                app.dirs.history_file().display()
-            ),
+            "Tracks played here are stored per server on this device. Clearing them does not delete the server's play history.",
             |ui| {
                 if theme::soft_button(ui, &palette, Some(Icon::Trash), "Clear history", false)
                     .clicked()
@@ -884,7 +473,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             "Sign-in",
             &format!(
                 "Credentials are kept in {}",
-                app.dirs.credentials_dir().display()
+                app.dirs.credentials_file().display()
             ),
             |_| {},
         );
@@ -903,7 +492,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 );
                 theme::text(
                     ui,
-                    "Built with Rust, egui, and librespot. Not affiliated with Spotify.",
+                    "Built with Rust and egui for OpenSubsonic music servers.",
                     theme::regular(13.0),
                     palette.secondary,
                 );
@@ -920,8 +509,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             if theme::soft_button(ui, &palette, Some(Icon::ExternalLink), "Source code", false)
                 .clicked()
             {
-                ui.ctx()
-                    .open_url(egui::OpenUrl::new_tab(env!("CARGO_PKG_REPOSITORY")));
+                app.actions
+                    .push(Action::OpenUrl(env!("CARGO_PKG_REPOSITORY").into()));
             }
         });
     });

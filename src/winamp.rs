@@ -107,8 +107,6 @@ pub struct WinampState {
     pub playlist_resize: f32,
     /// The playlist's rows as Winamp drew them, kept once drawn.
     pub playlist_text: crate::ui::winamp::PixelText,
-    /// MilkDrop presets listed and downloaded from Settings.
-    pub presets: crate::milkdrop::Presets,
 }
 
 impl WinampState {
@@ -136,7 +134,6 @@ impl WinampState {
             playlist_wheel: 0.0,
             playlist_resize: 0.0,
             playlist_text: crate::ui::winamp::PixelText::default(),
-            presets: crate::milkdrop::Presets::new(),
         }
     }
 

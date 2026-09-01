@@ -1,16 +1,19 @@
 //! Album art: fetched once, kept on disk, decoded by egui on demand.
 //!
-//! [`ArtLoader`] handles `http(s)` URIs in egui's image pipeline. The first
-//! request starts a background download or disk-cache read. A size limit keeps
-//! long sessions from retaining unlimited textures.
+//! [`ArtLoader`] handles secret-free `fastpotify-art:` references in egui's
+//! image pipeline. The active Navidrome client resolves them; authenticated
+//! HTTP URLs never enter the model, cache key, or loader diagnostics.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use egui::load::{Bytes, BytesLoadResult, BytesLoader, BytesPoll, LoadError};
 use sha1::{Digest, Sha1};
+
+use crate::api::ApiClient;
 
 /// Maximum artwork bytes held in memory.
 ///
@@ -33,7 +36,8 @@ enum Entry {
 
 struct Inner {
     entries: Mutex<HashMap<String, Entry>>,
-    http: reqwest::Client,
+    client: Mutex<Option<Arc<ApiClient>>>,
+    generation: AtomicU64,
     runtime: tokio::runtime::Handle,
     cache_dir: PathBuf,
 }
@@ -44,21 +48,40 @@ pub struct ArtLoader {
 }
 
 impl ArtLoader {
-    pub fn new(http: reqwest::Client, runtime: tokio::runtime::Handle, cache_dir: PathBuf) -> Self {
+    pub fn new(runtime: tokio::runtime::Handle, cache_dir: PathBuf) -> Self {
         let _ = std::fs::create_dir_all(&cache_dir);
         Self {
             inner: Arc::new(Inner {
                 entries: Mutex::new(HashMap::new()),
-                http,
+                client: Mutex::new(None),
+                generation: AtomicU64::new(0),
                 runtime,
                 cache_dir,
             }),
         }
     }
 
-    /// Bytes for `url`, from memory, disk, or the network.
-    pub async fn fetch(&self, url: &str) -> Result<Arc<[u8]>, String> {
-        self.inner.fetch(url).await
+    /// Changes the profile used to resolve artwork. In-memory entries are
+    /// discarded on session changes so a pending old-session result cannot be
+    /// mistaken for current state.
+    pub fn set_client(&self, client: Option<Arc<ApiClient>>) {
+        *self
+            .inner
+            .client
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = client;
+        self.inner.generation.fetch_add(1, Ordering::AcqRel);
+        self.inner
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
+    /// Bytes for an opaque artwork reference, from memory, disk, or the
+    /// currently authenticated server.
+    pub async fn fetch(&self, reference: &str) -> Result<Arc<[u8]>, String> {
+        self.inner.fetch(reference).await
     }
 
     /// Evicts failed entries and the oldest artwork above the memory limit.
@@ -125,8 +148,35 @@ fn over_budget(mut held: Vec<(String, Instant, usize)>, budget: usize) -> Vec<St
 }
 
 impl Inner {
-    fn cache_path(&self, url: &str) -> PathBuf {
-        let digest = Sha1::digest(url.as_bytes());
+    fn ensure_generation(&self, generation: u64) -> Result<(), String> {
+        if self.generation.load(Ordering::Acquire) == generation {
+            Ok(())
+        } else {
+            Err("artwork session changed".to_owned())
+        }
+    }
+
+    fn client_for(&self, reference: &str) -> Result<Arc<ApiClient>, String> {
+        if !crate::media::is_artwork_ref(reference) {
+            return Err("invalid artwork reference".to_owned());
+        }
+        let artwork = reference
+            .parse::<crate::api::ArtworkRef>()
+            .map_err(|_| "invalid artwork reference".to_owned())?;
+        let client = self
+            .client
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .ok_or_else(|| "artwork is unavailable while signed out".to_owned())?;
+        if artwork.profile != *client.profile_id() {
+            return Err("artwork belongs to another server profile".to_owned());
+        }
+        Ok(client)
+    }
+
+    fn cache_path(&self, reference: &str) -> PathBuf {
+        let digest = Sha1::digest(reference.as_bytes());
         let mut name = String::with_capacity(40);
         for byte in digest {
             use std::fmt::Write;
@@ -135,16 +185,22 @@ impl Inner {
         self.cache_dir.join(name)
     }
 
-    async fn fetch(self: &Arc<Self>, url: &str) -> Result<Arc<[u8]>, String> {
+    async fn fetch(self: &Arc<Self>, reference: &str) -> Result<Arc<[u8]>, String> {
+        let generation = self.generation.load(Ordering::Acquire);
+        let artwork = reference
+            .parse::<crate::api::ArtworkRef>()
+            .map_err(|_| "invalid artwork reference".to_owned())?;
+        let client = self.client_for(reference)?;
         if let Some(Entry::Ready { bytes, .. }) = self
             .entries
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .get(url)
+            .get(reference)
         {
+            self.ensure_generation(generation)?;
             return Ok(Arc::clone(bytes));
         }
-        let path = self.cache_path(url);
+        let path = self.cache_path(reference);
         let cached = tokio::task::spawn_blocking({
             let path = path.clone();
             move || std::fs::read(path).ok()
@@ -153,22 +209,15 @@ impl Inner {
         .ok()
         .flatten();
         let bytes: Vec<u8> = match cached {
-            Some(bytes) if !bytes.is_empty() => bytes,
+            Some(bytes) if !bytes.is_empty() && bytes.len() <= MAX_ART_BYTES => bytes,
             _ => {
-                let response = self
-                    .http
-                    .get(url)
-                    .send()
+                let bytes = client
+                    .cover_art(&artwork, None)
                     .await
-                    .map_err(|error| error.to_string())?;
-                if !response.status().is_success() {
-                    return Err(format!("artwork request failed: {}", response.status()));
-                }
-                let bytes = response.bytes().await.map_err(|error| error.to_string())?;
+                    .map_err(|_| "unable to load artwork".to_owned())?;
                 if bytes.len() > MAX_ART_BYTES {
                     return Err("artwork is too large".to_string());
                 }
-                let bytes = bytes.to_vec();
                 let write_path = path.clone();
                 let payload = bytes.clone();
                 self.runtime.spawn_blocking(move || {
@@ -180,14 +229,20 @@ impl Inner {
                 bytes
             }
         };
+        self.ensure_generation(generation)?;
         Ok(Arc::from(bytes))
     }
 
-    fn start(self: &Arc<Self>, ctx: &egui::Context, url: String) {
+    fn start(self: &Arc<Self>, ctx: &egui::Context, reference: String) {
         let loader = Arc::clone(self);
         let ctx = ctx.clone();
+        let generation = self.generation.load(Ordering::Acquire);
         self.runtime.spawn(async move {
-            let result = loader.fetch(&url).await;
+            let result = loader.fetch(&reference).await;
+            if loader.generation.load(Ordering::Acquire) != generation {
+                ctx.request_repaint();
+                return;
+            }
             let entry = match result {
                 Ok(bytes) => Entry::Ready {
                     bytes,
@@ -199,7 +254,7 @@ impl Inner {
                 .entries
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .insert(url, entry);
+                .insert(reference, entry);
             ctx.request_repaint();
         });
     }
@@ -211,10 +266,15 @@ impl BytesLoader for ArtLoader {
     }
 
     fn load(&self, ctx: &egui::Context, uri: &str) -> BytesLoadResult {
-        if !(uri.starts_with("https://") || uri.starts_with("http://")) {
+        if !uri.starts_with("fastpotify-art:") {
             return Err(LoadError::NotSupported);
         }
+        let generation = self.inner.generation.load(Ordering::Acquire);
+        self.inner.client_for(uri).map_err(LoadError::Loading)?;
         let mut entries = self.inner.entries.lock().unwrap_or_else(|p| p.into_inner());
+        if self.inner.generation.load(Ordering::Acquire) != generation {
+            return Ok(BytesPoll::Pending { size: None });
+        }
         match entries.get_mut(uri) {
             Some(Entry::Ready { bytes, last_used }) => {
                 *last_used = Instant::now();
@@ -301,6 +361,93 @@ pub fn accent_color(bytes: &[u8]) -> Option<[u8; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    fn loader(runtime: &tokio::runtime::Runtime) -> ArtLoader {
+        ArtLoader::new(
+            runtime.handle().clone(),
+            std::env::temp_dir().join(format!(
+                "fastpotify-art-test-{}-{}",
+                std::process::id(),
+                rand::random::<u64>()
+            )),
+        )
+    }
+
+    #[test]
+    fn authenticated_urls_are_never_artwork_references() {
+        let runtime = runtime();
+        let loader = loader(&runtime);
+        let error = runtime
+            .block_on(loader.fetch("https://music.example/rest/getCoverArt?t=secret"))
+            .unwrap_err();
+        assert_eq!(error, "invalid artwork reference");
+    }
+
+    #[test]
+    fn artwork_must_belong_to_the_active_profile() {
+        let runtime = runtime();
+        let loader = loader(&runtime);
+        let credentials =
+            crate::auth::Credentials::new("https://music.example.test", "alice", "not-printed")
+                .unwrap();
+        let client = Arc::new(crate::api::ApiClient::with_default_activity(credentials).unwrap());
+        loader.set_client(Some(client));
+        let foreign = crate::api::ArtworkRef::new(
+            crate::auth::ProfileId::new("fedcba9876543210fedcba9876543210fedcba98"),
+            "cover",
+        )
+        .uri();
+        let error = runtime.block_on(loader.fetch(&foreign)).unwrap_err();
+        assert_eq!(error, "artwork belongs to another server profile");
+        assert!(!error.contains("music.example"));
+        assert!(!error.contains("not-printed"));
+    }
+
+    #[test]
+    fn cache_keys_are_isolated_by_secret_free_profile_reference() {
+        let runtime = runtime();
+        let loader = loader(&runtime);
+        let first = crate::api::ArtworkRef::new(
+            crate::auth::ProfileId::new("0123456789abcdef0123456789abcdef01234567"),
+            "same-id",
+        )
+        .uri();
+        let second = crate::api::ArtworkRef::new(
+            crate::auth::ProfileId::new("fedcba9876543210fedcba9876543210fedcba98"),
+            "same-id",
+        )
+        .uri();
+        assert_ne!(
+            loader.inner.cache_path(&first),
+            loader.inner.cache_path(&second)
+        );
+        assert!(
+            !loader
+                .inner
+                .cache_path(&first)
+                .to_string_lossy()
+                .contains("?")
+        );
+    }
+
+    #[test]
+    fn stale_artwork_fetches_are_rejected_after_a_session_change() {
+        let runtime = runtime();
+        let loader = loader(&runtime);
+        assert!(loader.inner.ensure_generation(0).is_ok());
+        loader.inner.generation.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(
+            loader.inner.ensure_generation(0),
+            Err("artwork session changed".to_owned())
+        );
+    }
 
     #[test]
     fn accent_color_finds_dominant_hue() {
