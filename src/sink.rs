@@ -34,11 +34,14 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 /// How often playback looks at which output the system calls its default.
 const DEFAULT_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Default device buffer length in milliseconds.
+/// Default Windows device buffer length in milliseconds.
+///
+/// Small platform defaults can click under load (#88). A 100 ms buffer avoids
+/// these underruns while keeping controls responsive.
 pub const DEFAULT_BUFFER_MS: u32 = 100;
 
-/// Allowed device buffer range. Lower values can click; higher values delay
-/// playback controls.
+/// Allowed Windows device buffer range. Lower values can click; higher values
+/// delay playback controls.
 pub const BUFFER_MS_RANGE: std::ops::RangeInclusive<u32> = 20..=500;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -296,18 +299,25 @@ fn open_stream(
             builder
         })
     };
-    if let Ok(stream) = builder(PCM_SAMPLE_RATE, true)?.open_stream() {
+    // The fixed engine buffer addresses Windows shared-mode underruns (#88).
+    // CoreAudio, ALSA, PulseAudio, and PipeWire keep their proven
+    // driver-selected callback periods.
+    let fixed_buffer = cfg!(windows);
+    if let Ok(stream) = builder(PCM_SAMPLE_RATE, fixed_buffer)?.open_stream() {
         return Ok(stream);
     }
     if let Ok(config) = device.default_output_config()
-        && let Ok(stream) = builder(config.sample_rate().0, true)?.open_stream()
+        && let Ok(stream) = builder(config.sample_rate().0, fixed_buffer)?.open_stream()
     {
         return Ok(stream);
     }
     builder(PCM_SAMPLE_RATE, false)?.open_stream_or_fallback()
 }
 
-/// Raises the Windows audio thread one step above normal to prevent underruns.
+/// Raises the Windows decoder thread one step above normal to prevent queued
+/// audio from running out under load (#88).
+///
+/// Linux requires rtkit; CoreAudio owns its real-time callback on macOS.
 #[cfg(windows)]
 fn take_precedence() {
     use windows_sys::Win32::System::Threading::{

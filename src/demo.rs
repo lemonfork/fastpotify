@@ -1551,23 +1551,40 @@ mod tests {
         let text = painted_text(&output.shapes);
         let visible_text = clipped_painted_text(&output.shapes);
 
-        for expected in [
-            "Maximum streaming bitrate",
-            "Audio output",
-            "Keep music playing when the window closes",
-            "Check for updates",
-            "Output buffer",
-            "Playback settings applied.",
-        ] {
+        let expected_rows: &[&str] = if cfg!(windows) {
+            &[
+                "Maximum streaming bitrate",
+                "Audio output",
+                "Keep music playing when the window closes",
+                "Check for updates",
+                "Output buffer",
+                "Playback settings applied.",
+            ]
+        } else {
+            &[
+                "Maximum streaming bitrate",
+                "Audio output",
+                "Keep music playing when the window closes",
+                "Check for updates",
+                "Playback settings applied.",
+            ]
+        };
+        for expected in expected_rows {
             let (_, layout, visible) = visible_text
                 .iter()
-                .find(|(painted, _, _)| painted == expected)
+                .find(|(painted, _, _)| painted == *expected)
                 .unwrap_or_else(|| {
                     panic!("wide Playback row {expected:?} is not visible in the default window")
                 });
             assert_eq!(
                 *layout, *visible,
                 "wide Playback row {expected:?} is clipped in the default window"
+            );
+        }
+        if !cfg!(windows) {
+            assert!(
+                !text.iter().any(|(painted, _)| painted == "Output buffer"),
+                "the Windows-only output buffer setting was drawn"
             );
         }
 
@@ -1595,11 +1612,6 @@ mod tests {
             widget_around("Normal · 96 kbps"),
             widget_around("High · 160 kbps"),
             widget_around("Very high · 320 kbps"),
-        ];
-        let buffer_buttons = [
-            widget_around("200 ms"),
-            widget_around("100 ms"),
-            widget_around("50 ms"),
         ];
         let bitrate_centers = bitrate_buttons
             .iter()
@@ -1637,7 +1649,7 @@ mod tests {
                 .next()
                 .unwrap_or_else(|| panic!("wide Playback row {label:?} has no aligned switch"))
         };
-        let control_right_edges = [
+        let mut control_right_edges = vec![
             bitrate_buttons
                 .iter()
                 .map(egui::Rect::right)
@@ -1645,11 +1657,20 @@ mod tests {
             widget_around("System default").right(),
             switch_for("Keep music playing when the window closes").right(),
             switch_for("Check for updates").right(),
-            buffer_buttons
-                .iter()
-                .map(egui::Rect::right)
-                .fold(f32::NEG_INFINITY, f32::max),
         ];
+        if cfg!(windows) {
+            let buffer_buttons = [
+                widget_around("200 ms"),
+                widget_around("100 ms"),
+                widget_around("50 ms"),
+            ];
+            control_right_edges.push(
+                buffer_buttons
+                    .iter()
+                    .map(egui::Rect::right)
+                    .fold(f32::NEG_INFINITY, f32::max),
+            );
+        }
         let leftmost_control_edge = control_right_edges
             .iter()
             .copied()

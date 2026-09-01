@@ -51,7 +51,7 @@ section. Main fields include:
 | --- | --- | --- |
 | `bitrate` | `320` | Preferred server transcoding ceiling in kbps; an empty transcode falls back to the original file |
 | `audio_device` | system default | Local output device |
-| `audio_buffer_ms` | `100` | Output buffer; lower is more responsive, higher tolerates load |
+| `audio_buffer_ms` | `100` | Windows output buffer; retained but ignored on other platforms |
 | `theme` | `dark` | `dark`, `light`, or `system` |
 | `accent_from_art` | `true` | Tint pages with album art |
 | `volume` | `70%` | Last local volume |

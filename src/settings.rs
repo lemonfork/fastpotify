@@ -53,8 +53,8 @@ pub struct Settings {
     /// the original stream when it is already within this limit.
     pub bitrate: u16,
     pub audio_device: Option<String>,
-    /// Output buffer in milliseconds. Smaller values may click under load;
-    /// larger values delay playback controls.
+    /// Windows output buffer in milliseconds. Smaller values may click under
+    /// load; larger values delay playback controls.
     /// See [`crate::sink::DEFAULT_BUFFER_MS`].
     #[serde(default = "default_buffer_ms")]
     pub audio_buffer_ms: u32,

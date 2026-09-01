@@ -529,6 +529,7 @@ fn playback(
             }
         },
     );
+    #[cfg(windows)]
     preference_row(
         ui,
         palette,

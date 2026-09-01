@@ -60,5 +60,5 @@ There is no browser approval and no separate playback authorization.
   Ctrl+/ shows all shortcuts.
 - **Right-click rows and cards** to queue, favorite, add to a playlist, or
   copy the app's secret-free media reference.
-- **Output-device, buffer, bitrate, theme, EQ, and Winamp controls** live in
-  Settings.
+- **Output-device, bitrate, theme, EQ, and Winamp controls** live in Settings.
+  Windows also offers an output-buffer control.
