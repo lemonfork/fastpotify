@@ -10,6 +10,8 @@ pub enum Page {
     Home,
     Search,
     Favorites,
+    DailyMix,
+    RandomMix,
     Albums,
     Artists,
     Playlist(MediaId),
@@ -25,6 +27,8 @@ impl Page {
             Page::Home => "home".into(),
             Page::Search => "search".into(),
             Page::Favorites => "favorites".into(),
+            Page::DailyMix => "daily-mix".into(),
+            Page::RandomMix => "random-mix".into(),
             Page::Albums => "albums".into(),
             Page::Artists => "artists".into(),
             Page::Playlist(id) => format!("playlist|{}", id.uri()),
@@ -42,6 +46,8 @@ impl Page {
             // The old label is accepted as a harmless navigation preference;
             // old provider media references still fail strict parsing below.
             "favorites" | "liked" => Page::Favorites,
+            "daily-mix" => Page::DailyMix,
+            "random-mix" => Page::RandomMix,
             "albums" => Page::Albums,
             "artists" => Page::Artists,
             "queue" => Page::Queue,
@@ -272,10 +278,15 @@ pub struct Library {
 
 #[derive(Default)]
 pub struct HomeData {
+    pub daily_mix: Loadable<Vec<Song>>,
+    pub daily_mix_revision: u64,
     pub recently_added: Loadable<Vec<Album>>,
     pub recently_played: Loadable<Vec<PlayHistory>>,
     pub frequent_albums: Loadable<Vec<Album>>,
     pub random_songs: Loadable<Vec<Song>>,
+    pub random_mix_revision: u64,
+    /// A manual Random mix refresh keeps the previous songs visible.
+    pub random_refreshing: bool,
     pub generation: u64,
     pub requested: bool,
     pub loaded_at: Option<Instant>,
@@ -515,6 +526,8 @@ pub enum Action {
     LoadMore(Page),
     LoadMoreRecents,
     ReloadRecents,
+    /// Ask Navidrome for a fresh Random mix without reloading other Home data.
+    RefreshRandomMix,
     SetQueueTab(QueueTab),
     Reload(Page),
     SignIn,
@@ -585,6 +598,8 @@ mod tests {
     #[test]
     fn typed_pages_round_trip_arbitrary_server_ids() {
         for page in [
+            Page::DailyMix,
+            Page::RandomMix,
             Page::Playlist(media(MediaKind::Playlist, "list:/ 中文")),
             Page::Album(media(MediaKind::Album, "album:?&")),
             Page::Artist(media(MediaKind::Artist, "artist:with:colons")),

@@ -29,7 +29,7 @@ struct Cli {
     demo_page: Option<String>,
 
     /// Extra demo surfaces: a comma-separated list including `queue`,
-    /// `shortcuts`, `create`, `scripts`, `light`, or `focus`.
+    /// `shortcuts`, `create`, `scripts`, `light`, `dark`, or `focus`.
     #[cfg(feature = "demo")]
     #[arg(long)]
     demo_show: Option<String>,
@@ -382,7 +382,7 @@ fn main() -> eframe::Result<()> {
                 let mut guard = slot.lock().unwrap_or_else(|p| p.into_inner());
                 let app = guard.as_mut().expect("application state present");
                 app.background_frame(&headless);
-                if app.quit_requested || app.wants_show {
+                if app.quit_requested || app.wants_show || app.switch_intent {
                     break;
                 }
             }

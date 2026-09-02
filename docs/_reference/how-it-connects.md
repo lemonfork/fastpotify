@@ -33,6 +33,14 @@ uses the server's `/rest/stream` endpoint through a separate client with no
 total response timeout, because a healthy stream is intentionally long-lived.
 Authenticated redirects are followed only within the configured origin.
 
+The Random mix opened from Home uses the standard `getRandomSongs` endpoint.
+The Daily mix is assembled locally from profile-scoped play history and
+Favorites together with those random candidates; Fastpotify does not upload
+listening history to a recommendation service. Daily mix is rebuilt
+automatically for each local calendar day; refreshing Random mix is an
+independent metadata request and cannot replace the queue snapshot of a mix
+already playing.
+
 The first stream request asks the server for MP3 at the selected bitrate. If a
 server reports success but the transcode ends before its first byte,
 Fastpotify retries that song once with OpenSubsonic's `format=raw`. This keeps

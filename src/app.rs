@@ -12,8 +12,8 @@ use egui::Color32;
 
 use crate::api::{
     Album, AlbumListRequest, AlbumListType, Artist, Favorites, MediaId, MediaKind, PlayHistory,
-    PlayableItem, Playlist, PlaylistItem, ProfileId, SearchOptions, SearchResults, Song, User,
-    UserRef,
+    PlayableItem, Playlist, PlaylistItem, ProfileId, RandomSongsRequest, SearchOptions,
+    SearchResults, Song, User, UserRef,
 };
 use crate::auth::Credentials;
 use crate::backend::{
@@ -37,6 +37,7 @@ const SAVE_DELAY: Duration = Duration::from_secs(2);
 const TOAST_LIFETIME: Duration = Duration::from_millis(3_200);
 const ART_EVICTION_INTERVAL: Duration = Duration::from_secs(20);
 const PLAYER_REPAINT_INTERVAL: Duration = Duration::from_millis(250);
+const DAILY_MIX_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 const ALBUM_PAGE_SIZE: u32 = 50;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -95,6 +96,7 @@ enum PlaylistBefore {
 
 enum RequestPurpose {
     Home,
+    RandomMix,
     LibraryAlbums(u32),
     LibraryArtists,
     Playlists,
@@ -125,6 +127,7 @@ enum RequestPurpose {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum RequestKey {
     Home,
+    RandomMix,
     LibraryAlbums,
     LibraryArtists,
     Playlists,
@@ -151,6 +154,7 @@ impl RequestPurpose {
     fn key(&self) -> RequestKey {
         match self {
             Self::Home => RequestKey::Home,
+            Self::RandomMix => RequestKey::RandomMix,
             Self::LibraryAlbums(_) => RequestKey::LibraryAlbums,
             Self::LibraryArtists => RequestKey::LibraryArtists,
             Self::Playlists => RequestKey::Playlists,
@@ -262,6 +266,8 @@ pub struct App {
     last_update_check: Option<Instant>,
     last_history_refresh: Instant,
     history_generation_floor: u64,
+    daily_mix_day: Option<String>,
+    last_daily_mix_check: Instant,
     window_title: String,
     session_window_size: Option<[f32; 2]>,
     session_window_pos: Option<[f32; 2]>,
@@ -283,6 +289,21 @@ impl App {
             .as_ref()
             .map(|profile| crate::history::History::load(&dirs.history_file(profile), profile))
             .unwrap_or_default();
+        let today = crate::mixes::local_day_key();
+        let cached_daily_mix = profile.as_ref().and_then(|profile| {
+            crate::mixes::DailyMixCache::load(
+                &dirs.daily_mix_file(profile),
+                &today,
+                profile,
+                crate::mixes::MIX_SIZE,
+            )
+        });
+        let daily_mix_day = cached_daily_mix.as_ref().map(|_| today);
+        let daily_mix = match (profile.is_some(), cached_daily_mix) {
+            (_, Some(songs)) => Loadable::Loaded(songs),
+            (true, None) => Loadable::Loading,
+            (false, None) => Loadable::NotLoaded,
+        };
 
         let first_page = session
             .last_page
@@ -375,6 +396,7 @@ impl App {
             login_username,
             login_password: String::new(),
             home: HomeData {
+                daily_mix,
                 recently_played: Loadable::Loaded(history_store.plays().to_vec()),
                 ..HomeData::default()
             },
@@ -446,6 +468,8 @@ impl App {
             last_update_check: None,
             last_history_refresh: Instant::now(),
             history_generation_floor: 0,
+            daily_mix_day,
+            last_daily_mix_check: Instant::now(),
             window_title: String::new(),
             session_window_size: session.window_size,
             session_window_pos: session.window_pos,
@@ -818,6 +842,12 @@ impl App {
                     );
                 }
             }
+            Page::DailyMix => {
+                self.ensure_loaded(Page::Favorites);
+                self.load_random_mix(false);
+                self.refresh_daily_mix_if_needed();
+            }
+            Page::RandomMix => self.load_random_mix(false),
             Page::Albums => {
                 if !self.library.albums.loaded_once && !self.library.albums.loading {
                     self.load_album_page(0);
@@ -912,16 +942,87 @@ impl App {
         self.home.generation = self.next_generation();
         self.home.recently_added = Loadable::Loading;
         self.home.frequent_albums = Loadable::Loading;
-        self.home.random_songs = Loadable::Loading;
         self.request(
             ApiRequest::Home {
                 music_folder_id: None,
                 album_limit: 20,
-                song_limit: 30,
                 generation: self.home.generation,
             },
             RequestPurpose::Home,
         );
+    }
+
+    fn load_random_mix(&mut self, force: bool) {
+        if self.home.random_refreshing || (!force && !self.home.random_songs.needs_load()) {
+            return;
+        }
+        if self.home.random_songs.get().is_none() {
+            self.home.random_songs = Loadable::Loading;
+        }
+        self.home.random_refreshing = true;
+        let generation = self.next_generation();
+        self.request(
+            ApiRequest::RandomSongs {
+                request: RandomSongsRequest {
+                    size: crate::mixes::MIX_SIZE as u32,
+                    ..RandomSongsRequest::default()
+                },
+                generation,
+            },
+            RequestPurpose::RandomMix,
+        );
+    }
+
+    fn refresh_daily_mix_if_needed(&mut self) {
+        let Some(profile) = self.active_profile.clone() else {
+            self.home.daily_mix = Loadable::NotLoaded;
+            self.daily_mix_day = None;
+            return;
+        };
+        let today = crate::mixes::local_day_key();
+        if self.daily_mix_day.as_deref() == Some(today.as_str()) {
+            return;
+        }
+
+        let random_settled = matches!(
+            self.home.random_songs,
+            Loadable::Loaded(_) | Loadable::Failed(_)
+        ) && !self.home.random_refreshing;
+        if !self.library.favorite_songs.loaded_once || !random_settled {
+            self.home.daily_mix = Loadable::Loading;
+            return;
+        }
+
+        let history = self.home.recently_played.get().cloned().unwrap_or_default();
+        let favorites = self.library.favorite_songs.items.clone();
+        let discovery = self.home.random_songs.get().cloned().unwrap_or_default();
+        let songs = crate::mixes::generate_daily_mix(
+            &history,
+            &favorites,
+            &discovery,
+            &today,
+            crate::mixes::MIX_SIZE,
+        );
+        // Historical snapshots can predate later Favorites or local optimistic
+        // toggles. Seed unknown rows without letting the mix overwrite any
+        // favorite state the current session already knows.
+        self.seed_songs_preserving_saved(&songs);
+        if songs.is_empty() {
+            // Keep an empty mix eligible for another attempt after the first
+            // qualified play or Favorite arrives later today.
+            self.home.daily_mix = Loadable::Loaded(songs);
+            self.home.daily_mix_revision = self.home.daily_mix_revision.wrapping_add(1);
+            self.daily_mix_day = None;
+            return;
+        }
+        if let Err(error) =
+            crate::mixes::DailyMixCache::save(&self.dirs.daily_mix_file(&profile), &today, &songs)
+        {
+            log::warn!("could not save the Daily mix: {error}");
+        }
+        self.home.daily_mix = Loadable::Loaded(songs);
+        self.home.daily_mix_revision = self.home.daily_mix_revision.wrapping_add(1);
+        self.daily_mix_day = Some(today);
     }
 
     fn load_library(&mut self) {
@@ -936,6 +1037,7 @@ impl App {
         self.ensure_loaded(Page::Favorites);
         self.ensure_loaded(Page::Albums);
         self.ensure_loaded(Page::Artists);
+        self.load_random_mix(false);
         self.load_home(false);
     }
 
@@ -966,6 +1068,8 @@ impl App {
                 }
             }
             Page::Favorites
+            | Page::DailyMix
+            | Page::RandomMix
             | Page::Artists
             | Page::Playlist(_)
             | Page::Album(_)
@@ -986,6 +1090,14 @@ impl App {
             }
             Page::Favorites => {
                 self.library.favorite_songs.reset();
+            }
+            Page::DailyMix => {
+                self.ensure_loaded(Page::DailyMix);
+                return;
+            }
+            Page::RandomMix => {
+                self.load_random_mix(true);
+                return;
             }
             Page::Albums => self.library.albums.reset(),
             Page::Artists => self.library.artists.reset(),
@@ -1174,6 +1286,9 @@ impl App {
     #[cfg(any(test, feature = "demo"))]
     pub(crate) fn demo_rebuild_saved_state(&mut self) {
         self.saved.clear();
+        if let Some(songs) = self.home.daily_mix.get().cloned() {
+            self.seed_songs(&songs);
+        }
         if let Some(albums) = self.home.recently_added.get().cloned() {
             self.seed_albums(&albums);
         }
@@ -1412,6 +1527,15 @@ impl App {
                     .favorite_songs
                     .items
                     .iter()
+                    .find(|song| song.id == *media)
+                    .cloned()
+            })
+            .or_else(|| {
+                self.home
+                    .daily_mix
+                    .get()
+                    .into_iter()
+                    .flatten()
                     .find(|song| song.id == *media)
                     .cloned()
             })
@@ -2034,6 +2158,7 @@ impl App {
                 self.history_generation_floor = generation;
                 self.backend.history(generation);
             }
+            Action::RefreshRandomMix => self.load_random_mix(true),
             Action::SetQueueTab(tab) => {
                 self.queue_tab = tab;
                 self.note_session_change();
@@ -2086,6 +2211,8 @@ impl App {
             Action::ShowWindow => {
                 self.wants_show = true;
                 self.window_hidden = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
             Action::HideWindow => {
                 self.hide_intent = true;
@@ -2099,6 +2226,17 @@ impl App {
                 self.recents.set_cached(Vec::new());
                 self.recents_view.clear();
                 self.home.recently_played = Loadable::Loaded(Vec::new());
+                self.home.daily_mix = Loadable::Loading;
+                self.daily_mix_day = None;
+                if let Some(profile) = self.active_profile.as_ref() {
+                    let path = self.dirs.daily_mix_file(profile);
+                    if let Err(error) = std::fs::remove_file(path)
+                        && error.kind() != std::io::ErrorKind::NotFound
+                    {
+                        log::warn!("could not remove the cached Daily mix: {error}");
+                    }
+                }
+                self.refresh_daily_mix_if_needed();
                 let generation = self.next_generation();
                 self.history_generation_floor = generation;
                 self.backend.clear_history(generation);
@@ -2296,21 +2434,26 @@ impl App {
             return;
         };
         for command in commands {
-            self.actions.push(match command {
-                TrayCommand::Show => Action::ShowWindow,
-                TrayCommand::ShowHide => {
-                    if self.window_hidden {
-                        Action::ShowWindow
-                    } else {
-                        Action::HideWindow
-                    }
-                }
-                TrayCommand::PlayPause => Action::TogglePlay,
-                TrayCommand::Next => Action::Next,
-                TrayCommand::Previous => Action::Previous,
-                TrayCommand::Quit => Action::Quit,
-            });
+            self.handle_tray_command(command);
         }
+    }
+
+    fn handle_tray_command(&mut self, command: TrayCommand) {
+        self.actions.push(match command {
+            TrayCommand::Show if self.settings.winamp_window => Action::ToggleWinampWindow,
+            TrayCommand::Show => Action::ShowWindow,
+            TrayCommand::ShowHide => {
+                if self.window_hidden {
+                    Action::ShowWindow
+                } else {
+                    Action::HideWindow
+                }
+            }
+            TrayCommand::PlayPause => Action::TogglePlay,
+            TrayCommand::Next => Action::Next,
+            TrayCommand::Previous => Action::Previous,
+            TrayCommand::Quit => Action::Quit,
+        });
     }
 
     fn sync_media_controls(&mut self) {
@@ -2490,6 +2633,10 @@ impl App {
             self.history_generation_floor = generation;
             self.backend.history(generation);
         }
+        if self.last_daily_mix_check.elapsed() >= DAILY_MIX_CHECK_INTERVAL {
+            self.last_daily_mix_check = now;
+            self.refresh_daily_mix_if_needed();
+        }
         if self.last_eviction.elapsed() >= ART_EVICTION_INTERVAL {
             self.last_eviction = now;
             self.backend.art().evict(ctx);
@@ -2654,6 +2801,7 @@ impl App {
                     self.recents.set_cached(plays.clone());
                     self.recents_view = plays.clone();
                     self.home.recently_played = Loadable::Loaded(plays);
+                    self.refresh_daily_mix_if_needed();
                 }
                 Event::Lyrics {
                     epoch,
@@ -2797,10 +2945,35 @@ impl App {
         self.recents.set_cached(plays.clone());
         self.recents_view = plays.clone();
         self.home.recently_played = Loadable::Loaded(plays);
+        let today = crate::mixes::local_day_key();
+        match crate::mixes::DailyMixCache::load(
+            &self.dirs.daily_mix_file(&profile),
+            &today,
+            &profile,
+            crate::mixes::MIX_SIZE,
+        ) {
+            Some(songs) => {
+                self.seed_songs(&songs);
+                self.home.daily_mix = Loadable::Loaded(songs);
+                self.home.daily_mix_revision = self.home.daily_mix_revision.wrapping_add(1);
+                self.daily_mix_day = Some(today);
+            }
+            None => {
+                self.home.daily_mix = Loadable::Loading;
+                self.daily_mix_day = None;
+            }
+        }
     }
 
     fn reset_server_data(&mut self) {
-        self.home = HomeData::default();
+        let daily_mix_revision = self.home.daily_mix_revision.wrapping_add(1);
+        let random_mix_revision = self.home.random_mix_revision.wrapping_add(1);
+        self.home = HomeData {
+            daily_mix_revision,
+            random_mix_revision,
+            ..HomeData::default()
+        };
+        self.daily_mix_day = None;
         self.library = Library::default();
         self.search = SearchState::default();
         self.playlist_pages.clear();
@@ -2882,10 +3055,8 @@ impl App {
             (RequestPurpose::Home, ApiPayload::Home(home)) => {
                 self.seed_albums(&home.newest.items);
                 self.seed_albums(&home.frequent.items);
-                self.seed_songs(&home.random_songs);
                 self.home.recently_added = Loadable::Loaded(home.newest.items);
                 self.home.frequent_albums = Loadable::Loaded(home.frequent.items);
-                self.home.random_songs = Loadable::Loaded(home.random_songs);
                 self.home.loaded_at = Some(Instant::now());
             }
             (RequestPurpose::LibraryAlbums(offset), ApiPayload::Albums(albums)) => {
@@ -2901,6 +3072,7 @@ impl App {
             }
             (RequestPurpose::Favorites, ApiPayload::Favorites(favorites)) => {
                 self.apply_favorites(favorites);
+                self.refresh_daily_mix_if_needed();
             }
             (RequestPurpose::Search(serial), ApiPayload::Search(results)) => {
                 if serial == self.search.serial {
@@ -3010,13 +3182,17 @@ impl App {
             }
             (RequestPurpose::Favorite(media, _), ApiPayload::FavoriteChanged { favorite, .. }) => {
                 self.saved.insert(media, favorite);
+                self.refresh_daily_mix_if_needed();
             }
             (RequestPurpose::PlaylistMutation(before), payload) => {
                 self.finish_playlist_mutation(*before, payload);
             }
-            (_, ApiPayload::RandomSongs(songs)) => {
-                self.seed_songs(&songs);
+            (RequestPurpose::RandomMix, ApiPayload::RandomSongs(songs)) => {
+                self.seed_songs_preserving_saved(&songs);
                 self.home.random_songs = Loadable::Loaded(songs);
+                self.home.random_mix_revision = self.home.random_mix_revision.wrapping_add(1);
+                self.home.random_refreshing = false;
+                self.refresh_daily_mix_if_needed();
             }
             _ => {}
         }
@@ -3027,14 +3203,21 @@ impl App {
             RequestPurpose::Home => {
                 self.home.recently_added = Loadable::Failed(message.clone());
                 self.home.frequent_albums = Loadable::Failed(message.clone());
-                self.home.random_songs = Loadable::Failed(message.clone());
                 self.home.requested = false;
+            }
+            RequestPurpose::RandomMix => {
+                self.home.random_refreshing = false;
+                if self.home.random_songs.get().is_none() {
+                    self.home.random_songs = Loadable::Failed(message.clone());
+                }
+                self.refresh_daily_mix_if_needed();
             }
             RequestPurpose::LibraryAlbums(_) => self.library.albums.fail(message.clone()),
             RequestPurpose::LibraryArtists => self.library.artists.fail(message.clone()),
             RequestPurpose::Playlists => self.library.playlists = Loadable::Failed(message.clone()),
             RequestPurpose::Favorites => {
                 self.library.favorite_songs.fail(message.clone());
+                self.refresh_daily_mix_if_needed();
             }
             RequestPurpose::Search(serial) if serial == self.search.serial => {
                 self.search.results = Loadable::Failed(message.clone())
@@ -3056,6 +3239,7 @@ impl App {
             }
             RequestPurpose::Favorite(media, before) => {
                 self.restore_favorite(&media, *before);
+                self.refresh_daily_mix_if_needed();
             }
             RequestPurpose::PlaylistMutation(before) => self.rollback_playlist(*before),
             RequestPurpose::PlaySong
@@ -3088,6 +3272,12 @@ impl App {
                 }
             }
         }
+    }
+
+    fn seed_songs_preserving_saved(&mut self, songs: &[Song]) {
+        let saved = self.saved.clone();
+        self.seed_songs(songs);
+        self.saved.extend(saved);
     }
 
     fn seed_albums(&mut self, albums: &[Album]) {
@@ -3310,6 +3500,8 @@ fn page_has_profile(page: &Page, profile: Option<&ProfileId>) -> bool {
         Page::Home
         | Page::Search
         | Page::Favorites
+        | Page::DailyMix
+        | Page::RandomMix
         | Page::Albums
         | Page::Artists
         | Page::Queue
@@ -3475,7 +3667,6 @@ mod tests {
             newest: ApiPage::from_slice(vec![album(name)], 0, 20, false),
             recent: ApiPage::default(),
             frequent: ApiPage::default(),
-            random_songs: Vec::new(),
         }
     }
 
@@ -3884,7 +4075,6 @@ mod tests {
             ApiRequest::Home {
                 music_folder_id: None,
                 album_limit: 20,
-                song_limit: 20,
                 generation: first_generation,
             },
             RequestPurpose::Home,
@@ -3894,7 +4084,6 @@ mod tests {
             ApiRequest::Home {
                 music_folder_id: None,
                 album_limit: 20,
-                song_limit: 20,
                 generation: second_generation,
             },
             RequestPurpose::Home,
@@ -3919,6 +4108,271 @@ mod tests {
     }
 
     #[test]
+    fn home_and_random_mix_use_independent_requests() {
+        let mut harness = harness();
+        harness.app.load_home(false);
+
+        assert!(harness.app.home.requested);
+        assert!(!harness.app.home.random_refreshing);
+        assert_eq!(
+            harness
+                .app
+                .requests
+                .values()
+                .filter(|purpose| matches!(purpose, RequestPurpose::Home))
+                .count(),
+            1
+        );
+        assert_eq!(
+            harness
+                .app
+                .requests
+                .values()
+                .filter(|purpose| matches!(purpose, RequestPurpose::RandomMix))
+                .count(),
+            0
+        );
+
+        harness.app.load_random_mix(false);
+        assert!(harness.app.home.random_refreshing);
+        assert_eq!(
+            harness
+                .app
+                .requests
+                .values()
+                .filter(|purpose| matches!(purpose, RequestPurpose::RandomMix))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn stale_random_mix_cannot_replace_a_newer_refresh() {
+        let mut harness = harness();
+        harness.app.home.random_songs = Loadable::Loaded(vec![song("original")]);
+        harness.app.home.random_refreshing = true;
+
+        let first_generation = harness.app.next_generation();
+        let first = harness.app.request(
+            ApiRequest::RandomSongs {
+                request: RandomSongsRequest::default(),
+                generation: first_generation,
+            },
+            RequestPurpose::RandomMix,
+        );
+        let second_generation = harness.app.next_generation();
+        let second = harness.app.request(
+            ApiRequest::RandomSongs {
+                request: RandomSongsRequest::default(),
+                generation: second_generation,
+            },
+            RequestPurpose::RandomMix,
+        );
+
+        harness.app.handle_api(ApiResponse {
+            epoch: 0,
+            request_id: first,
+            generation: first_generation,
+            result: Ok(ApiPayload::RandomSongs(vec![song("stale")])),
+        });
+        assert_eq!(
+            harness.app.home.random_songs.get().unwrap()[0].name,
+            "original"
+        );
+        assert_eq!(harness.app.home.random_mix_revision, 0);
+        assert!(harness.app.home.random_refreshing);
+
+        harness.app.handle_api(ApiResponse {
+            epoch: 0,
+            request_id: second,
+            generation: second_generation,
+            result: Ok(ApiPayload::RandomSongs(vec![song("fresh")])),
+        });
+        assert_eq!(
+            harness.app.home.random_songs.get().unwrap()[0].name,
+            "fresh"
+        );
+        assert_eq!(harness.app.home.random_mix_revision, 1);
+        assert!(!harness.app.home.random_refreshing);
+    }
+
+    #[test]
+    fn failed_random_mix_refresh_keeps_the_previous_songs() {
+        let mut harness = harness();
+        harness.app.home.random_songs = Loadable::Loaded(vec![song("still here")]);
+        harness.app.home.random_refreshing = true;
+        let generation = harness.app.next_generation();
+        let request_id = harness.app.request(
+            ApiRequest::RandomSongs {
+                request: RandomSongsRequest::default(),
+                generation,
+            },
+            RequestPurpose::RandomMix,
+        );
+
+        harness.app.handle_api(ApiResponse {
+            epoch: 0,
+            request_id,
+            generation,
+            result: Err(crate::backend::BackendError::Network),
+        });
+
+        assert_eq!(
+            harness.app.home.random_songs.get().unwrap()[0].name,
+            "still here"
+        );
+        assert!(!harness.app.home.random_refreshing);
+        assert_eq!(harness.app.toasts.len(), 1);
+    }
+
+    #[test]
+    fn random_mix_refresh_preserves_playback_and_current_favorite_state() {
+        let mut harness = harness();
+        harness.app.demo_set_playback(
+            crate::player::demo_snapshot(crate::player::DemoPlayback {
+                current: Some(song("playing")),
+                manual: vec![song("queued")],
+                context: vec![song("later")],
+                position_ms: 12_345,
+                playback: Playback::Playing,
+                volume: harness.app.settings.volume,
+                shuffle: true,
+                repeat: RepeatMode::Context,
+            }),
+            None,
+        );
+        let before = harness.app.playback.clone();
+        let server_says_unsaved = song("still saved");
+        let mut server_says_saved = song("still unsaved");
+        server_says_saved.starred = true;
+        server_says_saved.starred_at = Some("2026-09-01T00:00:00Z".into());
+        harness
+            .app
+            .saved
+            .insert(server_says_unsaved.id.clone(), true);
+        harness
+            .app
+            .saved
+            .insert(server_says_saved.id.clone(), false);
+        harness.app.home.random_refreshing = true;
+        let generation = harness.app.next_generation();
+        let request_id = harness.app.request(
+            ApiRequest::RandomSongs {
+                request: RandomSongsRequest::default(),
+                generation,
+            },
+            RequestPurpose::RandomMix,
+        );
+
+        harness.app.handle_api(ApiResponse {
+            epoch: 0,
+            request_id,
+            generation,
+            result: Ok(ApiPayload::RandomSongs(vec![
+                server_says_unsaved.clone(),
+                server_says_saved.clone(),
+            ])),
+        });
+
+        assert_eq!(harness.app.playback, before);
+        assert_eq!(harness.app.is_saved(&server_says_unsaved.id), Some(true));
+        assert_eq!(harness.app.is_saved(&server_says_saved.id), Some(false));
+    }
+
+    #[test]
+    fn daily_mix_generation_preserves_current_favorite_state() {
+        let mut harness = harness();
+        let historical = song("favorite since it was played");
+        let mut favorite = historical.clone();
+        favorite.starred = true;
+        favorite.starred_at = Some("2026-09-01T00:00:00Z".into());
+
+        harness.app.active_profile = Some(profile());
+        harness.app.home.recently_played = Loadable::Loaded(vec![PlayHistory {
+            track: historical.clone(),
+            played_at: Some("2026-08-31T00:00:00Z".into()),
+            context: None,
+        }]);
+        harness
+            .app
+            .library
+            .favorite_songs
+            .set_cached(vec![favorite]);
+        harness.app.home.random_songs = Loadable::Loaded(Vec::new());
+        harness.app.home.random_refreshing = false;
+        harness.app.daily_mix_day = None;
+        harness.app.saved.insert(historical.id.clone(), true);
+
+        harness.app.refresh_daily_mix_if_needed();
+
+        assert_eq!(harness.app.is_saved(&historical.id), Some(true));
+        assert_eq!(
+            harness.app.home.daily_mix.get().unwrap()[0].id,
+            historical.id
+        );
+        assert_eq!(harness.app.home.daily_mix_revision, 1);
+        assert!(harness.app.dirs.daily_mix_file(&profile()).is_file());
+    }
+
+    #[test]
+    fn daily_mix_generation_preserves_current_unfavorite_state() {
+        let mut harness = harness();
+        let mut historical = song("used to be favorite");
+        historical.starred = true;
+        historical.starred_at = Some("2026-09-01T00:00:00Z".into());
+
+        harness.app.active_profile = Some(profile());
+        harness.app.home.recently_played = Loadable::Loaded(vec![PlayHistory {
+            track: historical.clone(),
+            played_at: Some("2026-08-31T00:00:00Z".into()),
+            context: None,
+        }]);
+        harness.app.library.favorite_songs.set_cached(Vec::new());
+        harness.app.home.random_songs = Loadable::Loaded(Vec::new());
+        harness.app.home.random_refreshing = false;
+        harness.app.daily_mix_day = None;
+        harness.app.saved.insert(historical.id.clone(), false);
+
+        harness.app.refresh_daily_mix_if_needed();
+
+        assert_eq!(harness.app.is_saved(&historical.id), Some(false));
+        let mix = harness.app.home.daily_mix.get().unwrap();
+        assert_eq!(mix[0].id, historical.id);
+        assert!(!mix[0].starred);
+    }
+
+    #[test]
+    fn an_empty_daily_mix_can_fill_when_history_arrives_later_that_day() {
+        let mut harness = harness();
+        harness.app.active_profile = Some(profile());
+        harness.app.library.favorite_songs.set_cached(Vec::new());
+        harness.app.home.random_songs = Loadable::Loaded(Vec::new());
+        harness.app.home.random_refreshing = false;
+        harness.app.home.recently_played = Loadable::Loaded(Vec::new());
+        harness.app.daily_mix_day = None;
+
+        harness.app.refresh_daily_mix_if_needed();
+
+        assert!(harness.app.home.daily_mix.get().unwrap().is_empty());
+        assert_eq!(harness.app.home.daily_mix_revision, 1);
+        assert!(harness.app.daily_mix_day.is_none());
+        assert!(!harness.app.dirs.daily_mix_file(&profile()).exists());
+
+        let listened = song("qualified play");
+        harness.app.home.recently_played = Loadable::Loaded(vec![PlayHistory {
+            track: listened.clone(),
+            played_at: Some("2026-09-02T00:00:00Z".into()),
+            context: None,
+        }]);
+        harness.app.refresh_daily_mix_if_needed();
+
+        assert_eq!(harness.app.home.daily_mix.get().unwrap()[0].id, listened.id);
+        assert_eq!(harness.app.home.daily_mix_revision, 2);
+        assert!(harness.app.daily_mix_day.is_some());
+        assert!(harness.app.dirs.daily_mix_file(&profile()).is_file());
+    }
+
+    #[test]
     fn sign_in_immediately_releases_the_password_field() {
         let mut harness = harness();
         harness.app.login_server = "https://music.example".into();
@@ -3926,6 +4380,18 @@ mod tests {
         harness.app.login_password = "top-secret".into();
         harness.app.apply(Action::SignIn, &egui::Context::default());
         assert!(harness.app.login_password.is_empty());
+    }
+
+    #[test]
+    fn tray_show_switches_the_mini_player_back_to_the_main_window() {
+        let mut harness = harness();
+        harness.app.settings.winamp_window = true;
+
+        harness.app.handle_tray_command(TrayCommand::Show);
+        harness.app.apply_actions(&egui::Context::default());
+
+        assert!(!harness.app.settings.winamp_window);
+        assert!(harness.app.switch_intent);
     }
 
     #[test]

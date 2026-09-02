@@ -69,12 +69,18 @@ impl ksni::Tray for FastTray {
         use ksni::menu::*;
         vec![
             StandardItem {
-                label: "Show or hide Fastpotify".into(),
-                activate: Box::new(|tray: &mut Self| tray.send(TrayCommand::ShowHide)),
+                label: "Show Main Window".into(),
+                activate: Box::new(|tray: &mut Self| tray.send(TrayCommand::Show)),
                 ..Default::default()
             }
             .into(),
             MenuItem::Separator,
+            StandardItem {
+                label: "Previous".into(),
+                activate: Box::new(|tray: &mut Self| tray.send(TrayCommand::Previous)),
+                ..Default::default()
+            }
+            .into(),
             StandardItem {
                 label: if self.playing {
                     "Pause".into()
@@ -88,12 +94,6 @@ impl ksni::Tray for FastTray {
             StandardItem {
                 label: "Next".into(),
                 activate: Box::new(|tray: &mut Self| tray.send(TrayCommand::Next)),
-                ..Default::default()
-            }
-            .into(),
-            StandardItem {
-                label: "Previous".into(),
-                activate: Box::new(|tray: &mut Self| tray.send(TrayCommand::Previous)),
                 ..Default::default()
             }
             .into(),

@@ -8,6 +8,7 @@ mod keys;
 pub mod library;
 pub mod login;
 mod lyrics;
+pub mod mixes;
 pub mod player_bar;
 pub mod queue;
 pub mod search;
@@ -78,6 +79,8 @@ fn page_tint(app: &mut App) -> Option<Color32> {
             .and_then(|artist| pick_image(&artist.images, 300))
             .map(str::to_string),
         Page::Favorites => return Some(Color32::from_rgb(0x50, 0x38, 0xc8)),
+        Page::DailyMix => return Some(Color32::from_rgb(0x68, 0x3f, 0xb8)),
+        Page::RandomMix => return Some(Color32::from_rgb(0x18, 0x77, 0x78)),
         _ => None,
     };
     if !app.settings.accent_from_art && image.is_some() {
@@ -112,6 +115,20 @@ fn central(app: &mut App, ui: &mut egui::Ui) {
             ui.spacing_mut().item_spacing = vec2(8.0, 6.0);
             topbar::show(app, ui);
             let page = app.page().clone();
+            if matches!(&page, Page::Settings) {
+                Frame::new()
+                    .inner_margin(Margin {
+                        left: widgets::PAGE_PADDING as i8,
+                        right: widgets::PAGE_PADDING as i8,
+                        top: 4,
+                        bottom: 0,
+                    })
+                    .show(ui, |ui| {
+                        ui.set_min_size(ui.available_size());
+                        settings::show(app, ui);
+                    });
+                return;
+            }
             egui::ScrollArea::vertical()
                 .id_salt(("page", page.encode()))
                 .auto_shrink([false, false])
@@ -129,6 +146,8 @@ fn central(app: &mut App, ui: &mut egui::Ui) {
                                 Page::Home => home::show(app, ui),
                                 Page::Search => search::show(app, ui),
                                 Page::Favorites => collection::favorites(app, ui),
+                                Page::DailyMix => mixes::daily(app, ui),
+                                Page::RandomMix => mixes::random(app, ui),
                                 Page::Albums | Page::Artists => library::show(app, ui, page),
                                 Page::Playlist(id) => collection::playlist(app, ui, &id),
                                 Page::Album(id) => collection::album(app, ui, &id),

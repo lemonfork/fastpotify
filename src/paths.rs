@@ -75,6 +75,11 @@ impl AppDirs {
         self.profile_state_dir(profile).join("history.json")
     }
 
+    /// The generated songs for the profile's current local-calendar day.
+    pub fn daily_mix_file(&self, profile: &crate::auth::ProfileId) -> PathBuf {
+        self.profile_state_dir(profile).join("daily-mix.json")
+    }
+
     /// The log of the current run, replaced at every start.
     pub fn log_file(&self) -> PathBuf {
         self.state.join("fastpotify.log")
@@ -207,6 +212,10 @@ mod tests {
         assert_eq!(
             dirs.history_file(&profile),
             PathBuf::from("state/profiles/0123456789abcdef0123456789abcdef01234567/history.json")
+        );
+        assert_eq!(
+            dirs.daily_mix_file(&profile),
+            PathBuf::from("state/profiles/0123456789abcdef0123456789abcdef01234567/daily-mix.json")
         );
         assert_eq!(
             dirs.credentials_file(),

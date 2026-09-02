@@ -106,6 +106,16 @@ pub struct Actions<'a> {
     pub saved_tooltips: (&'a str, &'a str),
     pub owned_playlist: Option<Playlist>,
     pub name: &'a str,
+    pub auxiliary: Option<AuxiliaryAction<'a>>,
+}
+
+/// A small collection-level action displayed beside Play.
+pub struct AuxiliaryAction<'a> {
+    pub icon: Icon,
+    pub label: &'a str,
+    pub tooltip: &'a str,
+    pub loading: bool,
+    pub action: Action,
 }
 
 pub fn actions_row(
@@ -194,6 +204,20 @@ pub fn actions_row(
             .clicked()
         {
             app.actions.push(Action::PlaySongs { songs, index: 0 });
+        }
+        if let Some(auxiliary) = &actions.auxiliary {
+            if auxiliary.loading {
+                theme::spinner(ui, 18.0, palette.accent).on_hover_text(auxiliary.tooltip);
+            }
+            let response = ui
+                .add_enabled_ui(!auxiliary.loading, |ui| {
+                    theme::soft_button(ui, &palette, Some(auxiliary.icon), auxiliary.label, false)
+                })
+                .inner
+                .on_hover_text(auxiliary.tooltip);
+            if response.clicked() {
+                app.actions.push(auxiliary.action.clone());
+            }
         }
         if let Some((id, saved)) = &actions.saved {
             let (icon, tooltip, color) = if *saved {
@@ -391,7 +415,14 @@ pub fn table(app: &mut App, ui: &mut egui::Ui, table: Table<'_>) {
         (row >= 0.0 && row <= entry.visible.len() as f32)
             .then(|| (row.round() as usize).min(entry.visible.len()))
     });
-    let view = format!("{sort:?}|{needle}|{}", entry.visible.len());
+    // A server refresh can replace every row without changing the sort,
+    // filter, or row count. Include the source revision so selections never
+    // migrate onto unrelated songs in the replacement list.
+    let view = format!(
+        "{sort:?}|{needle}|{}|{}",
+        entry.visible.len(),
+        table.items_revision
+    );
     app.keep_picked_rows_for(&table.page, &view);
     let picked = app.picked_rows(&table.page).cloned().unwrap_or_default();
     let picked_songs: Vec<Song> = picked
@@ -632,6 +663,7 @@ pub fn playlist(app: &mut App, ui: &mut egui::Ui, id: &MediaId) {
                     saved_tooltips: ("", ""),
                     owned_playlist: owned.then(|| playlist.clone()),
                     name: &playlist.name,
+                    auxiliary: None,
                 },
                 Some(&mut page.filter),
             );
@@ -713,6 +745,7 @@ pub fn album(app: &mut App, ui: &mut egui::Ui, id: &MediaId) {
                     saved_tooltips: ("Add to Favorites", "Remove from Favorites"),
                     owned_playlist: None,
                     name: &album.name,
+                    auxiliary: None,
                 },
                 None,
             );
@@ -869,6 +902,7 @@ pub fn favorites(app: &mut App, ui: &mut egui::Ui) {
             saved_tooltips: ("", ""),
             owned_playlist: None,
             name: "Favorites",
+            auxiliary: None,
         },
         Some(&mut filter),
     );

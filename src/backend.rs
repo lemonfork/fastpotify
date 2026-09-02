@@ -84,7 +84,6 @@ pub struct HomeResponse {
     pub newest: Page<Album>,
     pub recent: Page<Album>,
     pub frequent: Page<Album>,
-    pub random_songs: Vec<Song>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,7 +97,6 @@ pub enum ApiRequest {
     Home {
         music_folder_id: Option<String>,
         album_limit: u32,
-        song_limit: u32,
         generation: u64,
     },
     AlbumList {
@@ -1159,7 +1157,6 @@ async fn perform_api(client: &ApiClient, request: ApiRequest) -> BackendResult<A
         ApiRequest::Home {
             music_folder_id,
             album_limit,
-            song_limit,
             ..
         } => {
             let album_request = |kind| AlbumListRequest {
@@ -1171,23 +1168,16 @@ async fn perform_api(client: &ApiClient, request: ApiRequest) -> BackendResult<A
             let newest_request = album_request(AlbumListType::Newest);
             let recent_request = album_request(AlbumListType::Recent);
             let frequent_request = album_request(AlbumListType::Frequent);
-            let random_request = RandomSongsRequest {
-                size: song_limit.clamp(1, 500),
-                music_folder_id,
-                ..RandomSongsRequest::default()
-            };
-            let (newest, recent, frequent, random_songs) = tokio::try_join!(
+            let (newest, recent, frequent) = tokio::try_join!(
                 client.album_list2(&newest_request),
                 client.album_list2(&recent_request),
                 client.album_list2(&frequent_request),
-                client.random_songs(&random_request),
             )
             .map_err(map_api_error)?;
             Ok(ApiPayload::Home(HomeResponse {
                 newest,
                 recent,
                 frequent,
-                random_songs,
             }))
         }
         ApiRequest::AlbumList { request, .. } => client
@@ -1721,6 +1711,10 @@ impl ScrobbleTracker {
 mod tests {
     use super::*;
 
+    use std::io::{BufRead as _, BufReader, Write as _};
+    use std::net::{Ipv4Addr, TcpListener};
+    use std::thread;
+
     const PROFILE: &str = "0123456789abcdef0123456789abcdef01234567";
 
     fn song(id: &str, duration_ms: u32) -> Song {
@@ -1746,6 +1740,82 @@ mod tests {
             playback,
             observed_at,
         }
+    }
+
+    #[tokio::test]
+    async fn home_succeeds_when_only_the_album_list_endpoint_exists() {
+        let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("unable to bind loopback test server: {error}"),
+        };
+        let server_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            const BODY: &str = concat!(
+                r#"{"subsonic-response":{"status":"ok","version":"1.16.1","#,
+                r#""albumList2":{"album":[]}}}"#,
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{BODY}",
+                BODY.len()
+            );
+            let mut requests = Vec::with_capacity(3);
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if matches!(line.as_str(), "\r\n" | "\n" | "") {
+                        break;
+                    }
+                }
+                requests.push(first);
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+            requests
+        });
+        let client = ApiClient::with_default_activity(
+            Credentials::new(server_url, "alice", "secret").unwrap(),
+        )
+        .unwrap();
+
+        let payload = perform_api(
+            &client,
+            ApiRequest::Home {
+                music_folder_id: Some("library".to_owned()),
+                album_limit: 7,
+                generation: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let ApiPayload::Home(home) = payload else {
+            panic!("home request returned a different payload");
+        };
+        assert!(home.newest.items.is_empty());
+        assert!(home.recent.items.is_empty());
+        assert!(home.frequent.items.is_empty());
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.contains("/rest/getAlbumList2.view?"))
+        );
+        for kind in ["newest", "recent", "frequent"] {
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request.contains(&format!("type={kind}")))
+                    .count(),
+                1
+            );
+        }
+        assert!(requests.iter().all(|request| !request.contains("random")));
     }
 
     #[test]

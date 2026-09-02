@@ -20,8 +20,9 @@ everyday use, and connection details.
   or decoder work cannot roll the queue back.
 - **Library and search.** Browse artists, albums, playlists, and favorites;
   search songs, artists, albums, and playlists on the server.
-- **Stable Home shelves.** Recently added and frequently played albums, local
-  recent songs, random songs, and user playlists.
+- **Personalized mixes.** Home cards open a daily mix weighted by listening
+  frequency, favorites, genres, and artists, plus a server-backed Random mix
+  that can be refreshed without interrupting playback.
 - **Playlist editing.** Create, rename, describe, add/remove songs, drag rows
   into a new order, and delete. Reordering replaces the complete ordered song
   list in one OpenSubsonic request, preserving duplicate occurrences.
@@ -132,6 +133,9 @@ Preferences remain in the existing Fastpotify application directories so an
 upgrade keeps themes, layout, shortcuts, and Winamp skins. Server credentials
 are in state, while artwork and lyrics are disposable caches. Session and
 history files are scoped to a non-secret server/user profile fingerprint.
+Settings are grouped into Account, Playback, Appearance, Winamp skins,
+Equalizer, Storage, and About, with a category rail on wide windows and a
+wrapped selector on compact ones.
 See [Settings & Files](docs/_reference/settings-and-files.md).
 
 ## Architecture

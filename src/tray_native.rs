@@ -35,7 +35,7 @@ const QUIT: &str = "quit";
 
 fn command_for(id: &MenuId) -> Option<TrayCommand> {
     match id.0.as_str() {
-        SHOW => Some(TrayCommand::ShowHide),
+        SHOW => Some(TrayCommand::Show),
         PLAY_PAUSE => Some(TrayCommand::PlayPause),
         NEXT => Some(TrayCommand::Next),
         PREVIOUS => Some(TrayCommand::Previous),
@@ -66,51 +66,48 @@ fn build(sender: Sender<TrayCommand>, wake: Wake) -> Result<Item, Box<dyn std::e
     let menu = Menu::new();
     let play_pause = MenuItem::with_id(PLAY_PAUSE, play_pause_label(false), true, None);
     menu.append_items(&[
-        &MenuItem::with_id(SHOW, "Show or hide Fastpotify", true, None),
+        &MenuItem::with_id(SHOW, "Show Main Window", true, None),
         &PredefinedMenuItem::separator(),
+        &MenuItem::with_id(PREVIOUS, "Previous", true, None),
         &play_pause,
         &MenuItem::with_id(NEXT, "Next", true, None),
-        &MenuItem::with_id(PREVIOUS, "Previous", true, None),
         &PredefinedMenuItem::separator(),
         &MenuItem::with_id(QUIT, "Quit", true, None),
     ])?;
     let builder = TrayIconBuilder::new()
         .with_icon(icon)
         .with_tooltip("Fastpotify")
-        .with_menu(Box::new(menu));
-    // A plain click shows or hides the window on every platform; the menu
-    // stays on right click.
+        .with_menu(Box::new(menu))
+        // A plain click opens the controls instead of changing window state.
+        .with_menu_on_left_click(true);
     #[cfg(target_os = "macos")]
-    let builder = builder
-        .with_icon_as_template(true)
-        .with_menu_on_left_click(false);
+    let builder = builder.with_icon_as_template(true);
     let icon = builder.build()?;
 
-    let menu_sender = sender.clone();
-    let menu_wake = Arc::clone(&wake);
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         if let Some(command) = command_for(&event.id)
-            && menu_sender.send(command).is_ok()
-        {
-            menu_wake();
-        }
-    }));
-    tray_icon::TrayIconEvent::set_event_handler(Some(move |event: tray_icon::TrayIconEvent| {
-        if let tray_icon::TrayIconEvent::Click {
-            button: tray_icon::MouseButton::Left,
-            button_state: tray_icon::MouseButtonState::Up,
-            ..
-        } = event
-            && sender.send(TrayCommand::ShowHide).is_ok()
+            && sender.send(command).is_ok()
         {
             wake();
         }
     }));
-
+    // The menu owns clicks now. Drain pointer events here so tray-icon does
+    // not retain every hover and movement in its unbounded fallback channel.
+    tray_icon::TrayIconEvent::set_event_handler(Some(|_| {}));
     Ok(Item {
         _icon: icon,
         play_pause,
     })
+}
+
+#[cfg(test)]
+mod menu_tests {
+    use super::*;
+
+    #[test]
+    fn show_menu_item_only_opens_the_main_window() {
+        assert_eq!(command_for(&MenuId::new(SHOW)), Some(TrayCommand::Show));
+    }
 }
 
 #[cfg(windows)]

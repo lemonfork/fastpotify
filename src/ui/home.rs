@@ -1,13 +1,13 @@
-//! Stable shelves backed by the user's server and local listening history.
+//! Home shortcuts and stable shelves backed by the user's server.
 
-use egui::{CornerRadius, Rect, Sense, Vec2, pos2, vec2};
+use egui::{Color32, CornerRadius, Rect, Sense, Vec2, pos2, vec2};
 
-use crate::api::models::{Album, MediaId, PlayHistory, PlayableItem, Song, pick_image};
+use crate::api::models::{Album, MediaId, PlayHistory, Song, pick_image};
 use crate::app::App;
-use crate::model::{Action, Loadable, Page, RowContext};
+use crate::model::{Action, Loadable, Page};
 use crate::theme::{self, Icon};
 
-use super::widgets::{self, TrackRow};
+use super::widgets;
 
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let palette = app.palette;
@@ -32,7 +32,6 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         "Played often",
         app.home.frequent_albums.clone(),
     );
-    song_list(app, ui, "A random mix", app.home.random_songs.clone(), 20);
 }
 
 struct Tile {
@@ -40,25 +39,72 @@ struct Tile {
     name: String,
     page: Page,
     play_context: Option<MediaId>,
-    favorite: bool,
+    cover: TileCover,
+}
+
+#[derive(Clone, Copy)]
+enum TileCover {
+    Favorites,
+    Gradient {
+        texture_name: &'static str,
+        corners: [Color32; 4],
+        icon: Icon,
+    },
+    Icon(Icon),
 }
 
 fn quick_access(app: &mut App, ui: &mut egui::Ui) {
     let palette = app.palette;
-    let mut tiles = vec![Tile {
-        image: None,
-        name: "Favorites".to_string(),
-        page: Page::Favorites,
-        play_context: None,
-        favorite: true,
-    }];
+    let mut tiles = vec![
+        Tile {
+            image: None,
+            name: "Favorites".to_string(),
+            page: Page::Favorites,
+            play_context: None,
+            cover: TileCover::Favorites,
+        },
+        Tile {
+            image: None,
+            name: "Daily mix".to_string(),
+            page: Page::DailyMix,
+            play_context: None,
+            cover: TileCover::Gradient {
+                texture_name: "daily-mix-cover-gradient",
+                corners: [
+                    Color32::from_rgb(0x77, 0x45, 0xc9),
+                    Color32::from_rgb(0xa0, 0x44, 0xb1),
+                    Color32::from_rgb(0x3b, 0x2b, 0x87),
+                    Color32::from_rgb(0x34, 0x5f, 0xae),
+                ],
+                icon: Icon::Sparkles,
+            },
+        },
+        Tile {
+            image: None,
+            name: "Random mix".to_string(),
+            page: Page::RandomMix,
+            play_context: None,
+            cover: TileCover::Gradient {
+                texture_name: "random-mix-cover-gradient",
+                corners: [
+                    Color32::from_rgb(0x1d, 0x88, 0x8a),
+                    Color32::from_rgb(0x26, 0x96, 0x6c),
+                    Color32::from_rgb(0x0d, 0x4c, 0x62),
+                    Color32::from_rgb(0x15, 0x5e, 0x83),
+                ],
+                icon: Icon::Shuffle,
+            },
+        },
+    ];
     if let Some(playlists) = app.library.playlists.get() {
-        tiles.extend(playlists.iter().take(7).map(|playlist| Tile {
+        // Keep the same eight-card footprint Home had before Mixes were
+        // introduced: three built-in shortcuts plus five server playlists.
+        tiles.extend(playlists.iter().take(5).map(|playlist| Tile {
             image: pick_image(&playlist.images, 64).map(str::to_string),
             name: playlist.name.clone(),
             page: Page::Playlist(playlist.id.clone()),
             play_context: Some(playlist.id.clone()),
-            favorite: false,
+            cover: TileCover::Icon(Icon::Music),
         }));
     }
 
@@ -84,17 +130,32 @@ fn quick_access(app: &mut App, ui: &mut egui::Ui) {
                     };
                     ui.painter().rect_filled(rect, CornerRadius::same(6), fill);
                     let cover = Rect::from_min_size(rect.min, Vec2::splat(60.0));
-                    if tile.favorite {
-                        super::sidebar::favorites_cover(ui, cover, 6.0);
-                    } else {
-                        widgets::paint_cover(
+                    match tile.cover {
+                        TileCover::Favorites => {
+                            super::sidebar::favorites_cover(ui, cover, 6.0);
+                        }
+                        TileCover::Gradient {
+                            texture_name,
+                            corners,
+                            icon,
+                        } => widgets::paint_gradient_icon_cover(
                             ui,
-                            &palette,
-                            tile.image.as_deref(),
                             cover,
                             6.0,
-                            Icon::Music,
-                        );
+                            texture_name,
+                            corners,
+                            icon,
+                        ),
+                        TileCover::Icon(icon) => {
+                            widgets::paint_cover(
+                                ui,
+                                &palette,
+                                tile.image.as_deref(),
+                                cover,
+                                6.0,
+                                icon,
+                            );
+                        }
                     }
                     let play_room = if hovered && tile.play_context.is_some() {
                         52.0
@@ -263,56 +324,4 @@ fn song_card(app: &mut App, ui: &mut egui::Ui, song: &Song) {
         app.actions
             .push(Action::Open(Page::Album(album.id.clone())));
     }
-}
-
-fn song_list(
-    app: &mut App,
-    ui: &mut egui::Ui,
-    title: &str,
-    songs: Loadable<Vec<Song>>,
-    limit: usize,
-) {
-    let palette = app.palette;
-    let songs = match songs {
-        Loadable::Loaded(songs) => songs,
-        Loadable::Loading | Loadable::NotLoaded => {
-            theme::section_title(ui, &palette, title);
-            widgets::loading_row(ui, &palette);
-            return;
-        }
-        Loadable::Failed(message) => {
-            theme::section_title(ui, &palette, title);
-            widgets::error_row(ui, app, &message, Some(Page::Home));
-            return;
-        }
-    };
-    if songs.is_empty() {
-        return;
-    }
-    theme::section_title(ui, &palette, title);
-    ui.add_space(4.0);
-    let context = RowContext::Songs(songs.clone());
-    let items: Vec<PlayableItem> = songs.into_iter().map(PlayableItem::Track).collect();
-    for (index, item) in items.iter().take(limit).enumerate() {
-        widgets::track_row(
-            ui,
-            app,
-            TrackRow {
-                index,
-                number: None,
-                item,
-                context: &context,
-                show_cover: !app.settings.tracklist_compact,
-                show_album: true,
-                added_at: None,
-                playlist_index: None,
-                compact: false,
-                thin: app.settings.tracklist_compact,
-                shift: 0.0,
-                picked: false,
-                picked_songs: &[],
-            },
-        );
-    }
-    ui.add_space(16.0);
 }

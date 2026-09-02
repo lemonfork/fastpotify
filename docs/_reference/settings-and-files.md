@@ -15,6 +15,7 @@ Fastpotify follows each platform's conventions. On Linux:
 | Active server credential | `~/.local/state/fastpotify/navidrome.json` | Yes, you sign in again |
 | Profile session | `~/.local/state/fastpotify/profiles/<profile>/session.json` | Yes |
 | Profile play history | `~/.local/state/fastpotify/profiles/<profile>/history.json` | Yes |
+| Today's Daily mix | `~/.local/state/fastpotify/profiles/<profile>/daily-mix.json` | Yes, it is regenerated |
 | Artwork cache | `~/.cache/fastpotify/art/` | Always |
 | Lyrics cache | `~/.cache/fastpotify/lyrics/` | Always |
 | Last run's log | `~/.local/state/fastpotify/fastpotify.log` | Always |
@@ -41,7 +42,10 @@ On macOS, settings, state, and logs are in
 
 Settings are readable JSON and are written atomically. Unknown fields from an
 older release are ignored, so removing an obsolete integration does not make
-the file unreadable. Main fields include:
+the file unreadable. In the app, Settings are grouped into Account, Playback,
+Appearance, Winamp skins, Equalizer, Storage, and About. Wide windows keep the
+section list in a left rail; the minimum width wraps it above the active
+section. Main fields include:
 
 | Field | Default | Meaning |
 | --- | --- | --- |

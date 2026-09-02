@@ -19,8 +19,9 @@ and Windows, starts quickly, and has no embedded browser engine.
   shuffle, repeat, seek, and session restore.
 - Browses artists, albums, playlists, and favorites and searches the server.
 - Creates, edits, and deletes playlists and adds or removes songs.
-- Shows stable Home shelves for recently added and frequently played albums,
-  local recent songs, and random songs.
+- Provides Home cards for a personalized Daily mix and refreshable Random mix,
+  alongside recently added albums, frequently played albums, and local recent
+  songs.
 - Supports light, dark, and system themes plus album-art accents.
 - Keeps playing from the tray and integrates with desktop media controls.
 - Includes the Winamp mini player, spectrum analyser, oscilloscope, playlist,

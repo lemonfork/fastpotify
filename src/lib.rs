@@ -24,6 +24,7 @@ pub mod media_controls;
 #[cfg(target_os = "macos")]
 #[path = "media_macos.rs"]
 pub mod media_controls;
+pub(crate) mod mixes;
 pub mod model;
 pub mod opener;
 mod opus;

@@ -53,8 +53,9 @@ There is no browser approval and no separate playback authorization.
 
 - **Double-click a song to play immediately.** Playback and the queue update
   optimistically; network and decode work stays off the UI thread.
-- **Closing the window can keep music playing.** Reopen it from the tray and
-  quit from the tray menu or Ctrl+Q. This is configurable in Settings.
+- **Closing the window can keep music playing.** The menu-bar or tray menu
+  offers Show Main Window, Previous, Play/Pause, Next, and Quit, with
+  separators around the playback controls. This is configurable in Settings.
 - **Use Space for play/pause, Ctrl+F or `/` for search, and Q for the queue.**
   Ctrl+/ shows all shortcuts.
 - **Right-click rows and cards** to queue, favorite, add to a playlist, or

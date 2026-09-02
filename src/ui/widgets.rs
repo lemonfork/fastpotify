@@ -82,6 +82,60 @@ pub fn paint_cover(
     }
 }
 
+/// Draws a rounded four-corner gradient with a centred white icon.
+pub fn paint_gradient_icon_cover(
+    ui: &Ui,
+    rect: Rect,
+    radius: f32,
+    texture_name: &'static str,
+    corners: [Color32; 4],
+    icon: Icon,
+) {
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let texture_id = egui::Id::new(texture_name);
+    let texture = ui
+        .data(|data| data.get_temp::<egui::TextureHandle>(texture_id))
+        .unwrap_or_else(|| {
+            let size = 64;
+            let channel = |a: u8, b: u8, t: f32| (a as f32 + (b as f32 - a as f32) * t) as u8;
+            let color = |a: Color32, b: Color32, t: f32| {
+                Color32::from_rgb(
+                    channel(a.r(), b.r(), t),
+                    channel(a.g(), b.g(), t),
+                    channel(a.b(), b.b(), t),
+                )
+            };
+            let [top_left, top_right, bottom_left, bottom_right] = corners;
+            let pixels = (0..size)
+                .flat_map(|y| {
+                    let y = y as f32 / (size - 1) as f32;
+                    (0..size).map(move |x| {
+                        let x = x as f32 / (size - 1) as f32;
+                        color(
+                            color(top_left, top_right, x),
+                            color(bottom_left, bottom_right, x),
+                            y,
+                        )
+                    })
+                })
+                .collect();
+            let texture = ui.ctx().load_texture(
+                texture_name,
+                egui::ColorImage::new([size, size], pixels),
+                egui::TextureOptions::LINEAR,
+            );
+            ui.data_mut(|data| data.insert_temp(texture_id, texture.clone()));
+            texture
+        });
+    egui::Image::new(&texture)
+        .corner_radius(CornerRadius::same(radius.min(127.0) as u8))
+        .paint_at(ui, rect);
+    let icon_size = (rect.width() * 0.45).clamp(12.0, 64.0);
+    theme::paint_icon(ui, icon, rect, icon_size, Color32::WHITE);
+}
+
 /// A soft drop shadow under a cover or card.
 pub fn paint_shadow(ui: &Ui, palette: &Palette, rect: Rect, radius: f32) {
     if !palette.dark {

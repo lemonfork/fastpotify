@@ -403,7 +403,17 @@ pub fn populate(app: &mut App) {
     app.home.loaded_at = Some(Instant::now());
     app.home.recently_added = Loadable::Loaded((0..8).map(album).collect());
     app.home.frequent_albums = Loadable::Loaded((1..9).map(album).collect());
-    app.home.random_songs = Loadable::Loaded(songs.iter().skip(10).take(12).cloned().collect());
+    app.home.daily_mix =
+        Loadable::Loaded(songs.iter().take(crate::mixes::MIX_SIZE).cloned().collect());
+    app.home.random_songs = Loadable::Loaded(
+        songs
+            .iter()
+            .rev()
+            .take(crate::mixes::MIX_SIZE)
+            .cloned()
+            .collect(),
+    );
+    app.home.random_refreshing = false;
     let home_now = demo_now();
     app.home.recently_played = Loadable::Loaded(
         songs
@@ -582,6 +592,10 @@ pub fn apply_flags(app: &mut App, page: Option<&str>, show: Option<&str>) {
                 app.settings.theme = crate::settings::ThemeChoice::Light;
                 app.actions.push(Action::SettingsChanged);
             }
+            "dark" => {
+                app.settings.theme = crate::settings::ThemeChoice::Dark;
+                app.actions.push(Action::SettingsChanged);
+            }
             "focus" => app.settings.sidebar_visible = false,
             "resume" => show_resume(app, false),
             "resume-next" => show_resume(app, true),
@@ -664,6 +678,13 @@ pub fn apply_flags(app: &mut App, page: Option<&str>, show: Option<&str>) {
             _ => {}
         }
     }
+    if matches!(app.page(), Page::Settings) {
+        app.settings.bitrate = 320;
+        app.settings.audio_device = None;
+        app.settings.keep_playing_in_background = true;
+        app.settings.check_for_updates = true;
+        app.settings.audio_buffer_ms = crate::sink::DEFAULT_BUFFER_MS;
+    }
 }
 
 #[cfg(test)]
@@ -672,6 +693,22 @@ mod tests {
     use crate::app::AppOptions;
     use crate::paths::AppDirs;
     use crate::settings::Settings;
+
+    const SETTINGS_PANELS: [(&str, &str); 7] = [
+        ("Account", "Signed in to your music server"),
+        ("Playback", "Maximum streaming bitrate"),
+        ("Appearance", "Colour from album art"),
+        ("Winamp skins", "Mini player"),
+        (
+            "Equalizer",
+            "A ten-band equalizer for playback on this computer.",
+        ),
+        ("Storage", "Artwork cache"),
+        (
+            "About",
+            "Built with Rust and egui for OpenSubsonic music servers.",
+        ),
+    ];
 
     fn page_playlist(index: usize) -> Page {
         Page::Playlist(playlist_id(index))
@@ -706,6 +743,288 @@ mod tests {
             app.frame_ui(ui);
         });
         output.textures_delta.clear();
+    }
+
+    fn painted_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Rect)> {
+        fn walk(shape: &egui::epaint::Shape, text: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::epaint::Shape::Text(shape) => text.push((
+                    shape.galley.job.text.clone(),
+                    egui::Rect::from_min_size(shape.pos, shape.galley.size()),
+                )),
+                egui::epaint::Shape::Vec(shapes) => {
+                    shapes.iter().for_each(|shape| walk(shape, text));
+                }
+                _ => {}
+            }
+        }
+
+        let mut text = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut text);
+        }
+        text
+    }
+
+    fn painted_rects(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Rect> {
+        fn walk(shape: &egui::epaint::Shape, rects: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::epaint::Shape::Rect(shape) => rects.push(shape.rect),
+                egui::epaint::Shape::Vec(shapes) => {
+                    shapes.iter().for_each(|shape| walk(shape, rects));
+                }
+                _ => {}
+            }
+        }
+
+        let mut rects = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut rects);
+        }
+        rects
+    }
+
+    fn painted_textures(
+        shapes: &[egui::epaint::ClippedShape],
+    ) -> Vec<(egui::Rect, egui::TextureId)> {
+        fn walk(shape: &egui::epaint::Shape, textures: &mut Vec<(egui::Rect, egui::TextureId)>) {
+            match shape {
+                egui::epaint::Shape::Rect(shape) => {
+                    if let Some(brush) = &shape.brush {
+                        textures.push((shape.rect, brush.fill_texture_id));
+                    }
+                }
+                egui::epaint::Shape::Vec(shapes) => {
+                    shapes.iter().for_each(|shape| walk(shape, textures));
+                }
+                _ => {}
+            }
+        }
+
+        let mut textures = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut textures);
+        }
+        textures
+    }
+
+    fn clipped_painted_text(
+        shapes: &[egui::epaint::ClippedShape],
+    ) -> Vec<(String, egui::Rect, egui::Rect)> {
+        fn walk(
+            shape: &egui::epaint::Shape,
+            clip_rect: egui::Rect,
+            text: &mut Vec<(String, egui::Rect, egui::Rect)>,
+        ) {
+            match shape {
+                egui::epaint::Shape::Text(shape) => {
+                    let rect = egui::Rect::from_min_size(shape.pos, shape.galley.size());
+                    let visible = rect.intersect(clip_rect);
+                    if visible.is_positive() {
+                        text.push((shape.galley.job.text.clone(), rect, visible));
+                    }
+                }
+                egui::epaint::Shape::Vec(shapes) => {
+                    shapes.iter().for_each(|shape| walk(shape, clip_rect, text));
+                }
+                _ => {}
+            }
+        }
+
+        let mut text = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, clipped.clip_rect, &mut text);
+        }
+        text
+    }
+
+    fn app_output(
+        ctx: &egui::Context,
+        app: &mut App,
+        viewport: egui::Rect,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let input = egui::RawInput {
+            screen_rect: Some(viewport),
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| app.frame_ui(ui));
+        output.textures_delta.clear();
+        output
+    }
+
+    // `App::frame_ui` drains actions after drawing. These settings-only
+    // harnesses keep the raw `Action` queue visible for tests that verify the
+    // page still emits the expected commands.
+    fn settings_output(
+        ctx: &egui::Context,
+        app: &mut App,
+        viewport: egui::Rect,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let input = egui::RawInput {
+            screen_rect: Some(viewport),
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            ui.set_min_size(ui.available_size());
+            crate::ui::settings::show(app, ui);
+        });
+        output.textures_delta.clear();
+        output
+    }
+
+    fn click_settings(
+        ctx: &egui::Context,
+        app: &mut App,
+        viewport: egui::Rect,
+        position: egui::Pos2,
+    ) {
+        let pointer = |pressed| egui::Event::PointerButton {
+            pos: position,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let _ = settings_output(
+            ctx,
+            app,
+            viewport,
+            vec![egui::Event::PointerMoved(position), pointer(true)],
+        );
+        let _ = settings_output(
+            ctx,
+            app,
+            viewport,
+            vec![egui::Event::PointerMoved(position), pointer(false)],
+        );
+    }
+
+    fn click_app(ctx: &egui::Context, app: &mut App, viewport: egui::Rect, position: egui::Pos2) {
+        let pointer = |pressed| egui::Event::PointerButton {
+            pos: position,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let _ = app_output(
+            ctx,
+            app,
+            viewport,
+            vec![egui::Event::PointerMoved(position), pointer(true)],
+        );
+        let _ = app_output(
+            ctx,
+            app,
+            viewport,
+            vec![egui::Event::PointerMoved(position), pointer(false)],
+        );
+    }
+
+    fn home_output(
+        ctx: &egui::Context,
+        app: &mut App,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| crate::ui::home::show(app, ui));
+        output.textures_delta.clear();
+        output
+    }
+
+    fn click_home(ctx: &egui::Context, app: &mut App, pos: egui::Pos2) {
+        let pointer = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let _ = home_output(
+            ctx,
+            app,
+            vec![egui::Event::PointerMoved(pos), pointer(true)],
+        );
+        let _ = home_output(
+            ctx,
+            app,
+            vec![egui::Event::PointerMoved(pos), pointer(false)],
+        );
+    }
+
+    fn mix_output(
+        ctx: &egui::Context,
+        app: &mut App,
+        page: Page,
+        events: Vec<egui::Event>,
+    ) -> (Vec<(String, egui::Rect)>, Vec<egui::Rect>) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| match &page {
+            Page::DailyMix => crate::ui::mixes::daily(app, ui),
+            Page::RandomMix => crate::ui::mixes::random(app, ui),
+            page => panic!("not a Mix page: {page:?}"),
+        });
+        output.textures_delta.clear();
+
+        fn collect_large_buttons(shape: &egui::epaint::Shape, buttons: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::epaint::Shape::Circle(shape) if (shape.radius - 28.0).abs() < 0.1 => {
+                    buttons.push(egui::Rect::from_center_size(
+                        shape.center,
+                        egui::Vec2::splat(shape.radius * 2.0),
+                    ));
+                }
+                egui::epaint::Shape::Vec(shapes) => {
+                    shapes
+                        .iter()
+                        .for_each(|shape| collect_large_buttons(shape, buttons));
+                }
+                _ => {}
+            }
+        }
+
+        let text = painted_text(&output.shapes);
+        let mut buttons = Vec::new();
+        for clipped in &output.shapes {
+            collect_large_buttons(&clipped.shape, &mut buttons);
+        }
+        (text, buttons)
+    }
+
+    fn click_mix(ctx: &egui::Context, app: &mut App, page: Page, pos: egui::Pos2) {
+        let pointer = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        mix_output(
+            ctx,
+            app,
+            page.clone(),
+            vec![egui::Event::PointerMoved(pos), pointer(true)],
+        );
+        mix_output(
+            ctx,
+            app,
+            page,
+            vec![egui::Event::PointerMoved(pos), pointer(false)],
+        );
     }
 
     fn make_app(tag: &str) -> (egui::Context, App, std::path::PathBuf) {
@@ -745,10 +1064,163 @@ mod tests {
     #[test]
     fn documented_demo_page_shorthands_still_decode() {
         assert_eq!(demo_page("home"), Some(Page::Home));
+        assert_eq!(demo_page("daily-mix"), Some(Page::DailyMix));
+        assert_eq!(demo_page("random-mix"), Some(Page::RandomMix));
         assert_eq!(demo_page("playlist:pl1"), Some(page_playlist(1)));
         assert_eq!(demo_page("album:alb0"), Some(page_album(0)));
         assert_eq!(demo_page("artist:art0"), Some(page_artist(0)));
         assert_eq!(demo_page("legacy:track"), None);
+    }
+
+    #[test]
+    fn home_demo_draws_mix_shortcuts_without_song_shelves() {
+        let (ctx, mut app, root) = make_app("home-mixes");
+        let mut daily_only = song(40);
+        daily_only.name = "Daily-only shelf sentinel".into();
+        let mut random_only = song(41);
+        random_only.name = "Random-only shelf sentinel".into();
+        app.home.daily_mix = Loadable::Loaded(vec![daily_only]);
+        app.home.random_songs = Loadable::Loaded(vec![random_only]);
+
+        let _ = home_output(&ctx, &mut app, Vec::new());
+        let output = home_output(&ctx, &mut app, Vec::new());
+        let text = painted_text(&output.shapes);
+        assert_eq!(
+            text.iter().filter(|(text, _)| text == "Daily mix").count(),
+            1
+        );
+        assert_eq!(
+            text.iter().filter(|(text, _)| text == "Random mix").count(),
+            1
+        );
+        assert!(
+            !text
+                .iter()
+                .any(|(text, _)| text == "Daily-only shelf sentinel")
+        );
+        assert!(
+            !text
+                .iter()
+                .any(|(text, _)| text == "Random-only shelf sentinel")
+        );
+
+        let textures = painted_textures(&output.shapes);
+        let gradient_for = |label: &str| {
+            let label = text
+                .iter()
+                .find(|(painted, _)| painted == label)
+                .map(|(_, rect)| *rect)
+                .unwrap_or_else(|| panic!("{label} shortcut is drawn"));
+            textures
+                .iter()
+                .filter(|(rect, _)| {
+                    (rect.width() - 60.0).abs() < 0.5
+                        && (rect.height() - 60.0).abs() < 0.5
+                        && rect.right() <= label.left()
+                        && (rect.center().y - label.center().y).abs() < 1.0
+                })
+                .max_by(|(left, _), (right, _)| left.right().total_cmp(&right.right()))
+                .map(|(_, texture)| *texture)
+                .unwrap_or_else(|| panic!("{label:?} has no textured 60px icon background"))
+        };
+        let daily_gradient = gradient_for("Daily mix");
+        let random_gradient = gradient_for("Random mix");
+        assert_ne!(
+            daily_gradient, random_gradient,
+            "Daily and Random mix should keep distinct gradient backgrounds"
+        );
+
+        let daily = text
+            .iter()
+            .find(|(text, _)| text == "Daily mix")
+            .map(|(_, rect)| rect.center())
+            .expect("Daily mix shortcut is drawn");
+        app.actions.clear();
+        click_home(&ctx, &mut app, daily);
+        assert!(matches!(
+            app.actions.as_slice(),
+            [Action::Open(Page::DailyMix)]
+        ));
+
+        let random = text
+            .iter()
+            .find(|(text, _)| text == "Random mix")
+            .map(|(_, rect)| rect.center())
+            .expect("Random mix shortcut is drawn");
+        app.actions.clear();
+        click_home(&ctx, &mut app, random);
+        assert!(matches!(
+            app.actions.as_slice(),
+            [Action::Open(Page::RandomMix)]
+        ));
+        finish(app, root);
+    }
+
+    #[test]
+    fn random_mix_retry_only_emits_the_targeted_refresh() {
+        let (ctx, mut app, root) = make_app("random-mix-retry");
+        app.home.daily_mix = Loadable::Loaded(Vec::new());
+        app.home.random_songs = Loadable::Failed("Random mix failed".into());
+        app.actions.clear();
+
+        let (text, _) = mix_output(&ctx, &mut app, Page::RandomMix, Vec::new());
+        let retry = text
+            .iter()
+            .find(|(text, _)| text == "Retry")
+            .map(|(_, rect)| rect.center())
+            .expect("Random mix page Retry is drawn");
+        click_mix(&ctx, &mut app, Page::RandomMix, retry);
+
+        assert!(matches!(app.actions.as_slice(), [Action::RefreshRandomMix]));
+        finish(app, root);
+    }
+
+    #[test]
+    fn random_mix_page_refresh_only_emits_the_targeted_refresh() {
+        let (ctx, mut app, root) = make_app("random-mix-refresh");
+        app.actions.clear();
+
+        let (text, _) = mix_output(&ctx, &mut app, Page::RandomMix, Vec::new());
+        let refresh = text
+            .iter()
+            .find(|(text, _)| text == "Refresh")
+            .map(|(_, rect)| rect.center())
+            .expect("Random mix page Refresh is drawn");
+        click_mix(&ctx, &mut app, Page::RandomMix, refresh);
+
+        assert!(matches!(app.actions.as_slice(), [Action::RefreshRandomMix]));
+        finish(app, root);
+    }
+
+    #[test]
+    fn daily_mix_page_draw_and_play_use_the_same_bounded_songs() {
+        let (ctx, mut app, root) = make_app("daily-mix-bound");
+        let source: Vec<_> = (0..=crate::mixes::MIX_SIZE).map(song).collect();
+        app.home.daily_mix = Loadable::Loaded(source.clone());
+        app.actions.clear();
+
+        let (_, buttons) = mix_output(&ctx, &mut app, Page::DailyMix, Vec::new());
+        let play = buttons
+            .first()
+            .map(egui::Rect::center)
+            .expect("Daily mix page Play button is drawn");
+        click_mix(&ctx, &mut app, Page::DailyMix, play);
+
+        match app.actions.as_slice() {
+            [Action::PlaySongs { songs, index }] => {
+                assert_eq!(*index, 0);
+                assert_eq!(songs.len(), crate::mixes::MIX_SIZE);
+                assert_eq!(
+                    songs.iter().map(|song| &song.id).collect::<Vec<_>>(),
+                    source[..crate::mixes::MIX_SIZE]
+                        .iter()
+                        .map(|song| &song.id)
+                        .collect::<Vec<_>>()
+                );
+            }
+            actions => panic!("Daily mix Play emitted unexpected actions: {actions:?}"),
+        }
+        finish(app, root);
     }
 
     #[cfg(feature = "demo")]
@@ -862,6 +1334,165 @@ mod tests {
     }
 
     #[test]
+    fn login_form_is_fully_visible_at_the_default_window_size() {
+        let (ctx, mut app, root) = make_app("login-default-window");
+        app.user = None;
+        app.auth = AuthStatus::SignedOut;
+
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+        let _ = app_output(&ctx, &mut app, viewport, Vec::new());
+        let output = app_output(&ctx, &mut app, viewport, Vec::new());
+        let visible_text = clipped_painted_text(&output.shapes);
+
+        for expected in [
+            "Server URL",
+            "Username",
+            "Password",
+            "Sign in",
+            "Compatible with Navidrome and OpenSubsonic servers. Your password is stored only in this app's private profile.",
+        ] {
+            let (_, layout, visible) = visible_text
+                .iter()
+                .find(|(text, _, _)| text == expected)
+                .unwrap_or_else(|| panic!("{expected:?} is not visible in the default window"));
+            assert_eq!(
+                *layout, *visible,
+                "{expected:?} is clipped in the default window"
+            );
+        }
+
+        finish(app, root);
+    }
+
+    #[test]
+    fn login_content_stays_in_the_minimum_window_and_scrolls_to_the_bottom() {
+        let (ctx, mut app, root) = make_app("login-minimum-window");
+        app.user = None;
+        app.login_server = "http://music.example.test".into();
+        app.login_username = "listener".into();
+        app.login_password = "secret".into();
+        let failure = "The server rejected this sign-in attempt after returning an unexpectedly long diagnostic response. Please verify the server address, account permissions, authentication settings, reverse proxy configuration, and network connection before trying again. ".repeat(5);
+        app.auth = AuthStatus::Failed(failure.clone());
+
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(760.0, 520.0));
+        let pointer = egui::pos2(380.0, 260.0);
+        let _ = app_output(
+            &ctx,
+            &mut app,
+            viewport,
+            vec![egui::Event::PointerMoved(pointer)],
+        );
+        let mut output = app_output(
+            &ctx,
+            &mut app,
+            viewport,
+            vec![egui::Event::PointerMoved(pointer)],
+        );
+
+        fn largest_panel_rect(
+            shape: &egui::epaint::Shape,
+            panel: egui::Color32,
+        ) -> Option<egui::Rect> {
+            match shape {
+                egui::epaint::Shape::Rect(shape) if shape.fill == panel => Some(shape.rect),
+                egui::epaint::Shape::Vec(shapes) => shapes
+                    .iter()
+                    .filter_map(|shape| largest_panel_rect(shape, panel))
+                    .max_by(|left, right| left.area().total_cmp(&right.area())),
+                _ => None,
+            }
+        }
+
+        let card = output
+            .shapes
+            .iter()
+            .filter_map(|shape| largest_panel_rect(&shape.shape, app.palette.panel))
+            .max_by(|left, right| left.area().total_cmp(&right.area()))
+            .expect("the login card is painted");
+        assert!(
+            viewport.contains_rect(card),
+            "login card {card:?} exceeds viewport {viewport:?}"
+        );
+
+        let initial_text = clipped_painted_text(&output.shapes);
+        assert!(
+            initial_text.iter().any(|(text, _, _)| text == "Server URL"),
+            "the top of the login form is not visible"
+        );
+        for (text, _, visible) in &initial_text {
+            assert!(
+                viewport.contains_rect(*visible),
+                "visible login text {text:?} exceeds viewport: {visible:?}"
+            );
+        }
+
+        let scroll = |delta| egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, delta),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut warning_seen = false;
+        let mut failure_seen = false;
+        let mut bottom_reached = false;
+        for _ in 0..24 {
+            let _ = app_output(
+                &ctx,
+                &mut app,
+                viewport,
+                vec![egui::Event::PointerMoved(pointer), scroll(-240.0)],
+            );
+            output = app_output(
+                &ctx,
+                &mut app,
+                viewport,
+                vec![egui::Event::PointerMoved(pointer)],
+            );
+            let visible_text = clipped_painted_text(&output.shapes);
+            warning_seen |= visible_text.iter().any(|(text, _, _)| {
+                text.contains(
+                    "HTTP is not encrypted. Other people on this network may observe your music",
+                )
+            });
+            failure_seen |= visible_text.iter().any(|(text, _, _)| text == &failure);
+            for (text, _, visible) in &visible_text {
+                assert!(
+                    viewport.contains_rect(*visible),
+                    "visible login text {text:?} exceeds viewport: {visible:?}"
+                );
+            }
+
+            bottom_reached = [
+                "Sign in",
+                "Compatible with Navidrome and OpenSubsonic servers. Your password is stored only in this app's private profile.",
+            ]
+            .iter()
+            .all(|expected| {
+                visible_text
+                    .iter()
+                    .find(|(text, _, _)| text == expected)
+                    .is_some_and(|(_, layout, visible)| {
+                        layout == visible && viewport.contains_rect(*layout)
+                    })
+            });
+            if bottom_reached {
+                break;
+            }
+        }
+        assert!(warning_seen, "the HTTP security warning is not reachable");
+        assert!(
+            failure_seen,
+            "the long authentication failure is not reachable"
+        );
+        assert!(
+            bottom_reached,
+            "the sign-in button and privacy note are not reachable after scrolling"
+        );
+
+        finish(app, root);
+    }
+
+    #[test]
     fn the_narrowest_panel_keeps_its_header_on_one_row() {
         let (ctx, mut app, root) = make_app("queue-header");
         app.show_queue_panel = true;
@@ -910,6 +1541,456 @@ mod tests {
     }
 
     #[test]
+    fn settings_start_on_playback_and_only_draw_the_active_panel() {
+        let (ctx, mut app, root) = make_app("settings-default-panel");
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1240.0, 800.0));
+        app.open(Page::Settings);
+
+        let _ = app_output(&ctx, &mut app, viewport, Vec::new());
+        let output = app_output(&ctx, &mut app, viewport, Vec::new());
+        let text = painted_text(&output.shapes);
+        let visible_text = clipped_painted_text(&output.shapes);
+
+        for expected in [
+            "Maximum streaming bitrate",
+            "Audio output",
+            "Keep music playing when the window closes",
+            "Check for updates",
+            "Output buffer",
+            "Playback settings applied.",
+        ] {
+            let (_, layout, visible) = visible_text
+                .iter()
+                .find(|(painted, _, _)| painted == expected)
+                .unwrap_or_else(|| {
+                    panic!("wide Playback row {expected:?} is not visible in the default window")
+                });
+            assert_eq!(
+                *layout, *visible,
+                "wide Playback row {expected:?} is clipped in the default window"
+            );
+        }
+
+        let background_rects = painted_rects(&output.shapes);
+        let widget_around = |label: &str| {
+            let text_rect = text
+                .iter()
+                .find(|(painted, _)| painted == label)
+                .map(|(_, rect)| *rect)
+                .unwrap_or_else(|| panic!("wide Playback control {label:?} is not painted"));
+            background_rects
+                .iter()
+                .filter(|rect| {
+                    rect.contains_rect(text_rect)
+                        && rect.width() > text_rect.width() + 3.0
+                        && rect.height() > text_rect.height() + 3.0
+                })
+                .min_by(|left, right| left.area().total_cmp(&right.area()))
+                .copied()
+                .unwrap_or_else(|| {
+                    panic!("wide Playback control {label:?} has no enclosing widget shape")
+                })
+        };
+        let bitrate_buttons = [
+            widget_around("Normal · 96 kbps"),
+            widget_around("High · 160 kbps"),
+            widget_around("Very high · 320 kbps"),
+        ];
+        let buffer_buttons = [
+            widget_around("200 ms"),
+            widget_around("100 ms"),
+            widget_around("50 ms"),
+        ];
+        let bitrate_centers = bitrate_buttons
+            .iter()
+            .map(|rect| rect.center().y)
+            .collect::<Vec<_>>();
+        let top_bitrate_center = bitrate_centers
+            .iter()
+            .copied()
+            .fold(f32::INFINITY, f32::min);
+        let bottom_bitrate_center = bitrate_centers
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            bottom_bitrate_center - top_bitrate_center < 1.0,
+            "wide Playback bitrate choices wrapped instead of staying on one line: {bitrate_buttons:?}"
+        );
+
+        let switch_for = |label: &str| {
+            let label_rect = text
+                .iter()
+                .find(|(painted, _)| painted == label)
+                .map(|(_, rect)| *rect)
+                .unwrap_or_else(|| panic!("wide Playback row {label:?} is not painted"));
+            background_rects
+                .iter()
+                .filter(|rect| {
+                    rect.width() > rect.height()
+                        && rect.width() < 80.0
+                        && rect.height() < 40.0
+                        && rect.left() > label_rect.right()
+                        && (rect.center().y - label_rect.center().y).abs() < 24.0
+                })
+                .copied()
+                .next()
+                .unwrap_or_else(|| panic!("wide Playback row {label:?} has no aligned switch"))
+        };
+        let control_right_edges = [
+            bitrate_buttons
+                .iter()
+                .map(egui::Rect::right)
+                .fold(f32::NEG_INFINITY, f32::max),
+            widget_around("System default").right(),
+            switch_for("Keep music playing when the window closes").right(),
+            switch_for("Check for updates").right(),
+            buffer_buttons
+                .iter()
+                .map(egui::Rect::right)
+                .fold(f32::NEG_INFINITY, f32::max),
+        ];
+        let leftmost_control_edge = control_right_edges
+            .iter()
+            .copied()
+            .fold(f32::INFINITY, f32::min);
+        let rightmost_control_edge = control_right_edges
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            rightmost_control_edge - leftmost_control_edge < 1.0,
+            "wide Playback controls do not share a right edge: {control_right_edges:?}"
+        );
+
+        finish(app, root);
+    }
+
+    #[test]
+    fn every_settings_category_switches_to_one_distinct_panel() {
+        let (ctx, mut app, root) = make_app("settings-categories");
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+        app.open(Page::Settings);
+
+        let _ = app_output(&ctx, &mut app, viewport, Vec::new());
+        let mut output = app_output(&ctx, &mut app, viewport, Vec::new());
+
+        // Start with Account so every click, including Playback, changes the
+        // selection rather than exercising an already-selected navigation row.
+        for index in [0, 1, 2, 3, 4, 5, 6] {
+            let (label, selected_anchor) = SETTINGS_PANELS[index];
+            let navigation = painted_text(&output.shapes)
+                .into_iter()
+                .find(|(painted, _)| painted == label)
+                .map(|(_, rect)| rect.center())
+                .unwrap_or_else(|| panic!("settings navigation did not draw {label:?}"));
+            click_app(&ctx, &mut app, viewport, navigation);
+            output = app_output(&ctx, &mut app, viewport, Vec::new());
+            let text = painted_text(&output.shapes);
+
+            let visible_panels = SETTINGS_PANELS
+                .iter()
+                .filter_map(|(_, anchor)| {
+                    text.iter()
+                        .any(|(painted, _)| painted == anchor)
+                        .then_some(*anchor)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                visible_panels,
+                vec![selected_anchor],
+                "clicking {label:?} did not show exactly its own panel"
+            );
+        }
+
+        finish(app, root);
+    }
+
+    #[test]
+    fn settings_navigation_is_a_wide_rail_and_wraps_at_the_minimum_window() {
+        fn nav_rects(text: &[(String, egui::Rect, egui::Rect)], wide: bool) -> Vec<egui::Rect> {
+            SETTINGS_PANELS
+                .iter()
+                .map(|(label, _)| {
+                    let candidates = text.iter().filter(|(painted, _, _)| painted == label);
+                    if wide {
+                        candidates
+                            .min_by(|(_, left, _), (_, right, _)| {
+                                left.left().total_cmp(&right.left())
+                            })
+                            .map(|(_, layout, _)| *layout)
+                    } else {
+                        candidates
+                            .min_by(|(_, left, _), (_, right, _)| {
+                                left.top().total_cmp(&right.top())
+                            })
+                            .map(|(_, layout, _)| *layout)
+                    }
+                    .unwrap_or_else(|| panic!("settings navigation did not draw {label:?}"))
+                })
+                .collect()
+        }
+
+        fn assert_horizontally_unclipped(
+            text: &[(String, egui::Rect, egui::Rect)],
+            label: &str,
+            pick_wide_navigation_copy: Option<bool>,
+        ) {
+            let mut candidates = text.iter().filter(|(painted, _, _)| painted == label);
+            let entry = match pick_wide_navigation_copy {
+                Some(true) => candidates
+                    .min_by(|(_, left, _), (_, right, _)| left.left().total_cmp(&right.left())),
+                Some(false) => candidates
+                    .min_by(|(_, left, _), (_, right, _)| left.top().total_cmp(&right.top())),
+                None => candidates.next(),
+            }
+            .unwrap_or_else(|| panic!("{label:?} was not visibly painted"));
+            let (_, layout, visible) = entry;
+            assert!(
+                (layout.left() - visible.left()).abs() < 0.5
+                    && (layout.right() - visible.right()).abs() < 0.5,
+                "{label:?} is horizontally clipped: layout {layout:?}, visible {visible:?}"
+            );
+        }
+
+        let (wide_ctx, mut wide_app, wide_root) = make_app("settings-wide-rail");
+        let wide_viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+        wide_app.open(Page::Settings);
+        let _ = app_output(&wide_ctx, &mut wide_app, wide_viewport, Vec::new());
+        let wide_output = app_output(&wide_ctx, &mut wide_app, wide_viewport, Vec::new());
+        let wide_text = clipped_painted_text(&wide_output.shapes);
+        let wide_nav = nav_rects(&wide_text, true);
+        for (label, _) in SETTINGS_PANELS {
+            assert_horizontally_unclipped(&wide_text, label, Some(true));
+        }
+        let playback = wide_text
+            .iter()
+            .find(|(painted, _, _)| painted == "Maximum streaming bitrate")
+            .map(|(_, layout, _)| *layout)
+            .expect("wide Playback content anchor is visible");
+        let rail_right = wide_nav
+            .iter()
+            .map(egui::Rect::right)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            playback.left() > rail_right + 20.0,
+            "wide Playback content {playback:?} does not sit to the right of the rail {wide_nav:?}"
+        );
+        assert_horizontally_unclipped(&wide_text, "Maximum streaming bitrate", None);
+        finish(wide_app, wide_root);
+
+        let (narrow_ctx, mut narrow_app, narrow_root) = make_app("settings-wrapped-nav");
+        let narrow_viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(760.0, 520.0));
+        narrow_app.open(Page::Settings);
+        let _ = app_output(&narrow_ctx, &mut narrow_app, narrow_viewport, Vec::new());
+        let mut narrow_output =
+            app_output(&narrow_ctx, &mut narrow_app, narrow_viewport, Vec::new());
+        let narrow_text = clipped_painted_text(&narrow_output.shapes);
+        let narrow_nav = nav_rects(&narrow_text, false);
+        for (label, _) in SETTINGS_PANELS {
+            assert_horizontally_unclipped(&narrow_text, label, Some(false));
+        }
+        let narrow_left = narrow_nav
+            .iter()
+            .map(egui::Rect::left)
+            .fold(f32::INFINITY, f32::min);
+        let narrow_right = narrow_nav
+            .iter()
+            .map(egui::Rect::right)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let narrow_top = narrow_nav
+            .iter()
+            .map(egui::Rect::top)
+            .fold(f32::INFINITY, f32::min);
+        let narrow_bottom = narrow_nav
+            .iter()
+            .map(egui::Rect::bottom)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            narrow_right - narrow_left > 100.0,
+            "minimum-width Settings navigation did not flow horizontally: {narrow_nav:?}"
+        );
+        assert!(
+            narrow_bottom - narrow_top > 32.0,
+            "minimum-width Settings navigation did not wrap onto multiple rows: {narrow_nav:?}"
+        );
+        let playback = narrow_text
+            .iter()
+            .find(|(painted, _, _)| painted == "Maximum streaming bitrate")
+            .map(|(_, layout, _)| *layout)
+            .expect("minimum-width Playback content anchor is visible");
+        assert!(
+            narrow_bottom < playback.top(),
+            "minimum-width navigation {narrow_nav:?} is not above Playback content {playback:?}"
+        );
+        assert_horizontally_unclipped(&narrow_text, "Maximum streaming bitrate", None);
+
+        click_app(
+            &narrow_ctx,
+            &mut narrow_app,
+            narrow_viewport,
+            narrow_nav[4].center(),
+        );
+        narrow_output = app_output(&narrow_ctx, &mut narrow_app, narrow_viewport, Vec::new());
+        let mut reached_last_band = false;
+        let content_pointer = egui::pos2(680.0, 400.0);
+        for _ in 0..20 {
+            let text = clipped_painted_text(&narrow_output.shapes);
+            if let Some((_, layout, visible)) = text.iter().find(|(painted, _, _)| painted == "16K")
+            {
+                assert_eq!(
+                    *layout, *visible,
+                    "minimum-width Equalizer last band is horizontally clipped"
+                );
+                reached_last_band = true;
+                break;
+            }
+            let wheel = egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -80.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let _ = app_output(
+                &narrow_ctx,
+                &mut narrow_app,
+                narrow_viewport,
+                vec![egui::Event::PointerMoved(content_pointer), wheel],
+            );
+            narrow_output = app_output(
+                &narrow_ctx,
+                &mut narrow_app,
+                narrow_viewport,
+                vec![egui::Event::PointerMoved(content_pointer)],
+            );
+        }
+        assert!(
+            reached_last_band,
+            "minimum-width Equalizer last band is not reachable by scrolling"
+        );
+        finish(narrow_app, narrow_root);
+    }
+
+    #[test]
+    fn long_settings_choice_groups_wrap_without_covering_following_content() {
+        let (ctx, mut app, root) = make_app("settings-wrapped-choice-groups");
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(760.0, 1100.0));
+        app.open(Page::Settings);
+
+        let _ = app_output(&ctx, &mut app, viewport, Vec::new());
+        let output = app_output(&ctx, &mut app, viewport, Vec::new());
+        let equalizer = painted_text(&output.shapes)
+            .into_iter()
+            .find(|(painted, _)| painted == "Equalizer")
+            .map(|(_, rect)| rect.center())
+            .expect("settings navigation draws Equalizer");
+        click_app(&ctx, &mut app, viewport, equalizer);
+
+        let output = app_output(&ctx, &mut app, viewport, Vec::new());
+        let text = clipped_painted_text(&output.shapes);
+        let label_rect = |label: &str| {
+            let (_, layout, visible) = text
+                .iter()
+                .find(|(painted, _, _)| painted == label)
+                .unwrap_or_else(|| panic!("minimum-width Equalizer text {label:?} is missing"));
+            assert_eq!(
+                *layout, *visible,
+                "minimum-width Equalizer text {label:?} is clipped"
+            );
+            *layout
+        };
+
+        let long_preset_bottom = [
+            label_rect("Laptop Speakers / Headphones"),
+            label_rect("Night Listening"),
+        ]
+        .into_iter()
+        .map(|rect| rect.bottom())
+        .fold(f32::NEG_INFINITY, f32::max);
+        let response_curve = label_rect("Pre");
+        assert!(
+            response_curve.top() > long_preset_bottom + 4.0,
+            "wrapped Equalizer presets overlap the following content: \
+             presets end at {long_preset_bottom}, response curve starts at {}",
+            response_curve.top()
+        );
+
+        finish(app, root);
+    }
+
+    #[test]
+    fn settings_playback_apply_and_account_sign_out_keep_their_actions() {
+        let (ctx, mut app, root) = make_app("settings-actions");
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+        let _ = settings_output(&ctx, &mut app, viewport, Vec::new());
+        let mut output = settings_output(&ctx, &mut app, viewport, Vec::new());
+
+        app.actions.clear();
+        let high_bitrate = painted_text(&output.shapes)
+            .into_iter()
+            .find(|(painted, _)| painted == "High · 160 kbps")
+            .map(|(_, rect)| rect.center())
+            .expect("Playback draws the 160 kbps choice");
+        click_settings(&ctx, &mut app, viewport, high_bitrate);
+        assert_eq!(app.settings.bitrate, 160);
+        assert!(
+            app.actions
+                .iter()
+                .any(|action| matches!(action, Action::SettingsChanged)),
+            "changing playback quality did not queue SettingsChanged"
+        );
+
+        output = settings_output(&ctx, &mut app, viewport, Vec::new());
+        let apply = painted_text(&output.shapes)
+            .into_iter()
+            .find(|(painted, _)| painted == "Apply and restart playback")
+            .map(|(_, rect)| rect.center())
+            .expect("changed playback settings do not offer Apply and restart playback");
+        app.actions.clear();
+        click_settings(&ctx, &mut app, viewport, apply);
+        assert!(
+            app.actions
+                .iter()
+                .any(|action| matches!(action, Action::RestartEngine)),
+            "applying changed playback settings did not queue RestartEngine"
+        );
+        output = settings_output(&ctx, &mut app, viewport, Vec::new());
+        let text = painted_text(&output.shapes);
+        assert!(
+            text.iter()
+                .any(|(painted, _)| painted == "Playback settings applied.")
+        );
+        assert!(
+            !text
+                .iter()
+                .any(|(painted, _)| painted == "Apply and restart playback")
+        );
+
+        let account = text
+            .iter()
+            .find(|(painted, _)| painted == "Account")
+            .map(|(_, rect)| rect.center())
+            .expect("settings navigation draws Account");
+        click_settings(&ctx, &mut app, viewport, account);
+        output = settings_output(&ctx, &mut app, viewport, Vec::new());
+        let sign_out = painted_text(&output.shapes)
+            .into_iter()
+            .find(|(painted, _)| painted == "Sign out")
+            .map(|(_, rect)| rect.center())
+            .expect("Account settings draw Sign out");
+        app.actions.clear();
+        click_settings(&ctx, &mut app, viewport, sign_out);
+        assert!(
+            app.actions
+                .iter()
+                .any(|action| matches!(action, Action::SignOut)),
+            "Account Sign out did not queue SignOut"
+        );
+
+        finish(app, root);
+    }
+
+    #[test]
     fn every_surface_renders_headless() {
         let (ctx, mut app, root) = make_app("render");
 
@@ -917,6 +1998,8 @@ mod tests {
             Page::Home,
             Page::Search,
             Page::Favorites,
+            Page::DailyMix,
+            Page::RandomMix,
             Page::Albums,
             Page::Artists,
             page_playlist(1),
