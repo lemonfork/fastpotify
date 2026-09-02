@@ -2311,7 +2311,7 @@ mod tests {
     fn clicking_search_in_library_shelf_focuses_search_field() {
         let (ctx, mut app, root) = make_app("sidebar-search-focus");
 
-        // Find the Y position of "Your Library" header.
+        // Find the Y position of the Library header.
         let mut library_y = None;
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -2326,7 +2326,7 @@ mod tests {
             fn walk(shape: &egui::epaint::Shape, found: &mut Option<f32>) {
                 match shape {
                     egui::epaint::Shape::Text(text) => {
-                        if text.galley.job.text == "Your Library" {
+                        if text.galley.job.text == "Library" {
                             *found = Some(text.pos.y);
                         }
                     }
@@ -2340,10 +2340,10 @@ mod tests {
                 walk(&clipped.shape, &mut library_y);
             }
         }
-        let y = library_y.expect("Your Library label was not found");
+        let y = library_y.expect("Library label was not found");
         let search_pos = egui::pos2(168.0, y + 4.0);
 
-        // Click on the search button in the Your Library shelf header.
+        // Click on the search button in the Library shelf header.
         frame_events(
             &ctx,
             &mut app,

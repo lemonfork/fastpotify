@@ -183,7 +183,7 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         theme::icon(ui, Icon::Library, 22.0, palette.secondary);
         ui.add_space(2.0);
-        theme::text(ui, "Your Library", theme::bold(15.0), palette.text);
+        theme::text(ui, "Library", theme::bold(15.0), palette.text);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             if theme::icon_button(
