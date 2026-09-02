@@ -6,7 +6,9 @@ use egui::{Align, Layout, Sense, Vec2};
 
 use crate::api::models::{Album, MediaId, PlayableItem, Playlist, Song, pick_image};
 use crate::app::App;
-use crate::model::{Action, DragTrack, Loadable, Page, RowContext, SortColumn, TableSort};
+use crate::model::{
+    Action, DragTrack, Loadable, Page, RowContext, SongListMode, SortColumn, TableSort,
+};
 use crate::theme::{self, Icon};
 use crate::util;
 
@@ -101,6 +103,7 @@ pub struct Actions<'a> {
     /// Exact songs on screen. Used for sorted views and Favorites, where no
     /// synthetic server context exists.
     pub view: Option<Vec<Song>>,
+    pub view_mode: SongListMode,
     pub saved: Option<(MediaId, bool)>,
     pub saved_icons: (Icon, Icon),
     pub saved_tooltips: (&'a str, &'a str),
@@ -151,7 +154,11 @@ pub fn actions_row(
                 if now_playing_here {
                     app.actions.push(Action::TogglePlay);
                 } else if let Some(songs) = actions.view.clone() {
-                    app.actions.push(Action::PlaySongs { songs, index: 0 });
+                    app.actions.push(Action::PlaySongs {
+                        songs,
+                        index: 0,
+                        mode: actions.view_mode,
+                    });
                 } else {
                     app.actions.push(Action::PlayContext {
                         context: context.clone(),
@@ -203,7 +210,11 @@ pub fn actions_row(
             )
             .clicked()
         {
-            app.actions.push(Action::PlaySongs { songs, index: 0 });
+            app.actions.push(Action::PlaySongs {
+                songs,
+                index: 0,
+                mode: actions.view_mode,
+            });
         }
         if let Some(auxiliary) = &actions.auxiliary {
             if auxiliary.loading {
@@ -381,7 +392,14 @@ pub fn table(app: &mut App, ui: &mut egui::Ui, table: Table<'_>) {
                 songs: songs.to_vec(),
                 context: context.clone(),
             },
-            _ => RowContext::Songs(songs.to_vec()),
+            RowContext::Songs { mode, .. } => RowContext::Songs {
+                songs: songs.to_vec(),
+                mode: *mode,
+            },
+            _ => RowContext::Songs {
+                songs: songs.to_vec(),
+                mode: SongListMode::Finite,
+            },
         }
     } else {
         table.context.clone()
@@ -658,6 +676,7 @@ pub fn playlist(app: &mut App, ui: &mut egui::Ui, id: &MediaId) {
                 Actions {
                     play_context: Some(playlist.id.clone()),
                     view: table_view.view_songs.as_ref().map(|songs| songs.to_vec()),
+                    view_mode: SongListMode::Finite,
                     saved: None,
                     saved_icons: (Icon::Heart, Icon::HeartFilled),
                     saved_tooltips: ("", ""),
@@ -740,6 +759,7 @@ pub fn album(app: &mut App, ui: &mut egui::Ui, id: &MediaId) {
                 Actions {
                     play_context: Some(album.id.clone()),
                     view: table_view.view_songs.as_ref().map(|songs| songs.to_vec()),
+                    view_mode: SongListMode::Finite,
                     saved: Some((album.id.clone(), saved)),
                     saved_icons: (Icon::Heart, Icon::HeartFilled),
                     saved_tooltips: ("Add to Favorites", "Remove from Favorites"),
@@ -897,6 +917,7 @@ pub fn favorites(app: &mut App, ui: &mut egui::Ui) {
         Actions {
             play_context: None,
             view: Some(visible_songs.clone()),
+            view_mode: SongListMode::Finite,
             saved: None,
             saved_icons: (Icon::Heart, Icon::HeartFilled),
             saved_tooltips: ("", ""),
@@ -912,7 +933,10 @@ pub fn favorites(app: &mut App, ui: &mut egui::Ui) {
         ui,
         Table {
             items: &items,
-            context: RowContext::Songs(visible_songs),
+            context: RowContext::Songs {
+                songs: visible_songs,
+                mode: SongListMode::Finite,
+            },
             show_album: true,
             show_cover: true,
             show_added: true,

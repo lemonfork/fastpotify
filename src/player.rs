@@ -320,6 +320,8 @@ pub enum PlayerCommand {
     Pause,
     Stop,
     LoadContext(LoadContext),
+    /// Adds songs in the supplied order after the context without changing playback.
+    AppendContext(Vec<Song>),
     AddManual(Box<Song>),
     ClearManual,
     Next,
@@ -589,6 +591,15 @@ impl PlaybackReducer {
                     }
                 }
             }
+            PlayerCommand::AppendContext(songs) => {
+                for song in songs {
+                    let index = self.context_source.len();
+                    self.context_source.push(song.clone());
+                    let entry = self.occurrence(song, QueueSection::Context, Some(index));
+                    self.snapshot.queue.context.push(entry);
+                }
+                None
+            }
             PlayerCommand::AddManual(song) => {
                 let entry = self.occurrence(*song, QueueSection::Manual, None);
                 self.snapshot.queue.manual.push(entry);
@@ -762,6 +773,15 @@ impl PlaybackReducer {
             }
         };
         Self::finish(self, decode, output)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apply_for_test(
+        &mut self,
+        command: PlayerCommand,
+    ) -> (CommandReceipt, PlaybackSnapshot) {
+        let transition = self.apply(command);
+        (transition.receipt, transition.snapshot)
     }
 
     fn decoder_started(&mut self, token: DecodeToken) -> Option<Transition> {
@@ -1819,6 +1839,121 @@ mod tests {
         assert_eq!(reducer.snapshot().current_song().unwrap().name, "context-a");
         assert_eq!(reducer.snapshot().queue.manual[0].song.name, "manual");
         assert_eq!(reducer.snapshot().queue.context[0].song.name, "context-b");
+    }
+
+    #[test]
+    fn appending_context_preserves_playback_and_existing_queue() {
+        let mut reducer = PlaybackReducer::new(1);
+        reducer.apply(PlayerCommand::AddManual(Box::new(song("manual"))));
+        let loaded = reducer.apply(load(&["current", "existing"], true));
+        reducer
+            .decoder_started(loaded.decode.unwrap().token)
+            .unwrap();
+        let before = reducer.snapshot().clone();
+        let decode_generation = reducer.decode_generation();
+
+        let appended = reducer.apply(PlayerCommand::AppendContext(vec![
+            song("new-a"),
+            song("new-b"),
+        ]));
+
+        assert_eq!(appended.snapshot.current, before.current);
+        assert_eq!(appended.snapshot.queue.manual, before.queue.manual);
+        assert_eq!(appended.snapshot.position, before.position);
+        assert_eq!(appended.snapshot.play_instance_id, before.play_instance_id);
+        assert_eq!(appended.receipt.decode_generation, decode_generation);
+        assert!(appended.decode.is_none());
+        assert_eq!(appended.output, OutputAction::None);
+        assert_eq!(
+            &appended.snapshot.queue.context[..before.queue.context.len()],
+            before.queue.context.as_slice()
+        );
+        assert_eq!(
+            appended.snapshot.queue.context[before.queue.context.len()..]
+                .iter()
+                .map(|entry| entry.song.name.as_str())
+                .collect::<Vec<_>>(),
+            ["new-a", "new-b"]
+        );
+    }
+
+    #[test]
+    fn repeat_context_includes_appended_songs() {
+        let mut reducer = PlaybackReducer::new(1);
+        let loaded = reducer.apply(load(&["original"], true));
+        reducer.apply(PlayerCommand::AppendContext(vec![
+            song("appended-a"),
+            song("appended-b"),
+        ]));
+        reducer.apply(PlayerCommand::Repeat(RepeatMode::Context));
+
+        let appended_a = reducer.decoder_eof(loaded.decode.unwrap().token).unwrap();
+        assert_eq!(
+            appended_a.snapshot.current_song().unwrap().name,
+            "appended-a"
+        );
+        let appended_b = reducer
+            .decoder_eof(appended_a.decode.unwrap().token)
+            .unwrap();
+        assert_eq!(
+            appended_b.snapshot.current_song().unwrap().name,
+            "appended-b"
+        );
+        let repeated = reducer
+            .decoder_eof(appended_b.decode.unwrap().token)
+            .unwrap();
+        assert_eq!(repeated.snapshot.current_song().unwrap().name, "original");
+        assert_eq!(
+            repeated
+                .snapshot
+                .queue
+                .context
+                .iter()
+                .map(|entry| entry.song.name.as_str())
+                .collect::<Vec<_>>(),
+            ["appended-a", "appended-b"]
+        );
+    }
+
+    #[test]
+    fn appending_while_shuffled_preserves_prefix_and_input_order() {
+        let mut reducer = PlaybackReducer::new(1);
+        reducer.apply(load(&["current", "old-a", "old-b", "old-c"], false));
+        reducer.apply(PlayerCommand::Shuffle(true));
+        let existing = reducer.snapshot().queue.context.clone();
+
+        reducer.apply(PlayerCommand::AppendContext(vec![
+            song("new-a"),
+            song("new-b"),
+            song("new-c"),
+            song("new-d"),
+        ]));
+
+        assert_eq!(
+            &reducer.snapshot().queue.context[..existing.len()],
+            existing.as_slice()
+        );
+        assert_eq!(
+            reducer.snapshot().queue.context[existing.len()..]
+                .iter()
+                .map(|entry| entry.song.name.as_str())
+                .collect::<Vec<_>>(),
+            ["new-a", "new-b", "new-c", "new-d"]
+        );
+
+        reducer.apply(PlayerCommand::Shuffle(false));
+        assert_eq!(
+            reducer
+                .snapshot()
+                .queue
+                .context
+                .iter()
+                .map(|entry| entry.song.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "old-a", "old-b", "old-c", "new-a", "new-b", "new-c", "new-d"
+            ]
+        );
     }
 
     #[test]

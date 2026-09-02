@@ -370,6 +370,13 @@ pub enum SortColumn {
     Index,
 }
 
+/// Whether a local song list ends or can be extended while it plays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SongListMode {
+    Finite,
+    RandomMix,
+}
+
 /// Playback and action context for a track row.
 #[derive(Clone, Debug, PartialEq)]
 pub enum RowContext {
@@ -380,7 +387,10 @@ pub enum RowContext {
         editable_playlist: Option<MediaId>,
     },
     /// A loose list of songs shown in their exact play order.
-    Songs(Vec<Song>),
+    Songs {
+        songs: Vec<Song>,
+        mode: SongListMode,
+    },
     /// A Next up occurrence. Identity, rather than song ID, distinguishes
     /// duplicate rows and lets the player consume exactly through this row.
     Queue(crate::player::OccurrenceId),
@@ -446,6 +456,7 @@ pub enum Action {
     PlaySongs {
         songs: Vec<Song>,
         index: u32,
+        mode: SongListMode,
     },
     PlayFromRow {
         context: RowContext,
@@ -455,6 +466,7 @@ pub enum Action {
     /// Play one exact row from the authoritative local queue.
     PlayQueueOccurrence(crate::player::OccurrenceId),
     ShufflePlay(MediaId),
+    SetPlaying(bool),
     TogglePlay,
     Next,
     Previous,

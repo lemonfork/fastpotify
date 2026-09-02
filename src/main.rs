@@ -254,10 +254,9 @@ fn main() -> eframe::Result<()> {
     log_panics(dirs.panic_log());
     let settings = settings::Settings::load(&dirs.settings_file());
 
-    // The application (audio engine, Navidrome client, MPRIS, tray) outlives any
-    // window. Closing to the tray destroys the window and this loop creates
-    // a new one when the tray or MPRIS asks for it. Plain window lifecycle,
-    // portable across desktops.
+    // The application (audio engine, Navidrome client, MPRIS, tray) outlives a
+    // visible window. Windows and Linux destroy and recreate it; macOS keeps
+    // the root window hidden so AppKit continues serving the status item.
     let waker = backend::Waker::default();
 
     // A second launch surfaces the instance already running instead of
@@ -353,6 +352,13 @@ fn main() -> eframe::Result<()> {
         )?;
         waker.detach();
 
+        #[cfg(target_os = "macos")]
+        let switch = {
+            let guard = slot.lock().unwrap_or_else(|p| p.into_inner());
+            let app = guard.as_ref().expect("application state present");
+            !app.quit_requested && app.switch_intent
+        };
+        #[cfg(not(target_os = "macos"))]
         let (switch, hide) = {
             let guard = slot.lock().unwrap_or_else(|p| p.into_inner());
             let app = guard.as_ref().expect("application state present");
@@ -365,38 +371,48 @@ fn main() -> eframe::Result<()> {
             // Straight back round: the other kind of window opens.
             continue;
         }
+        #[cfg(target_os = "macos")]
+        {
+            // Hiding to the tray leaves AppKit running inside the same
+            // window loop, so any return here is a real exit.
+            break;
+        }
+        #[cfg(not(target_os = "macos"))]
         if !hide {
             break;
         }
 
-        // Tray life: no window, but audio, MPRIS, the tray, and polling all
-        // keep running until Show or Quit.
-        let headless = egui::Context::default();
-        slot.lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .as_mut()
-            .expect("application state present")
-            .window_gone();
-        loop {
-            {
-                let mut guard = slot.lock().unwrap_or_else(|p| p.into_inner());
-                let app = guard.as_mut().expect("application state present");
-                app.background_frame(&headless);
-                if app.quit_requested || app.wants_show || app.switch_intent {
-                    break;
-                }
-            }
-            fastpotify::tray::idle(std::time::Duration::from_millis(150));
-        }
-        let quit = {
-            let guard = slot.lock().unwrap_or_else(|p| p.into_inner());
-            guard
-                .as_ref()
+        #[cfg(not(target_os = "macos"))]
+        {
+            // Windows and Linux keep their tray services alive while the
+            // window is gone.
+            let headless = egui::Context::default();
+            slot.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_mut()
                 .expect("application state present")
-                .quit_requested
-        };
-        if quit {
-            break;
+                .window_gone();
+            loop {
+                {
+                    let mut guard = slot.lock().unwrap_or_else(|p| p.into_inner());
+                    let app = guard.as_mut().expect("application state present");
+                    app.background_frame(&headless);
+                    if app.quit_requested || !app.window_hidden || app.switch_intent {
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
+            let quit = {
+                let guard = slot.lock().unwrap_or_else(|p| p.into_inner());
+                guard
+                    .as_ref()
+                    .expect("application state present")
+                    .quit_requested
+            };
+            if quit {
+                break;
+            }
         }
     }
 

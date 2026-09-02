@@ -21,6 +21,8 @@ use crate::api::{
 use crate::history::History;
 use crate::images::{ArtLoader, accent_color};
 use crate::paths::AppDirs;
+#[cfg(test)]
+use crate::player::PlaybackReducer;
 use crate::player::{
     CommandReceipt, Engine, EngineConfig, EngineEvent, Playback, PlaybackSnapshot, PlayerCommand,
 };
@@ -333,6 +335,8 @@ pub struct Backend {
     art: ArtLoader,
     activity: Arc<NetActivity>,
     engine: EngineSlot,
+    #[cfg(test)]
+    test_player: Option<(SessionEpoch, Mutex<PlaybackReducer>)>,
     next_request: AtomicU64,
     thread: Option<std::thread::JoinHandle<()>>,
     offline: bool,
@@ -398,6 +402,8 @@ impl Backend {
             art,
             activity,
             engine,
+            #[cfg(test)]
+            test_player: None,
             next_request: AtomicU64::new(1),
             thread: Some(thread),
             offline: false,
@@ -423,6 +429,19 @@ impl Backend {
     /// Reduces a player command immediately and returns the same authoritative
     /// snapshot that the event stream will publish.
     pub fn player(&self, command: PlayerCommand) -> BackendResult<PlayerReceipt> {
+        #[cfg(test)]
+        if let Some((epoch, reducer)) = &self.test_player {
+            let (command, snapshot) = reducer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .apply_for_test(command);
+            return Ok(PlayerReceipt {
+                epoch: *epoch,
+                command,
+                snapshot,
+            });
+        }
+
         let (epoch, engine) = self
             .engine
             .lock()
@@ -438,6 +457,11 @@ impl Backend {
             command: receipt,
             snapshot: engine.snapshot(),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_test_player(&mut self, epoch: SessionEpoch, initial_volume: u16) {
+        self.test_player = Some((epoch, Mutex::new(PlaybackReducer::new(initial_volume))));
     }
 
     pub fn api(&self, request: ApiRequest) -> RequestId {

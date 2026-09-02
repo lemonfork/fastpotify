@@ -39,6 +39,7 @@ const ART_EVICTION_INTERVAL: Duration = Duration::from_secs(20);
 const PLAYER_REPAINT_INTERVAL: Duration = Duration::from_millis(250);
 const DAILY_MIX_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 const ALBUM_PAGE_SIZE: u32 = 50;
+const RANDOM_MIX_REFILL_THRESHOLD: usize = 3;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct NowPlaying {
@@ -97,6 +98,7 @@ enum PlaylistBefore {
 enum RequestPurpose {
     Home,
     RandomMix,
+    RandomMixContinuation,
     LibraryAlbums(u32),
     LibraryArtists,
     Playlists,
@@ -128,6 +130,7 @@ enum RequestPurpose {
 enum RequestKey {
     Home,
     RandomMix,
+    RandomMixContinuation,
     LibraryAlbums,
     LibraryArtists,
     Playlists,
@@ -155,6 +158,7 @@ impl RequestPurpose {
         match self {
             Self::Home => RequestKey::Home,
             Self::RandomMix => RequestKey::RandomMix,
+            Self::RandomMixContinuation => RequestKey::RandomMixContinuation,
             Self::LibraryAlbums(_) => RequestKey::LibraryAlbums,
             Self::LibraryArtists => RequestKey::LibraryArtists,
             Self::Playlists => RequestKey::Playlists,
@@ -182,6 +186,12 @@ struct ResumeState {
     manual: Vec<Song>,
     requested: bool,
     applied: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct RandomMixPlayback {
+    last_refill_play_instance: Option<u64>,
+    pause_requested: bool,
 }
 
 pub struct App {
@@ -223,7 +233,6 @@ pub struct App {
 
     pub window_hidden: bool,
     pub hide_intent: bool,
-    pub wants_show: bool,
     pub switch_intent: bool,
     pub quit_requested: bool,
     pub offline: bool,
@@ -237,6 +246,7 @@ pub struct App {
     playback: PlaybackSnapshot,
     player_revision_floor: u64,
     playing_context: Option<MediaId>,
+    random_mix_playback: Option<RandomMixPlayback>,
     restored_preview: bool,
     pending_play: HashSet<MediaId>,
     volume_before_mute: Option<u8>,
@@ -429,7 +439,6 @@ impl App {
             winamp: crate::winamp::WinampState::new(session.winamp_pos, tap, eq),
             window_hidden: false,
             hide_intent: false,
-            wants_show: false,
             switch_intent: false,
             quit_requested: false,
             offline: options.offline,
@@ -442,6 +451,7 @@ impl App {
             playback,
             player_revision_floor: 0,
             playing_context: None,
+            random_mix_playback: None,
             restored_preview: false,
             pending_play: HashSet::new(),
             volume_before_mute: None,
@@ -495,8 +505,8 @@ impl App {
         self.winamp.forget_textures();
         self.window_hidden = false;
         self.hide_intent = false;
-        self.wants_show = false;
         self.switch_intent = false;
+        #[cfg(target_os = "macos")]
         if let Some(tray) = &mut self.tray {
             tray.attach();
         }
@@ -530,11 +540,37 @@ impl App {
     pub fn window_gone(&mut self) {
         self.winamp.remember_position();
         self.winamp.forget_textures();
-        self.window_hidden = true;
         self.hide_intent = false;
-        self.wants_show = false;
-        if let Some(tray) = &mut self.tray {
-            tray.hidden();
+    }
+
+    fn show_window(&mut self, ctx: &egui::Context) {
+        self.window_hidden = false;
+        #[cfg(target_os = "macos")]
+        {
+            // Keep AppKit's event loop alive while the window is hidden. The
+            // status item depends on that loop to receive clicks.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    fn hide_window(&mut self, ctx: &egui::Context, close_requested: bool) {
+        self.window_hidden = true;
+        #[cfg(target_os = "macos")]
+        {
+            if close_requested {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            }
+            self.save_state();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.hide_intent = true;
+            if !close_requested {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
         }
     }
 
@@ -1227,13 +1263,16 @@ impl App {
         context: Option<MediaId>,
         position_ms: u32,
         play: bool,
-    ) {
+    ) -> bool {
         if songs.is_empty() {
-            return;
+            return false;
         }
+        self.random_mix_playback = None;
+        self.latest_generations
+            .remove(&RequestKey::RandomMixContinuation);
         self.playing_context = context;
         self.restored_preview = !play;
-        self.player(PlayerCommand::LoadContext(LoadContext {
+        let accepted = self.player(PlayerCommand::LoadContext(LoadContext {
             songs,
             start_index: start,
             position_ms,
@@ -1241,9 +1280,95 @@ impl App {
         }));
         self.pending_play.clear();
         self.note_session_change();
+        accepted
     }
 
-    fn player(&mut self, command: PlayerCommand) {
+    fn load_song_list(&mut self, songs: Vec<Song>, start: usize, mode: SongListMode) {
+        if self.load_context(songs, start, None, 0, true) && mode == SongListMode::RandomMix {
+            self.random_mix_playback = Some(RandomMixPlayback::default());
+            self.maybe_refill_random_mix();
+        }
+    }
+
+    fn maybe_refill_random_mix(&mut self) {
+        let Some(state) = self.random_mix_playback else {
+            return;
+        };
+        if self.offline
+            || !self.is_connected()
+            || self
+                .latest_generations
+                .contains_key(&RequestKey::RandomMixContinuation)
+            || state.pause_requested
+            || (self.playback.playback() == Playback::Stopped && self.playback.current.is_some())
+            || self.playback.queue.context.len() > RANDOM_MIX_REFILL_THRESHOLD
+            || state.last_refill_play_instance == Some(self.playback.play_instance_id)
+        {
+            return;
+        }
+
+        let play_instance = self.playback.play_instance_id;
+        let Some(state) = &mut self.random_mix_playback else {
+            return;
+        };
+        state.last_refill_play_instance = Some(play_instance);
+        let generation = self.next_generation();
+        self.request(
+            ApiRequest::RandomSongs {
+                request: RandomSongsRequest {
+                    size: crate::mixes::MIX_SIZE as u32,
+                    ..RandomSongsRequest::default()
+                },
+                generation,
+            },
+            RequestPurpose::RandomMixContinuation,
+        );
+    }
+
+    fn finish_random_mix_continuation(&mut self, songs: Vec<Song>) {
+        let Some(state) = self.random_mix_playback else {
+            return;
+        };
+
+        if songs.is_empty() {
+            // Playback may have advanced while this request was in flight.
+            // Re-check once against that newer play instance; the recorded
+            // instance prevents an empty response from spinning requests.
+            self.maybe_refill_random_mix();
+            return;
+        }
+        self.seed_songs_preserving_saved(&songs);
+        let appended = self.player(PlayerCommand::AppendContext(songs));
+        // The player can exhaust the old context after the API event was
+        // queued but before this append reaches its authoritative reducer.
+        // Decide from the append receipt, not the App's earlier snapshot.
+        if appended
+            && !state.pause_requested
+            && self.playback.current.is_none()
+            && self.playback.playback() == Playback::Stopped
+            && !self.playback.queue.context.is_empty()
+        {
+            self.player(PlayerCommand::Play);
+        }
+    }
+
+    fn player(&mut self, command: PlayerCommand) -> bool {
+        let play_intent = match &command {
+            PlayerCommand::Play
+            | PlayerCommand::Next
+            | PlayerCommand::Previous
+            | PlayerCommand::SkipTo(_) => Some(true),
+            PlayerCommand::Pause => Some(false),
+            PlayerCommand::Toggle => Some(!self.believed_playing()),
+            _ => None,
+        };
+        if let (Some(should_play), Some(state)) = (play_intent, &mut self.random_mix_playback) {
+            if should_play && state.pause_requested {
+                state.last_refill_play_instance = None;
+            }
+            state.pause_requested = !should_play;
+        }
+        let mut accepted = false;
         match self.backend.player(command) {
             Ok(receipt) if receipt.epoch == self.active_epoch => {
                 self.player_revision_floor =
@@ -1251,10 +1376,15 @@ impl App {
                 self.playback = receipt.snapshot;
                 self.settings.volume = self.playback.volume;
                 self.settings_dirty = true;
+                accepted = true;
             }
             Ok(_) => {}
             Err(error) => self.toast_error(error.to_string()),
         }
+        if accepted {
+            self.maybe_refill_random_mix();
+        }
+        accepted
     }
 
     #[cfg(any(test, feature = "demo"))]
@@ -1279,6 +1409,7 @@ impl App {
         self.settings.volume = snapshot.volume;
         self.playback = snapshot;
         self.playing_context = playing_context;
+        self.random_mix_playback = None;
         self.restored_preview = self.playback.position.playback == Playback::Paused;
         self.pending_play.clear();
     }
@@ -1762,9 +1893,9 @@ impl App {
                 offset_index,
             } => self.play_context(context, offset, offset_index, false),
             Action::ShufflePlay(context) => self.play_context(context, None, None, true),
-            Action::PlaySongs { songs, index } => {
+            Action::PlaySongs { songs, index, mode } => {
                 if !songs.is_empty() && songs.iter().all(|song| self.accepts_media(&song.id)) {
-                    self.load_context(songs, index as usize, None, 0, true);
+                    self.load_song_list(songs, index as usize, mode);
                 }
             }
             Action::PlayFromRow {
@@ -1775,19 +1906,38 @@ impl App {
                 RowContext::Context { context, .. } => {
                     self.play_context(context, Some(song.id), Some(index), false)
                 }
-                RowContext::Songs(songs) => self.load_context(songs, index as usize, None, 0, true),
-                RowContext::Queue(occurrence) => self.player(PlayerCommand::SkipTo(occurrence)),
+                RowContext::Songs { songs, mode } => {
+                    self.load_song_list(songs, index as usize, mode)
+                }
+                RowContext::Queue(occurrence) => {
+                    self.player(PlayerCommand::SkipTo(occurrence));
+                }
                 RowContext::View { songs, context } => {
-                    self.load_context(songs, index as usize, Some(context), 0, true)
+                    self.load_context(songs, index as usize, Some(context), 0, true);
                 }
             },
             Action::PlayQueueOccurrence(occurrence) => {
-                self.player(PlayerCommand::SkipTo(occurrence))
+                self.player(PlayerCommand::SkipTo(occurrence));
             }
-            Action::TogglePlay => self.player(PlayerCommand::Toggle),
-            Action::Next => self.player(PlayerCommand::Next),
-            Action::Previous => self.player(PlayerCommand::Previous),
-            Action::Seek(position) => self.player(PlayerCommand::Seek(position)),
+            Action::SetPlaying(playing) => {
+                self.player(if playing {
+                    PlayerCommand::Play
+                } else {
+                    PlayerCommand::Pause
+                });
+            }
+            Action::TogglePlay => {
+                self.player(PlayerCommand::Toggle);
+            }
+            Action::Next => {
+                self.player(PlayerCommand::Next);
+            }
+            Action::Previous => {
+                self.player(PlayerCommand::Previous);
+            }
+            Action::Seek(position) => {
+                self.player(PlayerCommand::Seek(position));
+            }
             Action::SeekBy(delta) => {
                 let position = i64::from(self.playback.position_now())
                     .saturating_add(delta)
@@ -1818,10 +1968,18 @@ impl App {
                     self.player(PlayerCommand::Volume(0));
                 }
             }
-            Action::ToggleShuffle => self.player(PlayerCommand::Shuffle(!self.playback.shuffle)),
-            Action::CycleRepeat => self.player(PlayerCommand::Repeat(self.playback.repeat.next())),
-            Action::SetShuffle(shuffle) => self.player(PlayerCommand::Shuffle(shuffle)),
-            Action::SetRepeat(repeat) => self.player(PlayerCommand::Repeat(repeat)),
+            Action::ToggleShuffle => {
+                self.player(PlayerCommand::Shuffle(!self.playback.shuffle));
+            }
+            Action::CycleRepeat => {
+                self.player(PlayerCommand::Repeat(self.playback.repeat.next()));
+            }
+            Action::SetShuffle(shuffle) => {
+                self.player(PlayerCommand::Shuffle(shuffle));
+            }
+            Action::SetRepeat(repeat) => {
+                self.player(PlayerCommand::Repeat(repeat));
+            }
             Action::AddToQueue { song, label } => {
                 if self.accepts_media(&song.id) {
                     self.player(PlayerCommand::AddManual(Box::new(song)));
@@ -1839,7 +1997,9 @@ impl App {
                     self.toast(format!("Added {count} songs to Next up"));
                 }
             }
-            Action::ClearQueue => self.player(PlayerCommand::ClearManual),
+            Action::ClearQueue => {
+                self.player(PlayerCommand::ClearManual);
+            }
             Action::ToggleFavorite(media) => {
                 let favorite = !self.saved.get(&media).copied().unwrap_or(false);
                 self.set_favorite(media, favorite);
@@ -2208,16 +2368,8 @@ impl App {
                 Arc::clone(&self.winamp.tap),
                 Arc::clone(&self.winamp.eq),
             ))),
-            Action::ShowWindow => {
-                self.wants_show = true;
-                self.window_hidden = false;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            }
-            Action::HideWindow => {
-                self.hide_intent = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
+            Action::ShowWindow => self.show_window(ctx),
+            Action::HideWindow => self.hide_window(ctx, false),
             Action::ClearArtCache => match self.backend.art().clear_disk_cache() {
                 Ok(bytes) => self.toast(format!("Cleared {} MiB of artwork", bytes / 1_048_576)),
                 Err(error) => self.toast_error(format!("Couldn't clear artwork: {error}")),
@@ -2322,11 +2474,11 @@ impl App {
             }
             Action::CloseWindow => {
                 if self.hides_to_tray() {
-                    self.hide_intent = true;
+                    self.hide_window(ctx, false);
                 } else {
                     self.quit_requested = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             Action::ToggleWinampShade => {
                 self.settings.winamp_shaded = !self.settings.winamp_shaded;
@@ -2366,9 +2518,9 @@ impl App {
             let playing = self.believed_playing();
             let action = match command {
                 ControlCommand::Show => Some(Action::ShowWindow),
-                ControlCommand::PlayPause => Some(Action::TogglePlay),
-                ControlCommand::Play => (!playing).then_some(Action::TogglePlay),
-                ControlCommand::Pause => playing.then_some(Action::TogglePlay),
+                ControlCommand::PlayPause => Some(Action::SetPlaying(!playing)),
+                ControlCommand::Play => Some(Action::SetPlaying(true)),
+                ControlCommand::Pause => Some(Action::SetPlaying(false)),
                 ControlCommand::Next => Some(Action::Next),
                 ControlCommand::Previous => Some(Action::Previous),
                 ControlCommand::SeekBy(offset) => Some(Action::SeekBy(offset)),
@@ -2402,9 +2554,9 @@ impl App {
         for command in commands {
             let playing = self.believed_playing();
             let action = match command {
-                MediaCommand::Play => (!playing).then_some(Action::TogglePlay),
-                MediaCommand::Pause | MediaCommand::Stop => playing.then_some(Action::TogglePlay),
-                MediaCommand::PlayPause => Some(Action::TogglePlay),
+                MediaCommand::Play => Some(Action::SetPlaying(true)),
+                MediaCommand::Pause | MediaCommand::Stop => Some(Action::SetPlaying(false)),
+                MediaCommand::PlayPause => Some(Action::SetPlaying(!playing)),
                 MediaCommand::Next => Some(Action::Next),
                 MediaCommand::Previous => Some(Action::Previous),
                 MediaCommand::SeekBy(offset) => Some(Action::SeekBy(offset)),
@@ -2678,6 +2830,13 @@ impl App {
         self.apply_actions(ctx);
         self.sync_media_controls();
         self.sync_window_title(ctx);
+        if ctx.input(|input| input.viewport().close_requested())
+            && !self.quit_requested
+            && !self.switch_intent
+            && self.hides_to_tray()
+        {
+            self.hide_window(ctx, true);
+        }
         if self.believed_playing() {
             ctx.request_repaint_after(PLAYER_REPAINT_INTERVAL);
         }
@@ -2711,13 +2870,6 @@ impl App {
         }
         if !self.toasts.is_empty() || self.any_play_pending() {
             ctx.request_repaint_after(Duration::from_millis(120));
-        }
-        if ctx.input(|input| input.viewport().close_requested())
-            && !self.quit_requested
-            && !self.switch_intent
-            && self.hides_to_tray()
-        {
-            self.hide_intent = true;
         }
     }
 
@@ -2986,6 +3138,7 @@ impl App {
         self.pending_playlist_ops = 0;
         self.latest_generations.clear();
         self.playing_context = None;
+        self.random_mix_playback = None;
         self.playback = PlaybackSnapshot {
             volume: self.settings.volume,
             ..PlaybackSnapshot::default()
@@ -3026,6 +3179,7 @@ impl App {
             self.toast_error(error);
         }
         self.note_session_change();
+        self.maybe_refill_random_mix();
     }
 
     fn handle_api(&mut self, response: ApiResponse) {
@@ -3194,6 +3348,9 @@ impl App {
                 self.home.random_refreshing = false;
                 self.refresh_daily_mix_if_needed();
             }
+            (RequestPurpose::RandomMixContinuation, ApiPayload::RandomSongs(songs)) => {
+                self.finish_random_mix_continuation(songs)
+            }
             _ => {}
         }
     }
@@ -3211,6 +3368,15 @@ impl App {
                     self.home.random_songs = Loadable::Failed(message.clone());
                 }
                 self.refresh_daily_mix_if_needed();
+            }
+            RequestPurpose::RandomMixContinuation => {
+                if self.random_mix_playback.is_none() {
+                    return;
+                }
+                // A request can fail after one or more tracks have advanced.
+                // Give the latest play instance its own attempt without
+                // retrying repeatedly on an unchanged snapshot.
+                self.maybe_refill_random_mix();
             }
             RequestPurpose::LibraryAlbums(_) => self.library.albums.fail(message.clone()),
             RequestPurpose::LibraryArtists => self.library.artists.fail(message.clone()),
@@ -3660,6 +3826,16 @@ mod tests {
             },
             ..User::default()
         });
+    }
+
+    fn connect_for_background_requests(app: &mut App) {
+        app.demo_connect(crate::api::VerifiedServer {
+            profile: profile(),
+            ..crate::api::VerifiedServer::default()
+        });
+        // The harness keeps the backend itself offline, so requests remain
+        // deterministic while the App exercises its connected behavior.
+        app.offline = false;
     }
 
     fn home(name: &str) -> HomeResponse {
@@ -4226,6 +4402,440 @@ mod tests {
     }
 
     #[test]
+    fn random_mix_refill_starts_once_when_three_context_songs_remain() {
+        let mut harness = harness();
+        connect_for_background_requests(&mut harness.app);
+        harness.app.demo_set_playback(
+            crate::player::demo_snapshot(crate::player::DemoPlayback {
+                current: Some(song("playing")),
+                manual: (0..8)
+                    .map(|index| song(&format!("manual-{index}")))
+                    .collect(),
+                context: vec![song("next-1"), song("next-2"), song("next-3")],
+                position_ms: 12_345,
+                playback: Playback::Playing,
+                volume: harness.app.settings.volume,
+                shuffle: false,
+                repeat: RepeatMode::Off,
+            }),
+            None,
+        );
+        harness.app.random_mix_playback = Some(RandomMixPlayback::default());
+
+        harness.app.maybe_refill_random_mix();
+        harness.app.maybe_refill_random_mix();
+
+        assert_eq!(
+            harness
+                .app
+                .requests
+                .values()
+                .filter(|purpose| matches!(purpose, RequestPurpose::RandomMixContinuation))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn random_mix_refill_waits_for_the_threshold_and_an_active_random_session() {
+        let mut harness = harness();
+        connect_for_background_requests(&mut harness.app);
+        harness.app.demo_set_playback(
+            crate::player::demo_snapshot(crate::player::DemoPlayback {
+                current: Some(song("playing")),
+                manual: Vec::new(),
+                context: vec![song("one"), song("two"), song("three"), song("four")],
+                position_ms: 0,
+                playback: Playback::Playing,
+                volume: harness.app.settings.volume,
+                shuffle: false,
+                repeat: RepeatMode::Off,
+            }),
+            None,
+        );
+
+        harness.app.maybe_refill_random_mix();
+        assert!(harness.app.requests.is_empty());
+
+        harness.app.random_mix_playback = Some(RandomMixPlayback::default());
+        harness.app.maybe_refill_random_mix();
+        assert!(harness.app.requests.is_empty());
+    }
+
+    #[test]
+    fn failed_random_mix_refill_retries_only_after_playback_advances() {
+        let mut harness = harness();
+        connect_for_background_requests(&mut harness.app);
+        harness.app.demo_set_playback(
+            crate::player::demo_snapshot(crate::player::DemoPlayback {
+                current: Some(song("playing")),
+                manual: Vec::new(),
+                context: vec![song("one"), song("two"), song("three")],
+                position_ms: 0,
+                playback: Playback::Playing,
+                volume: harness.app.settings.volume,
+                shuffle: false,
+                repeat: RepeatMode::Off,
+            }),
+            None,
+        );
+        harness.app.random_mix_playback = Some(RandomMixPlayback::default());
+        harness.app.maybe_refill_random_mix();
+        let request_id = harness
+            .app
+            .requests
+            .iter()
+            .find_map(|(id, purpose)| {
+                matches!(purpose, RequestPurpose::RandomMixContinuation).then_some(*id)
+            })
+            .unwrap();
+        let generation = harness.app.latest_generations[&RequestKey::RandomMixContinuation];
+
+        harness.app.handle_api(ApiResponse {
+            epoch: harness.app.active_epoch,
+            request_id,
+            generation,
+            result: Err(crate::backend::BackendError::Network),
+        });
+        harness.app.maybe_refill_random_mix();
+        assert!(harness.app.requests.is_empty());
+
+        harness.app.playback.play_instance_id =
+            harness.app.playback.play_instance_id.saturating_add(1);
+        harness.app.maybe_refill_random_mix();
+        assert_eq!(
+            harness
+                .app
+                .requests
+                .values()
+                .filter(|purpose| matches!(purpose, RequestPurpose::RandomMixContinuation))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn failed_random_mix_refill_observes_progress_made_while_in_flight() {
+        let mut harness = harness();
+        connect_for_background_requests(&mut harness.app);
+        harness.app.demo_set_playback(
+            crate::player::demo_snapshot(crate::player::DemoPlayback {
+                current: Some(song("playing")),
+                manual: Vec::new(),
+                context: vec![song("one"), song("two"), song("three")],
+                position_ms: 0,
+                playback: Playback::Playing,
+                volume: harness.app.settings.volume,
+                shuffle: false,
+                repeat: RepeatMode::Off,
+            }),
+            None,
+        );
+        harness.app.random_mix_playback = Some(RandomMixPlayback::default());
+        harness.app.maybe_refill_random_mix();
+        let request_id = harness
+            .app
+            .requests
+            .iter()
+            .find_map(|(id, purpose)| {
+                matches!(purpose, RequestPurpose::RandomMixContinuation).then_some(*id)
+            })
+            .unwrap();
+        let generation = harness.app.latest_generations[&RequestKey::RandomMixContinuation];
+        harness.app.playback.play_instance_id =
+            harness.app.playback.play_instance_id.saturating_add(1);
+        harness.app.playback.queue.context.remove(0);
+
+        harness.app.handle_api(ApiResponse {
+            epoch: harness.app.active_epoch,
+            request_id,
+            generation,
+            result: Err(crate::backend::BackendError::Network),
+        });
+
+        assert!(
+            harness
+                .app
+                .latest_generations
+                .contains_key(&RequestKey::RandomMixContinuation)
+        );
+        assert_eq!(
+            harness
+                .app
+                .requests
+                .values()
+                .filter(|purpose| matches!(purpose, RequestPurpose::RandomMixContinuation))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn empty_random_mix_refill_retries_once_after_the_context_exhausts() {
+        let mut harness = harness();
+        connect_for_background_requests(&mut harness.app);
+        harness.app.demo_set_playback(
+            crate::player::demo_snapshot(crate::player::DemoPlayback {
+                current: Some(song("playing")),
+                manual: Vec::new(),
+                context: vec![song("one"), song("two"), song("three")],
+                position_ms: 0,
+                playback: Playback::Playing,
+                volume: harness.app.settings.volume,
+                shuffle: false,
+                repeat: RepeatMode::Off,
+            }),
+            None,
+        );
+        harness.app.random_mix_playback = Some(RandomMixPlayback::default());
+        harness.app.maybe_refill_random_mix();
+        let request_id = harness
+            .app
+            .requests
+            .iter()
+            .find_map(|(id, purpose)| {
+                matches!(purpose, RequestPurpose::RandomMixContinuation).then_some(*id)
+            })
+            .unwrap();
+        let generation = harness.app.latest_generations[&RequestKey::RandomMixContinuation];
+        harness.app.playback.current = None;
+        harness.app.playback.queue.context.clear();
+        harness.app.playback.position.playback = Playback::Stopped;
+        harness.app.playback.position.observed_at = None;
+        harness.app.playback.play_instance_id =
+            harness.app.playback.play_instance_id.saturating_add(1);
+
+        harness.app.handle_api(ApiResponse {
+            epoch: harness.app.active_epoch,
+            request_id,
+            generation,
+            result: Ok(ApiPayload::RandomSongs(Vec::new())),
+        });
+
+        assert!(
+            harness
+                .app
+                .latest_generations
+                .contains_key(&RequestKey::RandomMixContinuation)
+        );
+        assert_eq!(harness.app.requests.len(), 1);
+    }
+
+    #[test]
+    fn random_mix_continuation_resumes_when_backend_exhausts_ahead_of_app() {
+        let mut harness = harness();
+        harness.app.active_profile = Some(profile());
+        harness
+            .app
+            .backend
+            .install_test_player(harness.app.active_epoch, harness.app.settings.volume);
+        harness.app.player(PlayerCommand::LoadContext(LoadContext {
+            songs: vec![song("last")],
+            start_index: 0,
+            position_ms: 0,
+            play: true,
+        }));
+        harness.app.random_mix_playback = Some(RandomMixPlayback::default());
+        let stale_app_snapshot = harness.app.playback.clone();
+
+        let exhausted = harness
+            .app
+            .backend
+            .player(PlayerCommand::Next)
+            .unwrap()
+            .snapshot;
+        assert!(exhausted.current.is_none());
+        assert_eq!(exhausted.playback(), Playback::Stopped);
+        assert_eq!(harness.app.playback, stale_app_snapshot);
+        assert_eq!(
+            harness
+                .app
+                .playback
+                .current_song()
+                .map(|song| song.name.as_str()),
+            Some("last")
+        );
+
+        harness
+            .app
+            .finish_random_mix_continuation(vec![song("appended-first"), song("appended-next")]);
+
+        assert_eq!(
+            harness
+                .app
+                .playback
+                .current_song()
+                .map(|song| song.name.as_str()),
+            Some("appended-first")
+        );
+        assert_eq!(harness.app.playback.playback(), Playback::Loading);
+    }
+
+    #[test]
+    fn stopped_random_mix_does_not_start_a_background_refill() {
+        let mut harness = harness();
+        connect_for_background_requests(&mut harness.app);
+        harness.app.demo_set_playback(
+            crate::player::demo_snapshot(crate::player::DemoPlayback {
+                current: Some(song("stopped")),
+                manual: Vec::new(),
+                context: vec![song("one"), song("two"), song("three")],
+                position_ms: 0,
+                playback: Playback::Stopped,
+                volume: harness.app.settings.volume,
+                shuffle: false,
+                repeat: RepeatMode::Off,
+            }),
+            None,
+        );
+        harness.app.random_mix_playback = Some(RandomMixPlayback::default());
+
+        harness.app.maybe_refill_random_mix();
+
+        assert!(harness.app.requests.is_empty());
+    }
+
+    #[test]
+    fn explicit_pause_in_a_refill_gap_prevents_resume_until_play_is_requested() {
+        let mut harness = harness();
+        connect_for_background_requests(&mut harness.app);
+        harness.app.demo_set_playback(
+            crate::player::demo_snapshot(crate::player::DemoPlayback {
+                current: None,
+                manual: Vec::new(),
+                context: Vec::new(),
+                position_ms: 0,
+                playback: Playback::Stopped,
+                volume: harness.app.settings.volume,
+                shuffle: false,
+                repeat: RepeatMode::Off,
+            }),
+            None,
+        );
+        harness.app.random_mix_playback = Some(RandomMixPlayback::default());
+
+        harness
+            .app
+            .apply(Action::SetPlaying(false), &egui::Context::default());
+        harness.app.maybe_refill_random_mix();
+        assert!(harness.app.requests.is_empty());
+
+        harness
+            .app
+            .apply(Action::SetPlaying(true), &egui::Context::default());
+        harness.app.maybe_refill_random_mix();
+        assert_eq!(harness.app.requests.len(), 1);
+    }
+
+    #[test]
+    fn external_pause_keeps_its_intent_if_a_player_event_arrives_before_apply() {
+        let mut harness = harness();
+        harness.app.demo_set_playback(
+            crate::player::demo_snapshot(crate::player::DemoPlayback {
+                current: Some(song("playing")),
+                manual: Vec::new(),
+                context: Vec::new(),
+                position_ms: 0,
+                playback: Playback::Playing,
+                volume: harness.app.settings.volume,
+                shuffle: false,
+                repeat: RepeatMode::Off,
+            }),
+            None,
+        );
+        harness.app.control_commands =
+            Some(Arc::new(std::sync::Mutex::new(vec![ControlCommand::Pause])));
+
+        harness.app.handle_control_commands();
+
+        assert!(matches!(
+            harness.app.actions.as_slice(),
+            [Action::SetPlaying(false)]
+        ));
+    }
+
+    #[test]
+    fn finite_song_list_invalidates_a_pending_random_mix_refill() {
+        let mut harness = harness();
+        connect_for_background_requests(&mut harness.app);
+        harness
+            .app
+            .backend
+            .install_test_player(harness.app.active_epoch, harness.app.settings.volume);
+        harness
+            .app
+            .load_song_list(vec![song("random")], 0, SongListMode::RandomMix);
+        let request_id = harness
+            .app
+            .requests
+            .iter()
+            .find_map(|(id, purpose)| {
+                matches!(purpose, RequestPurpose::RandomMixContinuation).then_some(*id)
+            })
+            .unwrap();
+        let generation = harness.app.latest_generations[&RequestKey::RandomMixContinuation];
+        harness
+            .app
+            .load_song_list(vec![song("finite")], 0, SongListMode::Finite);
+
+        harness.app.handle_api(ApiResponse {
+            epoch: harness.app.active_epoch,
+            request_id,
+            generation,
+            result: Ok(ApiPayload::RandomSongs(vec![song("must-not-append")])),
+        });
+
+        assert_eq!(
+            harness
+                .app
+                .playback
+                .current_song()
+                .map(|song| song.name.as_str()),
+            Some("finite")
+        );
+        assert!(harness.app.playback.queue.context.is_empty());
+        assert!(harness.app.random_mix_playback.is_none());
+        assert!(harness.app.toasts.is_empty());
+    }
+
+    #[test]
+    fn random_mix_page_refresh_and_playback_refill_use_independent_requests() {
+        let mut harness = harness();
+        connect_for_background_requests(&mut harness.app);
+        harness.app.demo_set_playback(
+            crate::player::demo_snapshot(crate::player::DemoPlayback {
+                current: Some(song("playing")),
+                manual: Vec::new(),
+                context: vec![song("one"), song("two"), song("three")],
+                position_ms: 0,
+                playback: Playback::Playing,
+                volume: harness.app.settings.volume,
+                shuffle: false,
+                repeat: RepeatMode::Off,
+            }),
+            None,
+        );
+        harness.app.random_mix_playback = Some(RandomMixPlayback::default());
+        harness.app.maybe_refill_random_mix();
+        harness.app.home.random_songs = Loadable::Loaded(vec![song("visible")]);
+        harness.app.load_random_mix(true);
+
+        assert!(
+            harness
+                .app
+                .latest_generations
+                .contains_key(&RequestKey::RandomMixContinuation)
+        );
+        assert!(
+            harness
+                .app
+                .latest_generations
+                .contains_key(&RequestKey::RandomMix)
+        );
+        assert_eq!(harness.app.requests.len(), 2);
+    }
+
+    #[test]
     fn random_mix_refresh_preserves_playback_and_current_favorite_state() {
         let mut harness = harness();
         harness.app.demo_set_playback(
@@ -4392,6 +5002,85 @@ mod tests {
 
         assert!(!harness.app.settings.winamp_window);
         assert!(harness.app.switch_intent);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn show_during_window_teardown_preserves_the_recreate_intent() {
+        let mut harness = harness();
+        let ctx = egui::Context::default();
+
+        let hidden = ctx.run_logic(&egui::RawInput::default(), |ctx| {
+            harness.app.hide_window(ctx, false);
+        });
+        assert!(
+            hidden.viewport_commands[&egui::ViewportId::ROOT]
+                .contains(&egui::ViewportCommand::Close)
+        );
+        assert!(harness.app.window_hidden);
+        assert!(harness.app.hide_intent);
+
+        ctx.run_logic(&egui::RawInput::default(), |ctx| {
+            harness.app.show_window(ctx);
+        });
+        assert!(!harness.app.window_hidden);
+        assert!(harness.app.hide_intent);
+
+        harness.app.window_gone();
+        assert!(!harness.app.window_hidden);
+        assert!(!harness.app.hide_intent);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn close_request_hides_window_without_requeueing_close() {
+        let mut harness = harness();
+        let ctx = egui::Context::default();
+
+        let hidden = ctx.run_logic(&egui::RawInput::default(), |ctx| {
+            harness.app.hide_window(ctx, true);
+        });
+        assert!(
+            !hidden.viewport_commands[&egui::ViewportId::ROOT]
+                .contains(&egui::ViewportCommand::Close)
+        );
+        assert!(harness.app.window_hidden);
+        assert!(harness.app.hide_intent);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn close_to_tray_keeps_event_loop_alive_and_tray_show_restores_window() {
+        let mut harness = harness();
+        harness.app.tray = TrayService::spawn(|| {});
+        harness.app.settings.keep_playing_in_background = true;
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .events
+            .push(egui::ViewportEvent::Close);
+
+        let hidden = ctx.run_logic(&input, |ctx| {
+            harness.app.background_frame(ctx);
+        });
+        let hide_commands = &hidden.viewport_commands[&egui::ViewportId::ROOT];
+        assert!(hide_commands.contains(&egui::ViewportCommand::CancelClose));
+        assert!(hide_commands.contains(&egui::ViewportCommand::Visible(false)));
+        assert!(!hide_commands.contains(&egui::ViewportCommand::Close));
+        assert!(harness.app.window_hidden);
+
+        harness.app.handle_tray_command(TrayCommand::Show);
+        let shown = ctx.run_logic(&egui::RawInput::default(), |ctx| {
+            harness.app.background_frame(ctx);
+        });
+        let show_commands = &shown.viewport_commands[&egui::ViewportId::ROOT];
+        assert!(show_commands.contains(&egui::ViewportCommand::Visible(true)));
+        assert!(show_commands.contains(&egui::ViewportCommand::Minimized(false)));
+        assert!(show_commands.contains(&egui::ViewportCommand::Focus));
+        assert!(!harness.app.window_hidden);
     }
 
     #[test]

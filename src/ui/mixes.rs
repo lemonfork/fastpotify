@@ -2,7 +2,7 @@
 
 use crate::api::models::{PlayableItem, Song};
 use crate::app::App;
-use crate::model::{Action, Loadable, Page, RowContext};
+use crate::model::{Action, Loadable, Page, RowContext, SongListMode};
 use crate::theme::{self, Icon};
 use crate::util;
 
@@ -36,6 +36,13 @@ impl MixKind {
                 "Made for today from your listening history, favorites, artists, and genres."
             }
             Self::Random => "A fresh selection from your Navidrome server.",
+        }
+    }
+
+    fn song_list_mode(self) -> SongListMode {
+        match self {
+            Self::Daily => SongListMode::Finite,
+            Self::Random => SongListMode::RandomMix,
         }
     }
 }
@@ -150,7 +157,10 @@ fn loaded(
         ui,
         Table {
             items: &items,
-            context: RowContext::Songs(visible_songs),
+            context: RowContext::Songs {
+                songs: visible_songs,
+                mode: kind.song_list_mode(),
+            },
             show_album: true,
             show_cover: true,
             show_added: false,
@@ -221,6 +231,7 @@ fn actions(
         Actions {
             play_context: None,
             view: Some(songs),
+            view_mode: kind.song_list_mode(),
             saved: None,
             saved_icons: (Icon::Heart, Icon::HeartFilled),
             saved_tooltips: ("", ""),

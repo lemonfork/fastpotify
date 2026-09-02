@@ -4,7 +4,7 @@ use egui::{Align, CornerRadius, Layout, Rect, Sense, Vec2, pos2, vec2};
 
 use crate::api::models::{Artist, MediaId, PlayableItem, SearchResults, Song, pick_image};
 use crate::app::App;
-use crate::model::{Action, Loadable, Page, RowContext, SearchFilter};
+use crate::model::{Action, Loadable, Page, RowContext, SearchFilter, SongListMode};
 use crate::theme::{self, Icon};
 
 use super::widgets::{self, TrackRow};
@@ -268,6 +268,7 @@ fn top_result(
                     PlayTarget::Song(song) => app.actions.push(Action::PlaySongs {
                         songs: vec![*song],
                         index: 0,
+                        mode: SongListMode::Finite,
                     }),
                     PlayTarget::Context(context) => app.actions.push(Action::PlayContext {
                         context,
@@ -297,7 +298,10 @@ fn songs(app: &mut App, ui: &mut egui::Ui, results: &SearchResults, limit: usize
     }
     theme::section_title(ui, &palette, "Songs");
     ui.add_space(4.0);
-    let context = RowContext::Songs(page.items.clone());
+    let context = RowContext::Songs {
+        songs: page.items.clone(),
+        mode: SongListMode::Finite,
+    };
     let items: Vec<PlayableItem> = page
         .items
         .iter()

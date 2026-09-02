@@ -36,6 +36,16 @@ OpenSubsonic `getRandomSongs`. The Refresh button on that page requests a new
 set without reloading the Daily mix or other Home sections. Refreshing only
 changes the Random mix page; a mix already playing keeps its existing queue.
 
+After you explicitly start playback from the Random mix page, Fastpotify asks
+the server for another batch whenever only three songs from that mix remain in
+**Next up**. Manually queued songs do not count toward that threshold and still
+play first. Each returned batch is appended after the existing mix, without
+changing the current song or manual queue. Only one continuation request runs
+at a time, and later batches are requested the same way while the server keeps
+returning songs. This continuation is separate from the page's Refresh button:
+background continuation does not change the page's visible set, and Refresh
+does not replace the playing context.
+
 ## Queue
 
 The queue belongs to the local player, not a remote device. Manually queued

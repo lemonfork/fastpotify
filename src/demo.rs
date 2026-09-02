@@ -1207,8 +1207,9 @@ mod tests {
         click_mix(&ctx, &mut app, Page::DailyMix, play);
 
         match app.actions.as_slice() {
-            [Action::PlaySongs { songs, index }] => {
+            [Action::PlaySongs { songs, index, mode }] => {
                 assert_eq!(*index, 0);
+                assert_eq!(*mode, SongListMode::Finite);
                 assert_eq!(songs.len(), crate::mixes::MIX_SIZE);
                 assert_eq!(
                     songs.iter().map(|song| &song.id).collect::<Vec<_>>(),
@@ -1219,6 +1220,82 @@ mod tests {
                 );
             }
             actions => panic!("Daily mix Play emitted unexpected actions: {actions:?}"),
+        }
+        finish(app, root);
+    }
+
+    #[test]
+    fn random_mix_page_play_marks_the_song_list_for_refill() {
+        let (ctx, mut app, root) = make_app("random-mix-play-mode");
+        let source: Vec<_> = (0..crate::mixes::MIX_SIZE).map(song).collect();
+        app.home.random_songs = Loadable::Loaded(source.clone());
+        app.actions.clear();
+
+        let (_, buttons) = mix_output(&ctx, &mut app, Page::RandomMix, Vec::new());
+        let play = buttons
+            .first()
+            .map(egui::Rect::center)
+            .expect("Random mix page Play button is drawn");
+        click_mix(&ctx, &mut app, Page::RandomMix, play);
+
+        match app.actions.as_slice() {
+            [Action::PlaySongs { songs, index, mode }] => {
+                assert_eq!(*index, 0);
+                assert_eq!(*mode, SongListMode::RandomMix);
+                assert_eq!(
+                    songs.iter().map(|song| &song.id).collect::<Vec<_>>(),
+                    source.iter().map(|song| &song.id).collect::<Vec<_>>()
+                );
+            }
+            actions => panic!("Random mix Play emitted unexpected actions: {actions:?}"),
+        }
+        finish(app, root);
+    }
+
+    #[test]
+    fn sorted_random_mix_row_play_keeps_the_refill_mode() {
+        let (ctx, mut app, root) = make_app("random-mix-row-play-mode");
+        let source: Vec<_> = (0..crate::mixes::MIX_SIZE).map(song).collect();
+        app.home.random_songs = Loadable::Loaded(source.clone());
+        app.table_sorts.insert(
+            Page::RandomMix,
+            TableSort {
+                column: SortColumn::Title,
+                ascending: true,
+            },
+        );
+        app.actions.clear();
+
+        let (text, _) = mix_output(&ctx, &mut app, Page::RandomMix, Vec::new());
+        let first_row = source
+            .iter()
+            .filter_map(|song| {
+                text.iter()
+                    .find(|(painted, _)| painted == &song.name)
+                    .map(|(_, rect)| *rect)
+            })
+            .min_by(|left, right| left.top().total_cmp(&right.top()))
+            .expect("Random mix song rows are drawn");
+        click_mix(
+            &ctx,
+            &mut app,
+            Page::RandomMix,
+            egui::pos2(16.0, first_row.center().y),
+        );
+
+        match app.actions.as_slice() {
+            [
+                Action::PlayFromRow {
+                    context: RowContext::Songs { songs, mode },
+                    index,
+                    ..
+                },
+            ] => {
+                assert_eq!(*index, 0);
+                assert_eq!(*mode, SongListMode::RandomMix);
+                assert_eq!(songs.len(), crate::mixes::MIX_SIZE);
+            }
+            actions => panic!("Random mix row Play emitted unexpected actions: {actions:?}"),
         }
         finish(app, root);
     }

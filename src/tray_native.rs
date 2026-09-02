@@ -2,14 +2,13 @@
 //! the window leaves the music playing on every desktop.
 //!
 //! Windows runs the item on its own thread with a message loop, like the
-//! Linux one. macOS allows status items on the main thread only, and only
-//! while its event loop runs, so there the item is created with the first
-//! window and, while no window exists, the headless loop in `main` pumps
-//! the application's events itself. Its Dock icon remains available and a
-//! Dock activation recreates the window.
+//! Linux one. macOS requires status items on the main thread, so there the
+//! item is created with the first window and shares the AppKit event loop
+//! with the hidden root window.
 
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
+#[cfg(windows)]
 use std::time::Duration;
 
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
@@ -208,19 +207,6 @@ impl TrayService {
             }
         }
     }
-
-    /// Nothing to do: the item lives on its own thread from the start.
-    pub fn attach(&mut self) {}
-
-    /// Nothing to do either; see `attach`.
-    pub fn hidden(&mut self) {}
-}
-
-/// Waits while the app lives in the tray without a window. Windows has
-/// nothing to pump here: the item runs on its own thread.
-#[cfg(windows)]
-pub fn idle(duration: Duration) {
-    std::thread::sleep(duration);
 }
 
 #[cfg(target_os = "macos")]
@@ -230,8 +216,7 @@ mod host {
 
     use objc2::runtime::{AnyClass, AnyObject, Bool, MethodImplementation, Sel};
     use objc2::{Encode, MainThreadMarker, sel};
-    use objc2_app_kit::{NSApplication, NSEventMask};
-    use objc2_foundation::{NSDate, NSDefaultRunLoopMode};
+    use objc2_app_kit::NSApplication;
 
     use super::*;
 
@@ -330,31 +315,6 @@ mod host {
         #[allow(deprecated)]
         app.activateIgnoringOtherApps(true);
     }
-
-    /// Runs the application's event loop for `duration`, so the status
-    /// item and the media controls keep answering without a window.
-    pub fn pump(duration: Duration) {
-        let Some(mtm) = MainThreadMarker::new() else {
-            std::thread::sleep(duration);
-            return;
-        };
-        let app = NSApplication::sharedApplication(mtm);
-        let deadline = NSDate::dateWithTimeIntervalSinceNow(duration.as_secs_f64());
-        // Safety: reading an extern static AppKit defines and never changes.
-        let mode = unsafe { NSDefaultRunLoopMode };
-        loop {
-            let event = app.nextEventMatchingMask_untilDate_inMode_dequeue(
-                NSEventMask::Any,
-                Some(&deadline),
-                mode,
-                true,
-            );
-            match event {
-                Some(event) => app.sendEvent(&event),
-                None => break,
-            }
-        }
-    }
 }
 
 #[cfg(target_os = "macos")]
@@ -400,16 +360,6 @@ impl TrayService {
             host::activate();
         }
     }
-
-    /// No window: the status item and Dock icon both remain available.
-    pub fn hidden(&mut self) {}
-}
-
-/// Waits while the app lives in the tray without a window, keeping AppKit
-/// served meanwhile.
-#[cfg(target_os = "macos")]
-pub fn idle(duration: Duration) {
-    host::pump(duration);
 }
 
 #[cfg(all(test, target_os = "macos"))]

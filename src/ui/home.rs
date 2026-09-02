@@ -4,7 +4,7 @@ use egui::{Color32, CornerRadius, Rect, Sense, Vec2, pos2, vec2};
 
 use crate::api::models::{Album, MediaId, PlayHistory, Song, pick_image};
 use crate::app::App;
-use crate::model::{Action, Loadable, Page};
+use crate::model::{Action, Loadable, Page, SongListMode};
 use crate::theme::{self, Icon};
 
 use super::widgets;
@@ -316,6 +316,7 @@ fn song_card(app: &mut App, ui: &mut egui::Ui, song: &Song) {
         app.actions.push(Action::PlaySongs {
             songs: vec![song.clone()],
             index: 0,
+            mode: SongListMode::Finite,
         });
     }
     if card.clicked

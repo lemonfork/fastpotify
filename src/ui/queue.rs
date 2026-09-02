@@ -4,7 +4,7 @@ use egui::{Align, Frame, Layout, Margin};
 
 use crate::api::models::PlayableItem;
 use crate::app::App;
-use crate::model::{Action, QueueTab, RowContext};
+use crate::model::{Action, QueueTab, RowContext, SongListMode};
 use crate::player::QueueEntry;
 use crate::theme::{self, Icon};
 
@@ -131,7 +131,10 @@ fn contents(app: &mut App, ui: &mut egui::Ui, compact: bool) {
     if let Some(current) = &current {
         theme::text(ui, "Now playing", theme::semibold(14.0), palette.text);
         ui.add_space(4.0);
-        let context = RowContext::Songs(vec![current.as_track().clone()]);
+        let context = RowContext::Songs {
+            songs: vec![current.as_track().clone()],
+            mode: SongListMode::Finite,
+        };
         widgets::track_row(
             ui,
             app,
@@ -226,7 +229,10 @@ fn recents_contents(app: &mut App, ui: &mut egui::Ui) {
     widgets::virtual_rows(ui, items.len(), theme::COMPACT_ROW_HEIGHT, |ui, index| {
         let entry = &items[index];
         let item = PlayableItem::Track(entry.track.clone());
-        let context = RowContext::Songs(vec![entry.track.clone()]);
+        let context = RowContext::Songs {
+            songs: vec![entry.track.clone()],
+            mode: SongListMode::Finite,
+        };
         widgets::track_row(
             ui,
             app,

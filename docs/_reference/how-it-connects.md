@@ -41,6 +41,16 @@ automatically for each local calendar day; refreshing Random mix is an
 independent metadata request and cannot replace the queue snapshot of a mix
 already playing.
 
+When playback is explicitly started from the Random mix page, Fastpotify also
+uses `getRandomSongs` to extend that playing context. It sends one continuation
+request when three of the mix's own upcoming songs remain; manually queued
+songs do not count toward the threshold. Only one continuation request can be
+in flight at a time. Songs returned by the server are appended to the context
+tail, leaving the current song and manual queue unchanged, and the same check
+can fetch later batches while the server keeps returning songs. Continuation
+requests do not replace the visible Random mix page, and that page's Refresh
+request does not replace the playing context.
+
 The first stream request asks the server for MP3 at the selected bitrate. If a
 server reports success but the transcode ends before its first byte,
 Fastpotify retries that song once with OpenSubsonic's `format=raw`. This keeps

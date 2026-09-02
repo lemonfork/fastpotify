@@ -49,3 +49,12 @@ check every one of them.
 10. **Old playback work is ignored.** Every load and decode belongs to a play
     instance and generation. A cancelled download, decoder EOF, or error from
     an older song cannot advance or stop the current queue.
+
+11. **A playing Random mix extends its own context.** After you explicitly
+    start playback from the Random mix page, Fastpotify requests another
+    server batch when three of that mix's songs remain under *Next up*.
+    Manually queued songs do not count toward the threshold and still play
+    first. Only one continuation request runs at a time; returned songs are
+    appended after the existing context without changing the current song or
+    manual queue. The same check can extend it again while the server keeps
+    returning songs. The Random mix page's Refresh button remains separate.
