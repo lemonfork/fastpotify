@@ -178,6 +178,7 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
     let mut show_search = ui
         .data(|data| data.get_temp::<bool>(search_id))
         .unwrap_or(false);
+    let mut focus_search = false;
     ui.horizontal(|ui| {
         ui.add_space(6.0);
         theme::icon(ui, Icon::Library, 22.0, palette.secondary);
@@ -225,9 +226,7 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
             {
                 show_search = !show_search;
                 if show_search {
-                    ui.memory_mut(|memory| {
-                        memory.request_focus(egui::Id::new("sidebar-search"));
-                    });
+                    focus_search = true;
                 } else {
                     app.library.filter.clear();
                 }
@@ -238,7 +237,7 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
     if show_search {
         ui.add_space(6.0);
         let width = ui.available_width() - 4.0;
-        super::widgets::search_field(
+        let response = super::widgets::search_field(
             ui,
             &palette,
             egui::Id::new("sidebar-search"),
@@ -246,6 +245,9 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
             "Favorites and playlists",
             width,
         );
+        if focus_search {
+            response.request_focus();
+        }
     }
     ui.add_space(8.0);
 
