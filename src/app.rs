@@ -272,6 +272,9 @@ pub struct App {
     last_session_save: Instant,
     applied_dark: Option<bool>,
     zoom_applied: bool,
+    /// Frames left to re-send the Winamp window's always-on-top level after the
+    /// window opens. X11 window managers can drop a level set before mapping.
+    winamp_level_reassert: u8,
     last_eviction: Instant,
     last_update_check: Option<Instant>,
     last_history_refresh: Instant,
@@ -474,6 +477,7 @@ impl App {
             last_session_save: Instant::now(),
             applied_dark: None,
             zoom_applied: false,
+            winamp_level_reassert: 0,
             last_eviction: Instant::now(),
             last_update_check: None,
             last_history_refresh: Instant::now(),
@@ -515,6 +519,11 @@ impl App {
             media_controls.attach();
         }
         if self.settings.winamp_window {
+            // X11 may discard the creation-time level before the window is
+            // mapped, so repeat it over the first live frames.
+            if self.settings.winamp_on_top {
+                self.winamp_level_reassert = 3;
+            }
             return;
         }
         if let Some(size) = self.session_window_size.take()
@@ -2413,6 +2422,7 @@ impl App {
             Action::ToggleWinampOnTop => {
                 self.settings.winamp_on_top = !self.settings.winamp_on_top;
                 self.mark_settings_dirty();
+                self.push_winamp_level(ctx);
             }
             Action::OpenSkinsFolder => self.open_folder(self.dirs.skins_dir()),
             Action::CycleVisualiser => {
@@ -2748,8 +2758,24 @@ impl App {
         }
     }
 
+    /// Pushes the Winamp window's always-on-top level to the live window.
+    fn push_winamp_level(&self, ctx: &egui::Context) {
+        if let Some(level) =
+            winamp_on_top_level(self.settings.winamp_window, self.settings.winamp_on_top)
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+        }
+    }
+
     fn tick(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
+        if self.winamp_level_reassert > 0 {
+            self.winamp_level_reassert -= 1;
+            self.push_winamp_level(ctx);
+            if self.winamp_level_reassert > 0 {
+                ctx.request_repaint();
+            }
+        }
         if !self.zoom_applied {
             self.zoom_applied = true;
             ctx.set_zoom_factor(self.settings.zoom.clamp(0.5, 2.5));
@@ -3717,6 +3743,21 @@ pub fn percent_to_volume(percent: u8) -> u16 {
     ((u32::from(percent.min(100)) * u32::from(u16::MAX)) / 100) as u16
 }
 
+/// The native window level for the Winamp always-on-top setting.
+pub fn on_top_window_level(on_top: bool) -> egui::WindowLevel {
+    if on_top {
+        egui::WindowLevel::AlwaysOnTop
+    } else {
+        egui::WindowLevel::Normal
+    }
+}
+
+/// The level to push to the live window. The main window always remains at
+/// its normal level even when the setting is changed from Settings.
+fn winamp_on_top_level(winamp_window: bool, on_top: bool) -> Option<egui::WindowLevel> {
+    winamp_window.then_some(on_top_window_level(on_top))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3760,6 +3801,48 @@ mod tests {
             },
         );
         Harness { app, root }
+    }
+
+    #[test]
+    fn the_winamp_window_follows_the_on_top_toggle_live() {
+        assert_eq!(
+            winamp_on_top_level(true, true),
+            Some(egui::WindowLevel::AlwaysOnTop)
+        );
+        assert_eq!(
+            winamp_on_top_level(true, false),
+            Some(egui::WindowLevel::Normal)
+        );
+    }
+
+    #[test]
+    fn the_main_window_never_follows_the_on_top_toggle() {
+        assert_eq!(winamp_on_top_level(false, true), None);
+        assert_eq!(winamp_on_top_level(false, false), None);
+    }
+
+    #[test]
+    fn opening_the_winamp_window_on_top_schedules_a_reassert() {
+        let ctx = egui::Context::default();
+        let mut harness = harness();
+        harness.app.settings.winamp_window = true;
+        harness.app.settings.winamp_on_top = true;
+
+        harness.app.attach(&ctx);
+
+        assert_eq!(harness.app.winamp_level_reassert, 3);
+    }
+
+    #[test]
+    fn opening_the_winamp_window_without_on_top_schedules_no_reassert() {
+        let ctx = egui::Context::default();
+        let mut harness = harness();
+        harness.app.settings.winamp_window = true;
+        harness.app.settings.winamp_on_top = false;
+
+        harness.app.attach(&ctx);
+
+        assert_eq!(harness.app.winamp_level_reassert, 0);
     }
 
     fn profile() -> ProfileId {
