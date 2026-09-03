@@ -2403,6 +2403,11 @@ impl App {
                 self.backend.clear_history(generation);
             }
             Action::ToggleWinampWindow => {
+                if self.settings.winamp_window {
+                    self.winamp.remember_position();
+                }
+                self.session_window_size = self.last_window_size.or(self.session_window_size);
+                self.session_window_pos = self.last_window_pos.or(self.session_window_pos);
                 self.settings.winamp_window = !self.settings.winamp_window;
                 self.settings_dirty = true;
                 self.switch_intent = true;
@@ -2883,7 +2888,7 @@ impl App {
         }
         self.apply_actions(&ctx);
         self.sync_media_controls();
-        if !self.settings.winamp_window {
+        if !self.settings.winamp_window && !self.switch_intent {
             if let Some(rect) = ctx.input(|input| input.viewport().inner_rect) {
                 self.last_window_size = Some([rect.width(), rect.height()]);
             }
@@ -5187,6 +5192,87 @@ mod tests {
         assert_ne!(
             view.current.unwrap().occurrence_id,
             view.rows[0].occurrence_id
+        );
+    }
+
+    /// Switching from Winamp back to the main window preserves the main
+    /// window's size and position across the closing mini-window frame.
+    #[test]
+    fn closing_winamp_frame_does_not_overwrite_main_window_geometry() {
+        let mut harness = harness();
+        let app = &mut harness.app;
+        app.demo_connect(crate::api::VerifiedServer {
+            profile: profile(),
+            ..crate::api::VerifiedServer::default()
+        });
+        app.last_window_size = Some([1024.0, 768.0]);
+        app.last_window_pos = Some([100.0, 150.0]);
+
+        // Toggle from main window to Winamp window
+        let ctx = egui::Context::default();
+        app.actions.push(Action::ToggleWinampWindow);
+        app.apply_actions(&ctx);
+
+        assert!(app.settings.winamp_window);
+        assert!(app.switch_intent);
+        assert_eq!(app.session_window_size, Some([1024.0, 768.0]));
+        assert_eq!(app.session_window_pos, Some([100.0, 150.0]));
+
+        // Attach the Winamp window (clears switch_intent, keeps session geometry)
+        app.attach(&ctx);
+        assert!(!app.switch_intent);
+        assert_eq!(app.session_window_size, Some([1024.0, 768.0]));
+
+        // Trigger switch back to the main window
+        app.actions.push(Action::ToggleWinampWindow);
+
+        // Run the closing frame of the mini-window with its tiny viewport geometry
+        let mut raw_input = egui::RawInput::default();
+        let mini_rect = egui::Rect::from_min_size(egui::pos2(50.0, 50.0), egui::vec2(275.0, 116.0));
+        let viewport = raw_input
+            .viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default();
+        viewport.inner_rect = Some(mini_rect);
+        viewport.outer_rect = Some(mini_rect);
+
+        let mut closing_output = ctx.run_ui(raw_input, |ui| {
+            app.frame_ui(ui);
+        });
+        closing_output.textures_delta.clear();
+
+        // The closing frame switched window mode and armed switch_intent...
+        assert!(!app.settings.winamp_window);
+        assert!(app.switch_intent);
+
+        // ...but switch_intent prevented the closing mini-window rect from
+        // overwriting the saved main window size and position.
+        assert_eq!(app.last_window_size, Some([1024.0, 768.0]));
+        assert_eq!(app.last_window_pos, Some([100.0, 150.0]));
+        assert_eq!(app.session_window_size, Some([1024.0, 768.0]));
+        assert_eq!(app.session_window_pos, Some([100.0, 150.0]));
+
+        // Attaching the new main window restores the saved geometry via viewport commands
+        let main_ctx = egui::Context::default();
+        let mut output = main_ctx.run_ui(Default::default(), |_ui| {
+            app.attach(&main_ctx);
+        });
+        output.textures_delta.clear();
+
+        let commands = &output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .expect("the root viewport")
+            .commands;
+        assert!(
+            commands.contains(&egui::ViewportCommand::InnerSize(egui::vec2(1024.0, 768.0))),
+            "attach restored the main window size: {commands:?}"
+        );
+        assert!(
+            commands.contains(&egui::ViewportCommand::OuterPosition(egui::pos2(
+                100.0, 150.0
+            ))),
+            "attach restored the main window position: {commands:?}"
         );
     }
 }
