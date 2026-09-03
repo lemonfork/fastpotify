@@ -42,11 +42,25 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libasound2-dev libpulse-dev libxkbcommon-dev \
             libwayland-dev libgl1-mesa-dev
+      - name: MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
 
       - run: cargo build --release --target ${{ matrix.target }}
+
+      # The zip and installer must run on a clean Windows machine without a
+      # separately installed Visual C++ redistributable.
+      - name: Verify standalone Windows runtime
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $binary = "target\${{ matrix.target }}\release\fastpotify.exe"
+          $imports = & dumpbin /dependents $binary | Out-String
+          $runtime = $imports | Select-String -Pattern 'MSVCP[0-9_]*\.dll|VCRUNTIME[0-9_]*\.dll'
+          if ($runtime) { throw "Fastpotify imports an MSVC runtime:`n$runtime" }
 
       - name: Package
         shell: bash
