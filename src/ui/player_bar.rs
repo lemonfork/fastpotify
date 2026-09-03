@@ -3,7 +3,7 @@
 use egui::{Align, Frame, Layout, Margin, Rect, Sense, UiBuilder, Vec2, pos2, vec2};
 
 use crate::app::{App, NowPlaying};
-use crate::model::{Action, Page};
+use crate::model::{Action, DragTrack, Page};
 use crate::player::RepeatMode;
 use crate::theme::{self, Icon};
 use crate::util;
@@ -102,13 +102,10 @@ fn now_playing_block(app: &mut App, ui: &mut egui::Ui, region: Rect, now: Option
         6.0,
         Icon::Music,
     );
+    let drag_sense = Sense::click_and_drag();
     let cover_response = ui
-        .interact(
-            cover_rect,
-            egui::Id::new("now-playing-cover"),
-            Sense::click(),
-        )
-        .on_hover_cursor(egui::CursorIcon::PointingHand);
+        .interact(cover_rect, egui::Id::new("now-playing-cover"), drag_sense)
+        .on_hover_cursor(egui::CursorIcon::Grab);
     // Hovering the cover offers to dock the art large at the sidebar's bottom.
     let art_available = now.song.image(128).is_some();
     let expand_rect = Rect::from_center_size(
@@ -147,7 +144,7 @@ fn now_playing_block(app: &mut App, ui: &mut egui::Ui, region: Rect, now: Option
     let text_left = cover_rect.right() + 12.0;
     let text_width = (region.right() - text_left - heart_width).max(40.0);
     let text_rect = Rect::from_min_size(pos2(text_left, cy - 18.0), vec2(text_width, 36.0));
-    let info_response = ui.interact(text_rect, egui::Id::new("now-playing-info"), Sense::click());
+    let info_response = ui.interact(text_rect, egui::Id::new("now-playing-info"), drag_sense);
     let mut text_ui = ui.new_child(
         UiBuilder::new()
             .max_rect(text_rect)
@@ -185,6 +182,18 @@ fn now_playing_block(app: &mut App, ui: &mut egui::Ui, region: Rect, now: Option
             );
         }
     });
+    if cover_response.drag_started_by(egui::PointerButton::Primary)
+        || info_response.drag_started_by(egui::PointerButton::Primary)
+    {
+        egui::DragAndDrop::set_payload(
+            ui.ctx(),
+            DragTrack {
+                song: now.song.clone(),
+                from: None,
+            },
+        );
+    }
+
     // The playing thing answers the same right-click menu as a table row,
     // from the cover, the empty space around the words, or the words.
     let item = crate::api::models::PlayableItem::Track(now.song.clone());

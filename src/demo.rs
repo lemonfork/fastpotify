@@ -2190,6 +2190,52 @@ mod tests {
     }
 
     #[test]
+    fn dragging_the_now_playing_song_supplies_a_playlist_row() {
+        let (ctx, mut app, root) = make_app("now-playing-drag");
+        for _ in 0..3 {
+            frame(&ctx, &mut app);
+        }
+
+        let start = egui::pos2(40.0, 755.0);
+        frame_events(
+            &ctx,
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(start),
+                egui::Event::PointerButton {
+                    pos: start,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame_events(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(start + egui::vec2(20.0, -10.0))],
+        );
+
+        let payload = egui::DragAndDrop::payload::<DragTrack>(&ctx)
+            .expect("dragging the bottom-left song should create a song payload");
+        assert_eq!(payload.song.id, song_id(0));
+        assert_eq!(payload.from, None, "this is an add, not a playlist move");
+
+        egui::DragAndDrop::clear_payload(&ctx);
+        frame_events(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos: start,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        finish(app, root);
+    }
+
+    #[test]
     fn dragging_a_duplicate_playlist_row_reorders_its_exact_occurrence() {
         let (ctx, mut app, root) = make_app("reorder-playlist");
         let playlist = playlist_id(1);

@@ -27,7 +27,8 @@ everyday use, and connection details.
   from its page asks the server for another batch when three of its own songs
   remain to play, then appends them without disturbing the current or manually
   queued songs. It repeats that check while the server keeps returning songs.
-- **Playlist editing.** Create, rename, describe, add/remove songs, drag rows
+- **Playlist editing.** Create, rename, describe, add/remove songs, drag a row
+  or the currently playing song onto a sidebar playlist, drag playlist rows
   into a new order, and delete. Reordering replaces the complete ordered song
   list in one OpenSubsonic request, preserving duplicate occurrences.
 - **Optimistic interactions.** Playing, queueing, and favorite changes appear
