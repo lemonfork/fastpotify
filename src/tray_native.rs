@@ -1,209 +1,320 @@
-//! The tray item on Windows and macOS: the same menu as on Linux, so closing
-//! the window leaves the music playing on every desktop.
+//! Native resources for the shared tray lifecycle on Windows and macOS.
 //!
-//! Windows runs the item on its own thread with a message loop, like the
-//! Linux one. macOS requires status items on the main thread, so there the
-//! item is created with the first window and shares the AppKit event loop
-//! with the hidden root window.
+//! Windows owns its item on a message-loop thread. macOS keeps it on the
+//! main thread, independently of the visible main/mini window.
 
-use std::sync::Arc;
-use std::sync::mpsc::{Receiver, Sender};
-#[cfg(windows)]
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, Once};
 
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TrayCommand {
-    Show,
-    ShowHide,
-    PlayPause,
-    Next,
-    Previous,
-    Quit,
-}
-
-type Wake = Arc<dyn Fn() + Send + Sync>;
+use super::{ActionSender, TrayAction};
 
 const SHOW: &str = "show";
+const SHOW_MINI: &str = "show-mini";
 const PLAY_PAUSE: &str = "play-pause";
 const NEXT: &str = "next";
 const PREVIOUS: &str = "previous";
 const QUIT: &str = "quit";
 
-fn command_for(id: &MenuId) -> Option<TrayCommand> {
-    match id.0.as_str() {
-        SHOW => Some(TrayCommand::Show),
-        PLAY_PAUSE => Some(TrayCommand::PlayPause),
-        NEXT => Some(TrayCommand::Next),
-        PREVIOUS => Some(TrayCommand::Previous),
-        QUIT => Some(TrayCommand::Quit),
-        _ => None,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Owner(u64);
+
+impl Owner {
+    fn new() -> Self {
+        static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT_OWNER.fetch_add(1, Ordering::Relaxed))
     }
+
+    fn menu_id(self, action: &str) -> MenuId {
+        MenuId::new(format!("{}:{action}", self.0))
+    }
+}
+
+fn action_for(id: &MenuId) -> Option<(Owner, TrayAction)> {
+    let (owner, action) = id.0.split_once(':')?;
+    let owner = Owner(owner.parse().ok()?);
+    let action = match action {
+        SHOW => TrayAction::ShowMainWindow,
+        SHOW_MINI => TrayAction::ShowMiniPlayer,
+        PLAY_PAUSE => TrayAction::PlayPause,
+        NEXT => TrayAction::Next,
+        PREVIOUS => TrayAction::Previous,
+        QUIT => TrayAction::Quit,
+        _ => return None,
+    };
+    Some((owner, action))
+}
+
+/// muda's handler is process-global and can only be installed once. The
+/// route changes with the native owner, without leaving a callback pointing
+/// at the first service's disconnected channel.
+#[derive(Default)]
+struct Router(Mutex<Option<(Owner, ActionSender)>>);
+
+impl Router {
+    fn bind(&self, owner: Owner, actions: ActionSender) {
+        *self.0.lock().expect("tray route poisoned") = Some((owner, actions));
+    }
+
+    fn clear(&self, owner: Owner) {
+        let mut route = self.0.lock().expect("tray route poisoned");
+        if route.as_ref().is_some_and(|(active, _)| *active == owner) {
+            *route = None;
+        }
+    }
+
+    fn menu(&self, id: &MenuId) {
+        let Some((owner, action)) = action_for(id) else {
+            return;
+        };
+        let sender = self
+            .0
+            .lock()
+            .expect("tray route poisoned")
+            .as_ref()
+            .filter(|(active, _)| *active == owner)
+            .map(|(_, sender)| sender.clone());
+        if let Some(sender) = sender {
+            sender.send(action);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn reopen(&self) {
+        let sender = self
+            .0
+            .lock()
+            .expect("tray route poisoned")
+            .as_ref()
+            .map(|(_, sender)| sender.clone());
+        if let Some(sender) = sender {
+            sender.send(TrayAction::ShowCurrentWindow);
+        }
+    }
+}
+
+static ROUTER: Router = Router(Mutex::new(None));
+
+#[cfg(any(windows, test))]
+static WORKER_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A timed-out startup still owns native resources until its worker exits.
+/// Keep that exclusivity even when no Platform was returned to the caller.
+#[cfg(any(windows, test))]
+struct WorkerLease;
+
+#[cfg(any(windows, test))]
+impl WorkerLease {
+    fn acquire() -> Result<Self, String> {
+        WORKER_ACTIVE
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .map(|_| Self)
+            .map_err(|_| "the previous tray worker has not finished shutting down".to_owned())
+    }
+}
+
+#[cfg(any(windows, test))]
+impl Drop for WorkerLease {
+    fn drop(&mut self) {
+        WORKER_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
+fn install_event_handlers() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        // Install before creating the first menu: muda initializes its
+        // handler cell on the first event, even when no handler is set.
+        MenuEvent::set_event_handler(Some(|event: MenuEvent| ROUTER.menu(&event.id)));
+        // Menus own clicks. Consume pointer events so hovering does not
+        // accumulate messages in tray-icon's unbounded fallback channel.
+        tray_icon::TrayIconEvent::set_event_handler(Some(|_| {}));
+    });
 }
 
 fn play_pause_label(playing: bool) -> &'static str {
     if playing { "Pause" } else { "Play" }
 }
 
-/// The item, and the menu entry whose label follows playback.
 struct Item {
     _icon: TrayIcon,
     play_pause: MenuItem,
 }
 
-/// Builds the item on the current thread and routes its events to `sender`.
-fn build(sender: Sender<TrayCommand>, wake: Wake) -> Result<Item, Box<dyn std::error::Error>> {
+fn build(owner: Owner, playing: bool) -> Result<Item, Box<dyn std::error::Error>> {
+    install_event_handlers();
     let size = 32u32;
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
     let icon = Icon::from_rgba(crate::util::app_icon_rgba(size as usize), size, size)?;
-    // macOS draws template images itself, black or white to match the menu
-    // bar, so the item looks native in either theme.
+    // AppKit renders template images in the menu bar's current appearance.
     #[cfg(target_os = "macos")]
     let icon = Icon::from_rgba(crate::util::tray_template_rgba(size as usize), size, size)?;
     let menu = Menu::new();
-    let play_pause = MenuItem::with_id(PLAY_PAUSE, play_pause_label(false), true, None);
+    let play_pause = MenuItem::with_id(
+        owner.menu_id(PLAY_PAUSE),
+        play_pause_label(playing),
+        true,
+        None,
+    );
     menu.append_items(&[
-        &MenuItem::with_id(SHOW, "Show Main Window", true, None),
+        &MenuItem::with_id(owner.menu_id(SHOW), "Show Main Window", true, None),
+        &MenuItem::with_id(owner.menu_id(SHOW_MINI), "Open Mini Player", true, None),
         &PredefinedMenuItem::separator(),
-        &MenuItem::with_id(PREVIOUS, "Previous", true, None),
+        &MenuItem::with_id(owner.menu_id(PREVIOUS), "Previous", true, None),
         &play_pause,
-        &MenuItem::with_id(NEXT, "Next", true, None),
+        &MenuItem::with_id(owner.menu_id(NEXT), "Next", true, None),
         &PredefinedMenuItem::separator(),
-        &MenuItem::with_id(QUIT, "Quit", true, None),
+        &MenuItem::with_id(owner.menu_id(QUIT), "Quit", true, None),
     ])?;
     let builder = TrayIconBuilder::new()
         .with_icon(icon)
         .with_tooltip("Fastpotify")
         .with_menu(Box::new(menu))
-        // A plain click opens the controls instead of changing window state.
         .with_menu_on_left_click(true);
     #[cfg(target_os = "macos")]
     let builder = builder.with_icon_as_template(true);
-    let icon = builder.build()?;
-
-    MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
-        if let Some(command) = command_for(&event.id)
-            && sender.send(command).is_ok()
-        {
-            wake();
-        }
-    }));
-    // The menu owns clicks now. Drain pointer events here so tray-icon does
-    // not retain every hover and movement in its unbounded fallback channel.
-    tray_icon::TrayIconEvent::set_event_handler(Some(|_| {}));
     Ok(Item {
-        _icon: icon,
+        _icon: builder.build()?,
         play_pause,
     })
 }
 
-#[cfg(test)]
-mod menu_tests {
-    use super::*;
-
-    #[test]
-    fn show_menu_item_only_opens_the_main_window() {
-        assert_eq!(command_for(&MenuId::new(SHOW)), Some(TrayCommand::Show));
-    }
-}
-
 #[cfg(windows)]
 mod host {
-    use super::*;
+    use std::sync::mpsc::{Receiver, Sender};
+    use std::thread::JoinHandle;
+    use std::time::Duration;
+
     use windows_sys::Win32::System::Threading::GetCurrentThreadId;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, GetMessageW, MSG, PostThreadMessageW, TranslateMessage, WM_APP,
+        DispatchMessageW, GetMessageW, MSG, PM_NOREMOVE, PeekMessageW, PostThreadMessageW,
+        TranslateMessage, WM_APP, WM_QUIT,
     };
 
-    /// Runs the item on its own thread. Answers with the thread's id once
-    /// the item exists, or with why it could not be made.
-    pub fn start(
-        sender: Sender<TrayCommand>,
-        wake: Wake,
-        playing: Receiver<bool>,
-    ) -> Result<u32, String> {
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let spawned = std::thread::Builder::new()
-            .name("fastpotify-tray".to_owned())
-            .spawn(move || {
-                let item = match build(sender, wake) {
-                    Ok(item) => item,
-                    Err(error) => {
-                        let _ = ready_tx.send(Err(error.to_string()));
-                        return;
-                    }
-                };
-                let _ = ready_tx.send(Ok(unsafe { GetCurrentThreadId() }));
-                let mut message: MSG = unsafe { std::mem::zeroed() };
-                while unsafe { GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) } > 0 {
-                    if message.message == WM_APP {
-                        while let Ok(playing) = playing.try_recv() {
-                            item.play_pause.set_text(play_pause_label(playing));
-                        }
-                        continue;
-                    }
-                    unsafe {
-                        TranslateMessage(&message);
-                        DispatchMessageW(&message);
-                    }
-                }
-            });
-        if let Err(error) = spawned {
-            return Err(error.to_string());
-        }
-        ready_rx
-            .recv_timeout(Duration::from_secs(5))
-            .map_err(|_| "the tray thread did not answer".to_string())?
+    use super::*;
+
+    pub struct Platform {
+        owner: Owner,
+        playing: Sender<bool>,
+        thread_id: u32,
+        thread: JoinHandle<()>,
+        stop_requested: bool,
     }
 
-    /// Wakes the thread's message loop to read what was sent to it.
-    pub fn poke(thread_id: u32) {
-        unsafe {
-            PostThreadMessageW(thread_id, WM_APP, 0, 0);
-        }
-    }
-}
-
-#[cfg(windows)]
-pub struct TrayService {
-    commands: Receiver<TrayCommand>,
-    playing: bool,
-    playing_tx: Sender<bool>,
-    thread_id: u32,
-}
-
-#[cfg(windows)]
-impl TrayService {
-    /// Registers the tray item. `None` when it cannot be made.
-    pub fn spawn(wake: impl Fn() + Send + Sync + 'static) -> Option<Self> {
-        let (sender, commands) = std::sync::mpsc::channel();
-        let (playing_tx, playing_rx) = std::sync::mpsc::channel();
-        match host::start(sender, Arc::new(wake), playing_rx) {
-            Ok(thread_id) => Some(Self {
-                commands,
-                playing: false,
-                playing_tx,
+    impl super::super::Host for Platform {
+        fn start(actions: ActionSender, playing: bool) -> Result<Self, String> {
+            let lease = WorkerLease::acquire()?;
+            let owner = Owner::new();
+            let (playing_tx, playing_rx) = std::sync::mpsc::channel();
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (accept_tx, accept_rx) = std::sync::mpsc::channel();
+            let thread = std::thread::Builder::new()
+                .name("fastpotify-tray".to_owned())
+                .spawn(move || {
+                    // run drops its Item before returning, including every
+                    // startup failure. The lease is released only after it.
+                    let _lease = lease;
+                    run(owner, playing, playing_rx, ready_tx, accept_rx);
+                    ROUTER.clear(owner);
+                })
+                .map_err(|error| error.to_string())?;
+            let thread_id = ready_rx
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(|_| "the tray thread did not answer".to_string())??;
+            ROUTER.bind(owner, actions);
+            // A timed-out caller drops accept_tx. Even if readiness raced
+            // with the timeout, the worker then drops its item and exits.
+            if accept_tx.send(()).is_err() {
+                ROUTER.clear(owner);
+                return Err("the tray thread stopped during startup".to_string());
+            }
+            Ok(Self {
+                owner,
+                playing: playing_tx,
                 thread_id,
-            }),
-            Err(error) => {
-                log::info!("no system tray available: {error}");
-                None
+                thread,
+                stop_requested: false,
+            })
+        }
+
+        fn set_playing(&mut self, playing: bool) -> Result<(), String> {
+            self.playing
+                .send(playing)
+                .map_err(|_| "the tray thread has stopped".to_string())?;
+            post(self.thread_id, WM_APP)
+        }
+
+        fn is_alive(&self) -> bool {
+            !self.thread.is_finished()
+        }
+
+        fn stop(&mut self) {
+            self.release();
+        }
+    }
+
+    impl Platform {
+        fn release(&mut self) {
+            ROUTER.clear(self.owner);
+            // Never join on the UI thread; the worker destroys its own item
+            // when it consumes WM_QUIT. is_alive acknowledges that cleanup.
+            if !self.stop_requested && !self.thread.is_finished() {
+                match post(self.thread_id, WM_QUIT) {
+                    Ok(()) => self.stop_requested = true,
+                    Err(error) => log::warn!("the tray thread could not be stopped: {error}"),
+                }
             }
         }
     }
 
-    pub fn drain_commands(&self) -> Vec<TrayCommand> {
-        self.commands.try_iter().collect()
+    impl Drop for Platform {
+        fn drop(&mut self) {
+            self.release();
+        }
     }
 
-    /// Keeps the menu's Play/Pause label matching reality.
-    pub fn set_playing(&mut self, playing: bool) {
-        if self.playing != playing {
-            self.playing = playing;
-            if self.playing_tx.send(playing).is_ok() {
-                host::poke(self.thread_id);
+    fn post(thread_id: u32, message: u32) -> Result<(), String> {
+        if unsafe { PostThreadMessageW(thread_id, message, 0, 0) } == 0 {
+            Err(std::io::Error::last_os_error().to_string())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn run(
+        owner: Owner,
+        playing: bool,
+        updates: Receiver<bool>,
+        ready: Sender<Result<u32, String>>,
+        accepted: Receiver<()>,
+    ) {
+        // PostThreadMessage requires the target's message queue to exist.
+        let mut message: MSG = unsafe { std::mem::zeroed() };
+        unsafe {
+            PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_NOREMOVE);
+        }
+        let item = match build(owner, playing) {
+            Ok(item) => item,
+            Err(error) => {
+                let _ = ready.send(Err(error.to_string()));
+                return;
+            }
+        };
+        if ready.send(Ok(unsafe { GetCurrentThreadId() })).is_err() || accepted.recv().is_err() {
+            return;
+        }
+        while unsafe { GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) } > 0 {
+            if message.message == WM_APP {
+                while let Ok(playing) = updates.try_recv() {
+                    item.play_pause.set_text(play_pause_label(playing));
+                }
+                continue;
+            }
+            unsafe {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
             }
         }
     }
@@ -221,30 +332,102 @@ mod host {
     use super::*;
 
     thread_local! {
-        /// The status item, which only the main thread may touch.
-        pub static ITEM: RefCell<Option<Item>> = const { RefCell::new(None) };
-        /// The channel a Dock click asks through, and the wake that makes
-        /// somebody read it.
-        pub(super) static REOPEN: RefCell<Option<(Sender<TrayCommand>, Wake)>> = const { RefCell::new(None) };
+        static ITEM: RefCell<Option<(Owner, Item)>> = const { RefCell::new(None) };
     }
 
-    /// A Dock click, asking for the app back.
-    ///
-    /// `has_visible_windows` is not the question it sounds like: a window
-    /// sitting in the Dock still counts as visible, which is exactly the
-    /// case that needs help, so the flag is not consulted. Asking for a
-    /// window that is already up costs a focus and nothing else.
-    pub(super) fn request_reopen(_has_visible_windows: bool) -> Bool {
-        REOPEN.with(|slot| {
-            if let Some((sender, wake)) = slot.borrow().as_ref() {
-                let _ = sender.send(TrayCommand::Show);
-                // Ask for a frame as well as leaving a message. A minimized
-                // window is drawn none at all, and every repaint this app
-                // schedules is armed by the frame before it, so the only
-                // reader of that message is a loop that has already stopped.
-                wake();
+    // A token keeps App Send without moving AppKit objects off the main
+    // thread. Every resource operation checks that thread before access.
+    pub struct Platform {
+        owner: Owner,
+    }
+
+    impl super::super::Host for Platform {
+        fn start(actions: ActionSender, playing: bool) -> Result<Self, String> {
+            let mtm = main_thread()?;
+            if ITEM.with(|slot| slot.borrow().is_some()) {
+                return Err("a macOS status item is already running".to_owned());
             }
-        });
+            let owner = Owner::new();
+            ROUTER.bind(owner, actions);
+            install_reopen_handler(&NSApplication::sharedApplication(mtm));
+            match build(owner, playing) {
+                Ok(item) => {
+                    ITEM.with(|slot| *slot.borrow_mut() = Some((owner, item)));
+                    Ok(Self { owner })
+                }
+                Err(error) => {
+                    ROUTER.clear(owner);
+                    Err(error.to_string())
+                }
+            }
+        }
+
+        fn set_playing(&mut self, playing: bool) -> Result<(), String> {
+            main_thread()?;
+            self.with_item(|item| {
+                item.play_pause.set_text(play_pause_label(playing));
+                Ok(())
+            })
+        }
+
+        fn is_alive(&self) -> bool {
+            MainThreadMarker::new().is_some()
+                && ITEM.with(|slot| {
+                    slot.borrow()
+                        .as_ref()
+                        .is_some_and(|(owner, _)| *owner == self.owner)
+                })
+        }
+
+        fn stop(&mut self) {
+            self.release();
+        }
+    }
+
+    impl Platform {
+        fn with_item(&self, apply: impl FnOnce(&Item) -> Result<(), String>) -> Result<(), String> {
+            ITEM.with(|slot| {
+                let slot = slot.borrow();
+                let Some((owner, item)) = slot.as_ref() else {
+                    return Err("the macOS status item has stopped".to_owned());
+                };
+                if *owner != self.owner {
+                    return Err("the macOS status item belongs to another lifecycle".to_owned());
+                }
+                apply(item)
+            })
+        }
+
+        fn release(&mut self) {
+            ROUTER.clear(self.owner);
+            if let Err(error) = main_thread() {
+                log::error!("the status item could not be removed: {error}");
+                return;
+            }
+            ITEM.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                if slot.as_ref().is_some_and(|(owner, _)| *owner == self.owner) {
+                    *slot = None;
+                }
+            });
+        }
+    }
+
+    impl Drop for Platform {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    fn main_thread() -> Result<MainThreadMarker, String> {
+        MainThreadMarker::new()
+            .ok_or_else(|| "the macOS status item requires the main thread".to_owned())
+    }
+
+    /// AppKit reports a minimized window as visible too. A Dock click must
+    /// raise the current window mode and wake its potentially idle loop.
+    pub(super) fn request_reopen(_has_visible_windows: bool) -> Bool {
+        ROUTER.reopen();
         Bool::YES
     }
 
@@ -288,131 +471,98 @@ mod host {
             log::warn!("the macOS Dock reopen handler could not be installed");
         }
     }
-
-    /// Creates the item, once, on the main thread.
-    pub fn create(sender: Sender<TrayCommand>, wake: Wake, playing: bool) {
-        let Some(mtm) = MainThreadMarker::new() else {
-            log::warn!("the status item can only be made on the main thread");
-            return;
-        };
-        REOPEN.with(|slot| *slot.borrow_mut() = Some((sender.clone(), Arc::clone(&wake))));
-        install_reopen_handler(&NSApplication::sharedApplication(mtm));
-        match build(sender, wake) {
-            Ok(item) => {
-                item.play_pause.set_text(play_pause_label(playing));
-                ITEM.with(|slot| *slot.borrow_mut() = Some(item));
-            }
-            Err(error) => log::info!("no status item: {error}"),
-        }
-    }
-
-    pub fn exists() -> bool {
-        ITEM.with(|slot| slot.borrow().is_some())
-    }
-
-    pub fn set_playing(playing: bool) {
-        ITEM.with(|slot| {
-            if let Some(item) = slot.borrow().as_ref() {
-                item.play_pause.set_text(play_pause_label(playing));
-            }
-        });
-    }
-
-    pub fn activate() {
-        let Some(mtm) = MainThreadMarker::new() else {
-            return;
-        };
-        let app = NSApplication::sharedApplication(mtm);
-        #[allow(deprecated)]
-        app.activateIgnoringOtherApps(true);
-    }
 }
 
-#[cfg(target_os = "macos")]
-pub struct TrayService {
-    commands: Receiver<TrayCommand>,
-    playing: bool,
-    /// What the item needs, until the first window lets it be made.
-    pending: Option<(Sender<TrayCommand>, Wake)>,
-}
+pub(super) use host::Platform;
 
-#[cfg(target_os = "macos")]
-impl TrayService {
-    /// Prepares the item. It is made with the first window, when AppKit's
-    /// event loop is running, which it must be.
-    pub fn spawn(wake: impl Fn() + Send + Sync + 'static) -> Option<Self> {
-        let (sender, commands) = std::sync::mpsc::channel();
-        Some(Self {
-            commands,
-            playing: false,
-            pending: Some((sender, Arc::new(wake))),
-        })
-    }
-
-    pub fn drain_commands(&self) -> Vec<TrayCommand> {
-        self.commands.try_iter().collect()
-    }
-
-    /// Keeps the menu's Play/Pause label matching reality.
-    pub fn set_playing(&mut self, playing: bool) {
-        if self.playing != playing {
-            self.playing = playing;
-            host::set_playing(playing);
-        }
-    }
-
-    /// A window exists: make the item if this is the first one and bring the
-    /// application forward.
-    pub fn attach(&mut self) {
-        if let Some((sender, wake)) = self.pending.take() {
-            host::create(sender, wake, self.playing);
-        }
-        if host::exists() {
-            host::activate();
-        }
-    }
-}
-
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+
     use super::*;
 
-    /// A Dock click asks for the window whatever AppKit says about visible
-    /// ones, and asks for a frame as well as leaving a message.
-    ///
-    /// Both halves are load-bearing. A window in the Dock is reported as
-    /// visible, so a handler that trusted that flag did nothing at all for
-    /// the one case that needed it; and a minimized window is drawn no
-    /// frames, so the message alone would wait for a reader that has
-    /// stopped running.
     #[test]
-    fn a_dock_click_asks_for_the_window_and_for_a_frame() {
-        let (sender, commands) = std::sync::mpsc::channel();
-        let woken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter = Arc::clone(&woken);
-        let wake: Wake = Arc::new(move || {
-            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    fn a_detached_startup_worker_blocks_restart_until_it_finishes() {
+        let lease = WorkerLease::acquire().expect("the first worker owns the tray");
+        let (release, cancelled) = std::sync::mpsc::channel();
+        let (finished, cleanup) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            cancelled
+                .recv()
+                .expect("startup caller releases the worker");
+            drop(lease);
+            finished.send(()).expect("report completed cleanup");
         });
-        host::REOPEN.with(|slot| *slot.borrow_mut() = Some((sender, wake)));
 
-        // A minimized window is the reported-visible case, and the one the
-        // bug report is about.
-        assert!(host::request_reopen(true).as_bool());
-        assert_eq!(
-            commands.try_recv(),
-            Ok(TrayCommand::Show),
-            "a window in the Dock reports as visible, and was left there"
+        // A startup timeout drops the JoinHandle without waiting for build.
+        // Losing that handle must not allow a second native worker to start.
+        drop(worker);
+        assert!(WorkerLease::acquire().is_err());
+        release.send(()).expect("cancel the pending startup");
+        cleanup.recv().expect("wait for deterministic cleanup");
+        let _replacement = WorkerLease::acquire().expect("restart after worker cleanup");
+    }
+
+    #[test]
+    fn replacing_the_owner_rejects_old_menu_events_and_old_cleanup() {
+        let router = Router::default();
+        let old = Owner::new();
+        let current = Owner::new();
+        let (old_tx, old_rx) = std::sync::mpsc::channel();
+        let (current_tx, current_rx) = std::sync::mpsc::channel();
+        let woken = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&woken);
+        router.bind(old, ActionSender::new(old_tx, Arc::new(|| {})));
+        router.bind(
+            current,
+            ActionSender::new(
+                current_tx,
+                Arc::new(move || {
+                    count.fetch_add(1, Ordering::SeqCst);
+                }),
+            ),
         );
-        assert_eq!(
-            woken.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "the message was left but nobody was asked to read it"
+        router.clear(old);
+        router.menu(&old.menu_id(PLAY_PAUSE));
+        assert!(old_rx.try_recv().is_err());
+        assert!(current_rx.try_recv().is_err());
+        assert_eq!(woken.load(Ordering::SeqCst), 0);
+
+        router.menu(&current.menu_id(PLAY_PAUSE));
+        assert_eq!(current_rx.try_recv(), Ok(TrayAction::PlayPause));
+        assert_eq!(woken.load(Ordering::SeqCst), 1);
+
+        router.clear(current);
+        router.menu(&current.menu_id(PLAY_PAUSE));
+        assert!(current_rx.try_recv().is_err());
+        assert_eq!(woken.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_dock_click_asks_for_the_current_window_and_for_a_frame() {
+        let owner = Owner::new();
+        let (sender, commands) = std::sync::mpsc::channel();
+        let woken = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&woken);
+        ROUTER.bind(
+            owner,
+            ActionSender::new(
+                sender,
+                Arc::new(move || {
+                    count.fetch_add(1, Ordering::SeqCst);
+                }),
+            ),
         );
 
-        // No window at all: the tray case, which already worked.
-        assert!(host::request_reopen(false).as_bool());
-        assert_eq!(commands.try_recv(), Ok(TrayCommand::Show));
-        assert_eq!(woken.load(std::sync::atomic::Ordering::SeqCst), 2);
-        host::REOPEN.with(|slot| *slot.borrow_mut() = None);
+        // The minimized-window case reports true; close-to-tray reports
+        // false. Both must deliver a request and schedule its reader.
+        for (visible, expected_wakes) in [(true, 1), (false, 2)] {
+            assert!(host::request_reopen(visible).as_bool());
+            assert_eq!(commands.try_recv(), Ok(TrayAction::ShowCurrentWindow));
+            assert_eq!(woken.load(Ordering::SeqCst), expected_wakes);
+        }
+        ROUTER.clear(owner);
     }
 }

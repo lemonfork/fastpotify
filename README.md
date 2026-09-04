@@ -38,7 +38,10 @@ everyday use, and connection details.
   playback, and desktop media controls.
 - **Winamp mini player.** Classic `.wsz` skins, spectrum analyser,
   oscilloscope, playlist, and ten-band equalizer. Visualizers receive the
-  signal after EQ and before volume, so zero volume still dances.
+  signal after EQ and before volume, so zero volume still dances. Tray
+  controls can open the mini player or main window and remain available
+  when switching between them;
+  on macOS the switch keeps the same window loop and menu-bar item alive.
 
 Fastpotify intentionally does not present Navidrome Jukebox or saved play
 queues as remote speaker control. The initial local pipeline does not claim

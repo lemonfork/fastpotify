@@ -309,7 +309,7 @@ fn main() -> eframe::Result<()> {
     });
     let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(app)));
 
-    loop {
+    let run_window = || {
         let creator_slot = std::sync::Arc::clone(&slot);
         let creator_waker = waker.clone();
         #[cfg(feature = "demo")]
@@ -322,7 +322,7 @@ fn main() -> eframe::Result<()> {
         let options = native_options(shot.is_some() && mini.is_none(), mini);
         #[cfg(not(feature = "demo"))]
         let options = native_options(false, mini);
-        eframe::run_native(
+        let result = eframe::run_native(
             "Fastpotify",
             options,
             Box::new(move |cc| {
@@ -342,23 +342,30 @@ fn main() -> eframe::Result<()> {
                     fastpotify::mac_menu::set_waker(move || ctx.request_repaint());
                 }
                 app.attach(&cc.egui_ctx);
+                #[cfg(target_os = "macos")]
+                let macos_fullscreen = fullscreen_observer(cc)?;
                 Ok(Box::new(Shell {
                     app: Some(app),
                     slot: std::sync::Arc::clone(&creator_slot),
+                    #[cfg(target_os = "macos")]
+                    macos_window_style: None,
+                    #[cfg(target_os = "macos")]
+                    macos_fullscreen,
                     #[cfg(feature = "demo")]
                     shot: creator_shot.clone(),
                 }))
             }),
-        )?;
+        );
         waker.detach();
+        result
+    };
 
-        #[cfg(target_os = "macos")]
-        let switch = {
-            let guard = slot.lock().unwrap_or_else(|p| p.into_inner());
-            let app = guard.as_ref().expect("application state present");
-            !app.quit_requested && app.switch_intent
-        };
-        #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "macos")]
+    run_window()?;
+
+    #[cfg(not(target_os = "macos"))]
+    loop {
+        run_window()?;
         let (switch, hide) = {
             let guard = slot.lock().unwrap_or_else(|p| p.into_inner());
             let app = guard.as_ref().expect("application state present");
@@ -371,18 +378,10 @@ fn main() -> eframe::Result<()> {
             // Straight back round: the other kind of window opens.
             continue;
         }
-        #[cfg(target_os = "macos")]
-        {
-            // Hiding to the tray leaves AppKit running inside the same
-            // window loop, so any return here is a real exit.
-            break;
-        }
-        #[cfg(not(target_os = "macos"))]
         if !hide {
             break;
         }
 
-        #[cfg(not(target_os = "macos"))]
         {
             // Windows and Linux keep their tray services alive while the
             // window is gone.
@@ -495,6 +494,14 @@ fn native_options(fullscreen: bool, mini: Option<MiniWindow>) -> eframe::NativeO
         .with_title("Fastpotify")
         .with_app_id("fastpotify")
         .with_icon(icon);
+    #[cfg(target_os = "macos")]
+    let viewport = viewport
+        // Main and mini share one GL surface. Alpha must be available before
+        // creation, even when the initial main window paints opaquely.
+        .with_transparent(true)
+        .with_fullsize_content_view(true)
+        .with_titlebar_shown(false)
+        .with_title_shown(false);
     let viewport = match mini {
         Some(mini) => {
             let level = app::on_top_window_level(mini.on_top);
@@ -544,6 +551,11 @@ fn native_options(fullscreen: bool, mini: Option<MiniWindow>) -> eframe::NativeO
 struct Shell {
     app: Option<app::App>,
     slot: std::sync::Arc<std::sync::Mutex<Option<app::App>>>,
+    /// Last applied mode; fullscreen clears it because AppKit may reset its mask.
+    #[cfg(target_os = "macos")]
+    macos_window_style: Option<bool>,
+    #[cfg(target_os = "macos")]
+    macos_fullscreen: fastpotify::mac_window::FullscreenObserver,
     /// A pending `--demo-shot` capture, if this is a screenshot run.
     #[cfg(feature = "demo")]
     shot: Option<Shot>,
@@ -608,7 +620,11 @@ impl Shell {
 
 impl eframe::App for Shell {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(target_os = "macos")]
+        let native_fullscreen = self.native_fullscreen(_frame);
         if let Some(app) = self.app.as_mut() {
+            #[cfg(target_os = "macos")]
+            app.update_native_fullscreen(native_fullscreen);
             #[cfg(target_os = "macos")]
             for command in fastpotify::mac_menu::drain_commands() {
                 use fastpotify::mac_menu::MenuCommand;
@@ -670,6 +686,8 @@ impl eframe::App for Shell {
             }
             app.background_frame(ctx);
         }
+        #[cfg(target_os = "macos")]
+        self.sync_window_style(_frame);
         #[cfg(feature = "demo")]
         self.drive_shot(ctx);
     }
@@ -678,6 +696,8 @@ impl eframe::App for Shell {
         if let Some(app) = self.app.as_mut() {
             app.frame_ui(ui);
         }
+        #[cfg(target_os = "macos")]
+        self.sync_window_style(_frame);
     }
 
     /// The mini player's window is see-through where the skin leaves it
@@ -707,6 +727,89 @@ impl Drop for Shell {
     }
 }
 
+#[cfg(target_os = "macos")]
+impl Shell {
+    fn native_fullscreen(&self, frame: &eframe::Frame) -> bool {
+        self.macos_fullscreen.is_active()
+            || frame
+                .winit_window()
+                .is_some_and(|window| window.fullscreen().is_some())
+    }
+
+    fn sync_window_style(&mut self, frame: &eframe::Frame) {
+        let Some(app) = self.app.as_ref() else {
+            return;
+        };
+        let mini = app.settings.winamp_window;
+        if self.native_fullscreen(frame) {
+            // AppKit owns the style mask throughout the fullscreen animation.
+            // Revalidate it after the native exit event, not on a timer.
+            self.macos_window_style = None;
+        } else if self.macos_window_style != Some(mini) && sync_macos_window_style(frame, mini) {
+            self.macos_window_style = Some(mini);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn sync_macos_window_style(frame: &eframe::Frame, mini: bool) -> bool {
+    use objc2_app_kit::{NSView, NSWindowStyleMask};
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let Some(window) = frame.winit_window() else {
+        return false;
+    };
+    // Do this before eframe applies the size/position commands from this frame.
+    // winit replaces the style mask when changing decorations and loses the
+    // creation-time FullSizeContentView bit. Restore it on this exact window;
+    // the subsequent Decorations viewport command is then a winit no-op.
+    window.set_decorations(!mini);
+    if mini {
+        return true;
+    }
+    let Ok(handle) = frame.window_handle() else {
+        return false;
+    };
+    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+        return false;
+    };
+    // SAFETY: eframe owns this NSView for the live Frame, and ui runs on the
+    // AppKit main thread. The borrowed pointer never escapes this call.
+    let view = unsafe { handle.ns_view.cast::<NSView>().as_ref() };
+    let Some(window) = view.window() else {
+        return false;
+    };
+    let style = window.styleMask();
+    if !style.contains(NSWindowStyleMask::FullSizeContentView) {
+        window.setStyleMask(style | NSWindowStyleMask::FullSizeContentView);
+        // AppKit may clear the first responder when changing the mask.
+        let _ = window.makeFirstResponder(Some(view));
+    }
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn fullscreen_observer(
+    cc: &eframe::CreationContext<'_>,
+) -> anyhow::Result<fastpotify::mac_window::FullscreenObserver> {
+    use objc2_app_kit::NSView;
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let handle = cc.window_handle()?;
+    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+        anyhow::bail!("the macOS root window has no AppKit handle");
+    };
+    // SAFETY: the live eframe window owns this view on the AppKit main thread.
+    let view = unsafe { handle.ns_view.cast::<NSView>().as_ref() };
+    let native = view
+        .window()
+        .ok_or_else(|| anyhow::anyhow!("the macOS root view has no window"))?;
+    Ok(fastpotify::mac_window::FullscreenObserver::new(
+        &native,
+        &cc.egui_ctx,
+    ))
+}
+
 /// The window icon, from the shared runtime drawing.
 fn app_icon() -> egui::IconData {
     const SIZE: usize = 128;
@@ -722,6 +825,25 @@ mod tests {
     use super::*;
 
     const SONG_REF: &str = "fastpotify:song:0123456789abcdef0123456789abcdef01234567:dHJhY2stMQ";
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn either_initial_window_mode_can_switch_without_recreating_its_surface() {
+        for mini in [
+            None,
+            Some(MiniWindow {
+                size: egui::vec2(550.0, 232.0),
+                position: None,
+                on_top: false,
+            }),
+        ] {
+            let viewport = native_options(false, mini).viewport;
+            assert_eq!(viewport.transparent, Some(true));
+            assert_eq!(viewport.fullsize_content_view, Some(true));
+            assert_eq!(viewport.titlebar_shown, Some(false));
+            assert_eq!(viewport.title_shown, Some(false));
+        }
+    }
 
     #[test]
     fn cli_exposes_favorite_and_secret_free_media_refs() {

@@ -16,6 +16,11 @@ path = "src/lib.rs"
 name = "fastpotify"
 path = "src/main.rs"
 
+[[test]]
+name = "tray_macos"
+# AppKit must run on the process main thread, not libtest's worker thread.
+harness = false
+
 [dependencies]
 anyhow = "1"
 thiserror = "2"
@@ -74,10 +79,12 @@ unicode-bidi = "0.3"
 tray-icon = { version = "0.24", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# Borrow eframe's exact NSView to preserve native chrome across window modes.
+raw-window-handle = "0.6"
 # The status item and Dock reopen callback share AppKit's main thread.
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSEvent", "NSMenu", "NSMenuItem", "NSResponder", "NSRunningApplication"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSDictionary", "NSObjCRuntime", "NSObject", "NSString", "NSValue"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSEvent", "NSMenu", "NSMenuItem", "NSResponder", "NSRunningApplication", "NSView", "NSWindow"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSDictionary", "NSNotification", "NSObjCRuntime", "NSObject", "NSString", "NSValue"] }
 # Generated bindings let macOS use MediaPlayer.framework directly without
 # souvlaki's obsolete Cocoa/block dependency or a Swift runtime dependency.
 objc2-media-player = { version = "0.3", default-features = false, features = ["MPMediaItem", "MPNowPlayingInfoCenter", "MPRemoteCommand", "MPRemoteCommandCenter", "MPRemoteCommandEvent"] }

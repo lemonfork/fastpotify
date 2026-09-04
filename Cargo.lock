@@ -1364,6 +1364,7 @@ dependencies = [
  "open",
  "opus-pure",
  "rand 0.9.5",
+ "raw-window-handle",
  "reqwest",
  "rodio",
  "serde",

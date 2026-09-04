@@ -4,12 +4,19 @@ description: Use classic Winamp 2 skins with an analyser, equalizer, and playlis
 nav_order: 4
 ---
 
-Open the mini player with Ctrl+M (Cmd+Shift+M on macOS), the shrink button, or
-**Switch to it** in Settings. It supports classic Winamp 2 `.wsz` skins. Find
+Open the mini player with Ctrl+M (Cmd+Shift+M on macOS), the shrink button,
+**Open Mini Player** in the tray menu, or **Switch to it** in Settings.
+The tray action raises the existing mini window if it is already open.
+It supports classic Winamp 2 `.wsz` skins. Find
 skins at the [Winamp Skin Museum](https://skins.webamp.org).
 
 Only one player window is open at a time. Click the skin logo or Eject, or use
-the shortcut again, to return to the main window.
+the shortcut again, to return to the main window. The menu-bar or system-tray
+controls remain available in either mode; **Show Main Window** returns from
+the mini player as well. On macOS, switching changes the existing window's
+appearance without removing and recreating the menu-bar icon.
+Clicking the Dock icon brings the current player forward without leaving mini
+mode; use **Show Main Window** when you want to switch back.
 
 ![The mini player wearing the built-in skin](/assets/images/winamp.png)
 

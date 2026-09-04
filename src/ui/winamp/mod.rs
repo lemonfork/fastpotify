@@ -1,7 +1,7 @@
 //! Winamp-style mini player using classic skins.
 //!
-//! The app has one main window at a time. Switching modes closes the current
-//! window and `main` opens the other. The mini player is borderless and uses
+//! The app has one main window at a time. macOS switches its presentation in
+//! place; Windows and Linux close it and open the other. The mini player is borderless and uses
 //! nearest-neighbor scaling at an integer screen-pixel ratio. Its controls emit
 //! the same actions as the main player. Stop pauses and rewinds; Eject and the
 //! logo return to the main window.

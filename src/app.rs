@@ -30,7 +30,7 @@ use crate::player::{
 use crate::settings::{SessionState, Settings, ThemeChoice};
 use crate::single_instance::ControlCommand;
 use crate::theme::{self, Palette};
-use crate::tray::{TrayCommand, TrayService};
+use crate::tray::{TrayAction, TrayService};
 
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(280);
 const SAVE_DELAY: Duration = Duration::from_secs(2);
@@ -286,6 +286,13 @@ pub struct App {
     session_window_pos: Option<[f32; 2]>,
     last_window_size: Option<[f32; 2]>,
     last_window_pos: Option<[f32; 2]>,
+    /// The current frame still describes the previous mode's native geometry.
+    #[cfg(target_os = "macos")]
+    window_mode_changed: bool,
+    #[cfg(target_os = "macos")]
+    window_mode_waiting_for_fullscreen: bool,
+    #[cfg(target_os = "macos")]
+    native_fullscreen: bool,
 }
 
 impl App {
@@ -364,13 +371,10 @@ impl App {
             let waker = waker.clone();
             MediaService::spawn(move || waker.wake())
         });
-        let tray = options
-            .tray
-            .then(|| {
-                let waker = waker.clone();
-                TrayService::spawn(move || waker.wake())
-            })
-            .flatten();
+        let tray = options.tray.then(|| {
+            let waker = waker.clone();
+            TrayService::new(move || waker.wake())
+        });
         let (login_server, login_username) = credentials
             .as_ref()
             .map(|credentials| {
@@ -489,6 +493,12 @@ impl App {
             session_window_pos: session.window_pos,
             last_window_size: None,
             last_window_pos: None,
+            #[cfg(target_os = "macos")]
+            window_mode_changed: false,
+            #[cfg(target_os = "macos")]
+            window_mode_waiting_for_fullscreen: false,
+            #[cfg(target_os = "macos")]
+            native_fullscreen: false,
         }
     }
 
@@ -510,14 +520,22 @@ impl App {
         self.window_hidden = false;
         self.hide_intent = false;
         self.switch_intent = false;
-        #[cfg(target_os = "macos")]
-        if let Some(tray) = &mut self.tray {
-            tray.attach();
+        if let Some(tray) = &mut self.tray
+            && let Err(error) = tray.start()
+        {
+            log::warn!("the tray could not start with the window loop: {error}");
         }
         #[cfg(target_os = "macos")]
         if let Some(media_controls) = &mut self.media_controls {
             media_controls.attach();
         }
+        #[cfg(target_os = "macos")]
+        // The GL surface is created with alpha so this same window can later
+        // host a cutout skin; the main window itself remains opaque.
+        ctx.send_viewport_cmd(egui::ViewportCommand::Transparent(
+            self.settings.winamp_window,
+        ));
+        ctx.options_mut(|options| options.input_options.line_scroll_speed = 120.0);
         if self.settings.winamp_window {
             // X11 may discard the creation-time level before the window is
             // mapped, so repeat it over the first live frames.
@@ -543,7 +561,6 @@ impl App {
                 position[1],
             )));
         }
-        ctx.options_mut(|options| options.input_options.line_scroll_speed = 120.0);
     }
 
     pub fn window_gone(&mut self) {
@@ -552,10 +569,112 @@ impl App {
         self.hide_intent = false;
     }
 
+    fn toggle_winamp_window(&mut self, ctx: &egui::Context) {
+        if self.settings.winamp_window {
+            self.winamp.remember_position();
+        }
+        self.session_window_size = self.last_window_size.or(self.session_window_size);
+        self.session_window_pos = self.last_window_pos.or(self.session_window_pos);
+        self.settings.winamp_window = !self.settings.winamp_window;
+        self.settings_dirty = true;
+        #[cfg(target_os = "macos")]
+        if self.native_fullscreen {
+            // AppKit exits native fullscreen asynchronously. Leave its chrome
+            // and size alone until the window reports that it has exited.
+            self.window_mode_waiting_for_fullscreen = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+        } else {
+            self.window_mode_waiting_for_fullscreen = false;
+            self.configure_window_mode(ctx);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.switch_intent = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn configure_window_mode(&mut self, ctx: &egui::Context) {
+        use egui::ViewportCommand;
+
+        // Returning from AppKit's event loop also closes the native status
+        // window. Keep the root window alive and change only its presentation.
+        let mini = self.settings.winamp_window;
+        self.window_mode_changed = true;
+        ctx.send_viewport_cmd(ViewportCommand::Maximized(false));
+        ctx.send_viewport_cmd(ViewportCommand::Transparent(mini));
+        ctx.send_viewport_cmd(ViewportCommand::Decorations(!mini));
+        ctx.send_viewport_cmd(ViewportCommand::Resizable(!mini));
+        ctx.send_viewport_cmd(ViewportCommand::EnableButtons {
+            close: true,
+            minimized: true,
+            maximize: !mini,
+        });
+        let (size, position) = if mini {
+            let pixels_per_point = ctx.pixels_per_point();
+            let unit = crate::winamp::WinampState::scale(&self.settings, pixels_per_point) as f32
+                / pixels_per_point;
+            let size = crate::ui::winamp::window_size(&self.settings, unit);
+            ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(size));
+            ctx.send_viewport_cmd(ViewportCommand::MaxInnerSize(size));
+            ctx.send_viewport_cmd(ViewportCommand::WindowLevel(on_top_window_level(
+                self.settings.winamp_on_top,
+            )));
+            (size, self.winamp.restore_pos)
+        } else {
+            // Clear the mini player's fixed maximum before restoring a main
+            // window size; otherwise AppKit clamps the resize to the skin.
+            ctx.send_viewport_cmd(ViewportCommand::MaxInnerSize(egui::Vec2::INFINITY));
+            ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(egui::vec2(760.0, 520.0)));
+            ctx.send_viewport_cmd(ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
+            let size = self
+                .session_window_size
+                .filter(|size| {
+                    (400.0..=3_000.0).contains(&size[0]) && (300.0..=2_000.0).contains(&size[1])
+                })
+                .unwrap_or([1240.0, 800.0]);
+            let position = self.session_window_pos.filter(|position| {
+                (-1_000.0..=5_000.0).contains(&position[0])
+                    && (-1_000.0..=5_000.0).contains(&position[1])
+            });
+            (size.into(), position)
+        };
+        ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
+        if let Some(position) = position {
+            ctx.send_viewport_cmd(ViewportCommand::OuterPosition(position.into()));
+        }
+        self.show_window(ctx);
+        ctx.request_repaint();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn finish_window_mode_change(&mut self, ctx: &egui::Context) {
+        if self.window_mode_waiting_for_fullscreen && !self.native_fullscreen {
+            self.window_mode_waiting_for_fullscreen = false;
+            self.configure_window_mode(ctx);
+        }
+    }
+
+    /// Reports fullscreen activity from the native host, including AppKit's
+    /// asynchronous exit animation. Requested geometry waits for completion.
+    #[cfg(target_os = "macos")]
+    pub fn update_native_fullscreen(&mut self, active: bool) {
+        self.native_fullscreen = active;
+    }
+
     fn show_window(&mut self, ctx: &egui::Context) {
         self.window_hidden = false;
         #[cfg(target_os = "macos")]
         {
+            // Mode changes keep the same loop now. An unavailable status
+            // item still gets an explicit retry when the listener raises
+            // the window, while a running one is left untouched.
+            if let Some(tray) = &mut self.tray
+                && let Err(error) = tray.start()
+            {
+                log::warn!("the tray could not be restored: {error}");
+            }
             // Keep AppKit's event loop alive while the window is hidden. The
             // status item depends on that loop to receive clicks.
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -584,7 +703,8 @@ impl App {
     }
 
     pub fn hides_to_tray(&self) -> bool {
-        self.tray.is_some() && self.settings.keep_playing_in_background
+        self.tray.as_ref().is_some_and(TrayService::is_available)
+            && self.settings.keep_playing_in_background
     }
 
     pub fn page(&self) -> &Page {
@@ -2377,7 +2497,13 @@ impl App {
                 Arc::clone(&self.winamp.tap),
                 Arc::clone(&self.winamp.eq),
             ))),
-            Action::ShowWindow => self.show_window(ctx),
+            Action::ShowMainWindow if self.settings.winamp_window => self.toggle_winamp_window(ctx),
+            Action::ShowMiniPlayer if !self.settings.winamp_window => {
+                self.toggle_winamp_window(ctx)
+            }
+            Action::ShowWindow | Action::ShowMainWindow | Action::ShowMiniPlayer => {
+                self.show_window(ctx);
+            }
             Action::HideWindow => self.hide_window(ctx, false),
             Action::ClearArtCache => match self.backend.art().clear_disk_cache() {
                 Ok(bytes) => self.toast(format!("Cleared {} MiB of artwork", bytes / 1_048_576)),
@@ -2402,17 +2528,7 @@ impl App {
                 self.history_generation_floor = generation;
                 self.backend.clear_history(generation);
             }
-            Action::ToggleWinampWindow => {
-                if self.settings.winamp_window {
-                    self.winamp.remember_position();
-                }
-                self.session_window_size = self.last_window_size.or(self.session_window_size);
-                self.session_window_pos = self.last_window_pos.or(self.session_window_pos);
-                self.settings.winamp_window = !self.settings.winamp_window;
-                self.settings_dirty = true;
-                self.switch_intent = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
+            Action::ToggleWinampWindow => self.toggle_winamp_window(ctx),
             Action::SetSkin(skin) => {
                 self.settings.skin = skin;
                 self.mark_settings_dirty();
@@ -2597,29 +2713,30 @@ impl App {
     }
 
     fn handle_tray(&mut self) {
-        let Some(commands) = self.tray.as_ref().map(TrayService::drain_commands) else {
+        let Some(actions) = self.tray.as_mut().map(TrayService::drain_actions) else {
             return;
         };
-        for command in commands {
-            self.handle_tray_command(command);
+        for action in actions {
+            self.handle_tray_action(action);
         }
     }
 
-    fn handle_tray_command(&mut self, command: TrayCommand) {
-        self.actions.push(match command {
-            TrayCommand::Show if self.settings.winamp_window => Action::ToggleWinampWindow,
-            TrayCommand::Show => Action::ShowWindow,
-            TrayCommand::ShowHide => {
+    fn handle_tray_action(&mut self, action: TrayAction) {
+        self.actions.push(match action {
+            TrayAction::ShowMainWindow => Action::ShowMainWindow,
+            TrayAction::ShowMiniPlayer => Action::ShowMiniPlayer,
+            TrayAction::ShowCurrentWindow => Action::ShowWindow,
+            TrayAction::ToggleWindowVisibility => {
                 if self.window_hidden {
                     Action::ShowWindow
                 } else {
                     Action::HideWindow
                 }
             }
-            TrayCommand::PlayPause => Action::TogglePlay,
-            TrayCommand::Next => Action::Next,
-            TrayCommand::Previous => Action::Previous,
-            TrayCommand::Quit => Action::Quit,
+            TrayAction::PlayPause => Action::TogglePlay,
+            TrayAction::Next => Action::Next,
+            TrayAction::Previous => Action::Previous,
+            TrayAction::Quit => Action::Quit,
         });
     }
 
@@ -2668,8 +2785,10 @@ impl App {
             controls.update(state);
         }
         let playing = self.believed_playing();
-        if let Some(tray) = &mut self.tray {
-            tray.set_playing(playing);
+        if let Some(tray) = &mut self.tray
+            && let Err(error) = tray.set_playing(playing)
+        {
+            log::warn!("the tray playback state could not be updated: {error}");
         }
         if let Some(slot) = &self.control_now_playing {
             *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = self.control_snapshot();
@@ -2859,6 +2978,8 @@ impl App {
         self.handle_tray();
         self.tick(ctx);
         self.apply_actions(ctx);
+        #[cfg(target_os = "macos")]
+        self.finish_window_mode_change(ctx);
         self.sync_media_controls();
         self.sync_window_title(ctx);
         if ctx.input(|input| input.viewport().close_requested())
@@ -2876,19 +2997,34 @@ impl App {
     pub fn frame_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.apply_theme(&ctx);
+        #[cfg(target_os = "macos")]
+        let previous_mini_position = self.winamp.last_pos;
         let needs_sign_in = !(self.is_connected() && self.user.is_some())
             && !matches!(self.auth, AuthStatus::Connecting | AuthStatus::Starting);
         if self.settings.winamp_window && needs_sign_in && !self.switch_intent {
             self.actions.push(Action::ToggleWinampWindow);
         }
-        if self.settings.winamp_window {
+        let draw_mini = self.settings.winamp_window;
+        #[cfg(target_os = "macos")]
+        let draw_mini = draw_mini && !self.window_mode_waiting_for_fullscreen;
+        if draw_mini {
             crate::ui::winamp::show(self, ui);
         } else {
             crate::ui::show(self, ui);
         }
         self.apply_actions(&ctx);
         self.sync_media_controls();
-        if !self.settings.winamp_window && !self.switch_intent {
+        #[cfg(target_os = "macos")]
+        let geometry_is_current = !self.window_mode_waiting_for_fullscreen
+            && !std::mem::take(&mut self.window_mode_changed)
+            && !self.native_fullscreen;
+        #[cfg(not(target_os = "macos"))]
+        let geometry_is_current = !self.switch_intent;
+        #[cfg(target_os = "macos")]
+        if !geometry_is_current {
+            self.winamp.last_pos = previous_mini_position;
+        }
+        if !self.settings.winamp_window && geometry_is_current {
             if let Some(rect) = ctx.input(|input| input.viewport().inner_rect) {
                 self.last_window_size = Some([rect.width(), rect.height()]);
             }
@@ -2964,6 +3100,9 @@ impl App {
     }
 
     pub fn shutdown(&mut self) {
+        if let Some(tray) = &mut self.tray {
+            tray.stop();
+        }
         self.save_state();
         self.backend.shutdown();
     }
@@ -5085,11 +5224,84 @@ mod tests {
         let mut harness = harness();
         harness.app.settings.winamp_window = true;
 
-        harness.app.handle_tray_command(TrayCommand::Show);
+        harness.app.handle_tray_action(TrayAction::ShowMainWindow);
         harness.app.apply_actions(&egui::Context::default());
 
         assert!(!harness.app.settings.winamp_window);
-        assert!(harness.app.switch_intent);
+        assert_eq!(harness.app.switch_intent, !cfg!(target_os = "macos"));
+    }
+
+    #[test]
+    fn tray_open_mini_switches_from_main_and_reopens_an_existing_mini() {
+        let mut harness = harness();
+        let ctx = egui::Context::default();
+        harness.app.handle_tray_action(TrayAction::ShowMiniPlayer);
+        let _ = ctx.run_logic(&egui::RawInput::default(), |ctx| {
+            harness.app.apply_actions(ctx);
+        });
+        assert!(harness.app.settings.winamp_window);
+        assert_eq!(harness.app.switch_intent, !cfg!(target_os = "macos"));
+
+        // Model the existing mini window after its initial creation, hidden
+        // or minimized. Opening it again must raise it, not toggle it away.
+        harness.app.attach(&ctx);
+        harness.app.window_hidden = true;
+        harness.app.handle_tray_action(TrayAction::ShowMiniPlayer);
+        let output = ctx.run_logic(&egui::RawInput::default(), |ctx| {
+            harness.app.apply_actions(ctx);
+        });
+        assert!(harness.app.settings.winamp_window);
+        assert!(!harness.app.window_hidden);
+        assert!(!harness.app.switch_intent);
+        let commands = &output.viewport_commands[&egui::ViewportId::ROOT];
+        assert!(commands.contains(&egui::ViewportCommand::Minimized(false)));
+        assert!(commands.contains(&egui::ViewportCommand::Focus));
+        assert!(!commands.contains(&egui::ViewportCommand::Close));
+    }
+
+    #[test]
+    fn queued_tray_window_requests_use_the_last_requested_mode() {
+        use TrayAction::{ShowMainWindow, ShowMiniPlayer};
+
+        for (initial_mini, requests, expected_mini) in [
+            (false, [ShowMiniPlayer, ShowMiniPlayer], true),
+            (true, [ShowMainWindow, ShowMainWindow], false),
+            (false, [ShowMiniPlayer, ShowMainWindow], false),
+            (true, [ShowMainWindow, ShowMiniPlayer], true),
+        ] {
+            let mut harness = harness();
+            harness.app.settings.winamp_window = initial_mini;
+            for request in requests {
+                harness.app.handle_tray_action(request);
+            }
+            harness.app.apply_actions(&egui::Context::default());
+            assert_eq!(harness.app.settings.winamp_window, expected_mini);
+        }
+    }
+
+    #[test]
+    fn dock_reopen_preserves_mini_mode_and_restores_its_window() {
+        let mut harness = harness();
+        harness.app.settings.winamp_window = true;
+        harness.app.window_hidden = true;
+        let ctx = egui::Context::default();
+
+        harness
+            .app
+            .handle_tray_action(TrayAction::ShowCurrentWindow);
+        let output = ctx.run_logic(&egui::RawInput::default(), |ctx| {
+            harness.app.apply_actions(ctx);
+        });
+
+        assert!(harness.app.settings.winamp_window);
+        assert!(!harness.app.window_hidden);
+        assert!(!harness.app.switch_intent);
+        let commands = &output.viewport_commands[&egui::ViewportId::ROOT];
+        assert!(commands.contains(&egui::ViewportCommand::Minimized(false)));
+        assert!(commands.contains(&egui::ViewportCommand::Focus));
+        assert!(!commands.contains(&egui::ViewportCommand::Close));
+        #[cfg(target_os = "macos")]
+        assert!(commands.contains(&egui::ViewportCommand::Visible(true)));
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -5138,10 +5350,11 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn close_to_tray_keeps_event_loop_alive_and_tray_show_restores_window() {
+    fn an_unstarted_tray_cannot_hide_the_only_window() {
         let mut harness = harness();
-        harness.app.tray = TrayService::spawn(|| {});
+        harness.app.tray = Some(TrayService::new(|| {}));
         harness.app.settings.keep_playing_in_background = true;
+        assert!(!harness.app.hides_to_tray());
         let ctx = egui::Context::default();
         let mut input = egui::RawInput::default();
         input
@@ -5151,23 +5364,12 @@ mod tests {
             .events
             .push(egui::ViewportEvent::Close);
 
-        let hidden = ctx.run_logic(&input, |ctx| {
+        let output = ctx.run_logic(&input, |ctx| {
             harness.app.background_frame(ctx);
         });
-        let hide_commands = &hidden.viewport_commands[&egui::ViewportId::ROOT];
-        assert!(hide_commands.contains(&egui::ViewportCommand::CancelClose));
-        assert!(hide_commands.contains(&egui::ViewportCommand::Visible(false)));
-        assert!(!hide_commands.contains(&egui::ViewportCommand::Close));
-        assert!(harness.app.window_hidden);
-
-        harness.app.handle_tray_command(TrayCommand::Show);
-        let shown = ctx.run_logic(&egui::RawInput::default(), |ctx| {
-            harness.app.background_frame(ctx);
-        });
-        let show_commands = &shown.viewport_commands[&egui::ViewportId::ROOT];
-        assert!(show_commands.contains(&egui::ViewportCommand::Visible(true)));
-        assert!(show_commands.contains(&egui::ViewportCommand::Minimized(false)));
-        assert!(show_commands.contains(&egui::ViewportCommand::Focus));
+        let commands = &output.viewport_commands[&egui::ViewportId::ROOT];
+        assert!(!commands.contains(&egui::ViewportCommand::CancelClose));
+        assert!(!commands.contains(&egui::ViewportCommand::Visible(false)));
         assert!(!harness.app.window_hidden);
     }
 
@@ -5197,6 +5399,7 @@ mod tests {
 
     /// Switching from Winamp back to the main window preserves the main
     /// window's size and position across the closing mini-window frame.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn closing_winamp_frame_does_not_overwrite_main_window_geometry() {
         let mut harness = harness();
@@ -5274,5 +5477,167 @@ mod tests {
             ))),
             "attach restored the main window position: {commands:?}"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mini_switch_waits_for_completed_native_fullscreen_exit() {
+        fn frame(app: &mut App, ctx: &egui::Context) -> Vec<egui::ViewportCommand> {
+            let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0));
+            let mut input = egui::RawInput {
+                screen_rect: Some(rect),
+                ..Default::default()
+            };
+            let viewport = input.viewports.entry(egui::ViewportId::ROOT).or_default();
+            viewport.inner_rect = Some(rect);
+            viewport.outer_rect = Some(rect);
+            // winit clears this as soon as exit is requested, before AppKit
+            // sends DidExitFullScreen. It must not release the transition.
+            viewport.fullscreen = Some(false);
+            let mut output = ctx.run_ui(input, |ui| {
+                app.background_frame(ui.ctx());
+                app.frame_ui(ui);
+            });
+            let commands = output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .clone();
+            output.textures_delta.clear();
+            commands
+        }
+
+        let mut harness = harness();
+        let app = &mut harness.app;
+        app.demo_connect(crate::api::VerifiedServer {
+            profile: profile(),
+            ..crate::api::VerifiedServer::default()
+        });
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        app.last_window_size = Some([1024.0, 768.0]);
+        app.last_window_pos = Some([100.0, 150.0]);
+        app.update_native_fullscreen(true);
+        app.actions.push(Action::ToggleWinampWindow);
+
+        let commands = frame(app, &ctx);
+        assert!(app.settings.winamp_window);
+        assert!(app.window_mode_waiting_for_fullscreen);
+        assert!(commands.contains(&egui::ViewportCommand::Fullscreen(false)));
+        for commands in [commands, frame(app, &ctx)] {
+            assert!(!commands.iter().any(|command| matches!(
+                command,
+                egui::ViewportCommand::Close
+                    | egui::ViewportCommand::InnerSize(_)
+                    | egui::ViewportCommand::MinInnerSize(_)
+                    | egui::ViewportCommand::MaxInnerSize(_)
+                    | egui::ViewportCommand::Decorations(_)
+            )));
+        }
+        assert_eq!(app.last_window_size, Some([1024.0, 768.0]));
+
+        app.update_native_fullscreen(false);
+        let commands = frame(app, &ctx);
+        assert!(!app.window_mode_waiting_for_fullscreen);
+        assert!(commands.contains(&egui::ViewportCommand::Decorations(false)));
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, egui::ViewportCommand::InnerSize(_)))
+        );
+        assert!(!commands.contains(&egui::ViewportCommand::Close));
+        assert_eq!(app.last_window_size, Some([1024.0, 768.0]));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn switching_window_modes_keeps_the_root_alive_and_restores_geometry() {
+        fn frame(
+            app: &mut App,
+            ctx: &egui::Context,
+            rect: egui::Rect,
+        ) -> Vec<egui::ViewportCommand> {
+            let mut input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, rect.size())),
+                ..Default::default()
+            };
+            let viewport = input.viewports.entry(egui::ViewportId::ROOT).or_default();
+            viewport.inner_rect = Some(rect);
+            viewport.outer_rect = Some(rect);
+            let mut output = ctx.run_ui(input, |ui| app.frame_ui(ui));
+            let commands = output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .clone();
+            output.textures_delta.clear();
+            commands
+        }
+
+        let mut harness = harness();
+        let app = &mut harness.app;
+        app.demo_connect(crate::api::VerifiedServer {
+            profile: profile(),
+            ..crate::api::VerifiedServer::default()
+        });
+        let main = egui::Rect::from_min_size(egui::pos2(100.0, 150.0), egui::vec2(1024.0, 768.0));
+        let mini = egui::Rect::from_min_size(egui::pos2(60.0, 80.0), egui::vec2(550.0, 232.0));
+        app.last_window_size = Some([main.width(), main.height()]);
+        app.last_window_pos = Some(main.min.into());
+        app.winamp.restore_pos = Some(mini.min.into());
+        app.settings.winamp_on_top = true;
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+
+        app.actions.push(Action::ToggleWinampWindow);
+        let commands = frame(app, &ctx, main);
+        assert!(app.settings.winamp_window);
+        assert!(!app.switch_intent);
+        assert!(!commands.contains(&egui::ViewportCommand::Close));
+        assert!(!commands.contains(&egui::ViewportCommand::Visible(false)));
+        assert!(commands.contains(&egui::ViewportCommand::Transparent(true)));
+        assert!(commands.contains(&egui::ViewportCommand::Decorations(false)));
+        assert!(commands.contains(&egui::ViewportCommand::WindowLevel(
+            egui::WindowLevel::AlwaysOnTop
+        )));
+        assert!(commands.contains(&egui::ViewportCommand::OuterPosition(mini.min)));
+        assert_eq!(app.session_window_size, Some([1024.0, 768.0]));
+
+        frame(app, &ctx, mini);
+        app.window_hidden = true;
+        app.actions.push(Action::ToggleWinampWindow);
+        let commands = frame(app, &ctx, mini);
+        assert!(!app.settings.winamp_window);
+        assert!(!app.switch_intent);
+        assert!(!app.window_hidden);
+        assert!(!commands.contains(&egui::ViewportCommand::Close));
+        assert!(!commands.contains(&egui::ViewportCommand::Visible(false)));
+        assert!(commands.contains(&egui::ViewportCommand::Visible(true)));
+        assert!(commands.contains(&egui::ViewportCommand::Transparent(false)));
+        assert!(commands.contains(&egui::ViewportCommand::Decorations(true)));
+        assert!(commands.contains(&egui::ViewportCommand::Resizable(true)));
+        assert!(commands.contains(&egui::ViewportCommand::WindowLevel(
+            egui::WindowLevel::Normal
+        )));
+        assert!(commands.contains(&egui::ViewportCommand::InnerSize(main.size())));
+        assert!(commands.contains(&egui::ViewportCommand::OuterPosition(main.min)));
+        let clear_maximum = commands
+            .iter()
+            .position(|command| {
+                command == &egui::ViewportCommand::MaxInnerSize(egui::Vec2::INFINITY)
+            })
+            .unwrap();
+        let restore_size = commands
+            .iter()
+            .position(|command| command == &egui::ViewportCommand::InnerSize(main.size()))
+            .unwrap();
+        assert!(clear_maximum < restore_size);
+        assert_eq!(app.last_window_size, Some([1024.0, 768.0]));
+        assert_eq!(app.last_window_pos, Some([100.0, 150.0]));
+        assert_eq!(app.winamp.restore_pos, Some([60.0, 80.0]));
+
+        // The next frame may have been clamped to a different size by AppKit;
+        // geometry recording resumes without waiting for an exact match.
+        let resized =
+            egui::Rect::from_min_size(egui::pos2(120.0, 160.0), egui::vec2(1100.0, 820.0));
+        frame(app, &ctx, resized);
+        assert_eq!(app.last_window_size, Some([1100.0, 820.0]));
+        assert_eq!(app.last_window_pos, Some([120.0, 160.0]));
     }
 }

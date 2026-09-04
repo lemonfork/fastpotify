@@ -550,6 +550,8 @@ pub enum Action {
     SettingsChanged,
     RestartEngine,
     ShowWindow,
+    ShowMainWindow,
+    ShowMiniPlayer,
     HideWindow,
     ClearArtCache,
     /// Clear local play history.
