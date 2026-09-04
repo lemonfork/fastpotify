@@ -53,6 +53,15 @@ songs play before the remaining album or playlist context. The same song may
 be queued more than once; each occurrence remains distinct. See
 [The Queue's Rules](/queue/) for the complete contract.
 
+When you select a new song, press Next or Previous, or jump to a queue item
+while audio is still playing, the old audio fades out over about 10 ms before
+it is discarded, and the replacement fades in over about 10 ms when its audio
+arrives. The displayed song and queue change immediately; they do not wait for
+either fade or the server. Rapid skips cancel older work and keep only the
+latest selection.
+These short fades soften abrupt cuts; they are not a crossfade or gapless playback.
+Natural track endings, seeking, and pause/resume keep their existing behavior.
+
 ## Recent songs and scrobbles
 
 Fastpotify records a song locally after about 30 seconds, or halfway through a

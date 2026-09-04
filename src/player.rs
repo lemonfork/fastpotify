@@ -27,7 +27,7 @@ use symphonia::core::probe::Hint;
 use crate::api::{ApiError, OpenSubsonicClient, Song};
 use crate::opus::OggOpusDecoder;
 use crate::resample::Resampler;
-use crate::sink::{OutputError, PCM_CHANNELS, PCM_SAMPLE_RATE, RodioSink};
+use crate::sink::{OutputError, OutputTransition, PCM_CHANNELS, PCM_SAMPLE_RATE, RodioSink};
 use crate::vis::{AudioTap, PcmProcessor};
 
 const STREAM_CHUNKS: usize = 8;
@@ -360,6 +360,8 @@ struct DecodeRequest {
 enum OutputAction {
     None,
     Clear,
+    /// An explicit change of song, including another skip while still loading.
+    Replace,
 }
 
 struct Transition {
@@ -580,7 +582,11 @@ impl PlaybackReducer {
                     self.history.extend(earlier);
                 }
                 self.snapshot.queue.context = entries;
-                output = OutputAction::Clear;
+                output = if load.play {
+                    OutputAction::Replace
+                } else {
+                    OutputAction::Clear
+                };
                 match selected {
                     Some(entry) => self.select(entry, load.play, load.position_ms),
                     None => {
@@ -610,11 +616,11 @@ impl PlaybackReducer {
                 None
             }
             PlayerCommand::Next => {
-                output = OutputAction::Clear;
+                output = OutputAction::Replace;
                 self.advance(false)
             }
             PlayerCommand::Previous => {
-                output = OutputAction::Clear;
+                output = OutputAction::Replace;
                 if self.snapshot.position_now() > PREVIOUS_RESTART_MS || self.history.is_empty() {
                     self.request_current(0)
                 } else {
@@ -656,7 +662,7 @@ impl PlaybackReducer {
                     selected = Some(self.snapshot.queue.context.remove(0));
                 }
                 if let Some(entry) = selected {
-                    output = OutputAction::Clear;
+                    output = OutputAction::Replace;
                     self.select(entry, true, 0)
                 } else {
                     None
@@ -892,8 +898,8 @@ impl TransitionSerial {
 }
 
 enum AudioControl {
-    Begin(DecodeToken),
-    Clear(u64),
+    Begin(DecodeToken, OutputTransition),
+    Clear(u64, OutputTransition),
     Shutdown,
 }
 
@@ -1040,14 +1046,23 @@ fn publish_transition(
         return Ok(());
     }
 
+    // Carry intent to the output actor, not a guess based on Playing: a rapid
+    // second skip already sees Loading while the old song can still be audible.
+    let output_transition = match transition.output {
+        OutputAction::Replace => OutputTransition::Smooth,
+        OutputAction::None | OutputAction::Clear => OutputTransition::Immediate,
+    };
     match (transition.output, &transition.decode) {
         (_, Some(request)) => shared
             .control
-            .send(AudioControl::Begin(request.token))
+            .send(AudioControl::Begin(request.token, output_transition))
             .map_err(|_| EngineError::ActorUnavailable)?,
-        (OutputAction::Clear, None) => shared
+        (OutputAction::Clear | OutputAction::Replace, None) => shared
             .control
-            .send(AudioControl::Clear(transition.receipt.decode_generation))
+            .send(AudioControl::Clear(
+                transition.receipt.decode_generation,
+                output_transition,
+            ))
             .map_err(|_| EngineError::ActorUnavailable)?,
         (OutputAction::None, None) => {}
     }
@@ -1174,7 +1189,7 @@ fn handle_audio_control(
     command: AudioControl,
 ) -> bool {
     match command {
-        AudioControl::Begin(token) => {
+        AudioControl::Begin(token, transition) => {
             if shared.generation.load(Ordering::Acquire) != token.generation {
                 return false;
             }
@@ -1185,23 +1200,26 @@ fn handle_audio_control(
                 Arc::clone(&shared.config.tap),
                 Arc::clone(&shared.config.eq),
             );
-            if let Err(error) = sink.begin() {
+            if let Err(error) = sink.begin(transition, token.generation, &shared.generation) {
                 handle_output_error(shared, token, error);
             }
             false
         }
-        AudioControl::Clear(generation) => {
+        AudioControl::Clear(generation, transition) => {
             if shared.generation.load(Ordering::Acquire) != generation {
                 return false;
             }
             *active_generation = generation;
             *started_generation = None;
             shared.config.tap.clear();
-            sink.clear();
+            // Clear can only be superseded while it fades; the newer control
+            // is already queued and owns the next output operation.
+            let _ = sink.clear(transition, generation, &shared.generation);
             false
         }
         AudioControl::Shutdown => {
-            sink.clear();
+            let generation = shared.generation.load(Ordering::Acquire);
+            let _ = sink.clear(OutputTransition::Immediate, generation, &shared.generation);
             true
         }
     }
@@ -1835,7 +1853,8 @@ mod tests {
     fn loading_a_context_preserves_the_manual_queue() {
         let mut reducer = PlaybackReducer::new(1);
         reducer.apply(PlayerCommand::AddManual(Box::new(song("manual"))));
-        reducer.apply(load(&["context-a", "context-b"], false));
+        let restored = reducer.apply(load(&["context-a", "context-b"], false));
+        assert_eq!(restored.output, OutputAction::Clear);
         assert_eq!(reducer.snapshot().current_song().unwrap().name, "context-a");
         assert_eq!(reducer.snapshot().queue.manual[0].song.name, "manual");
         assert_eq!(reducer.snapshot().queue.context[0].song.name, "context-b");
@@ -1966,6 +1985,44 @@ mod tests {
         assert!(transition.snapshot.queue.manual.is_empty());
         assert_eq!(transition.snapshot.queue.context[0].song.name, "context");
         assert!(transition.decode.is_some());
+        assert_eq!(transition.output, OutputAction::Replace);
+    }
+
+    #[test]
+    fn rapid_replacements_keep_smoothing_without_waiting_for_a_decoder() {
+        let mut reducer = PlaybackReducer::new(1);
+        let loaded = reducer.apply(load(&["a", "b", "c"], true));
+        let old = loaded.decode.unwrap().token;
+        reducer.decoder_started(old).unwrap();
+
+        let first_skip = reducer.apply(PlayerCommand::Next);
+        let skipped = first_skip.decode.unwrap().token;
+        assert_eq!(first_skip.output, OutputAction::Replace);
+        assert_eq!(first_skip.snapshot.playback(), Playback::Loading);
+
+        // The output actor may not have handled the first skip yet. Loading
+        // must not lose the second command's instruction to fade the old audio.
+        let second_skip = reducer.apply(PlayerCommand::Next);
+        assert_eq!(second_skip.output, OutputAction::Replace);
+        assert_eq!(second_skip.snapshot.current_song().unwrap().name, "c");
+        assert!(second_skip.snapshot.queue.is_empty());
+        assert!(reducer.decoder_started(skipped).is_none());
+        assert!(reducer.decoder_eof(old).is_none());
+
+        // Skipping beyond the last song still fades out, but has no incoming
+        // decoder. A newly selected context remains an explicit replacement.
+        let ended = reducer.apply(PlayerCommand::Next);
+        assert_eq!(ended.output, OutputAction::Replace);
+        assert_eq!(ended.snapshot.playback(), Playback::Stopped);
+        assert!(ended.decode.is_none());
+        let replacement = reducer.apply(load(&["new"], true));
+        assert_eq!(replacement.output, OutputAction::Replace);
+        assert_eq!(replacement.snapshot.current_song().unwrap().name, "new");
+        let ended = reducer
+            .decoder_eof(replacement.decode.unwrap().token)
+            .unwrap();
+        assert_eq!(ended.output, OutputAction::Clear);
+        assert!(ended.decode.is_none());
     }
 
     #[test]
@@ -1975,6 +2032,7 @@ mod tests {
         let loaded = reducer.apply(load(&["current", "context"], true));
         let token = loaded.decode.unwrap().token;
         let ended = reducer.decoder_eof(token).unwrap();
+        assert_eq!(ended.output, OutputAction::Clear);
         assert_eq!(ended.snapshot.current_song().unwrap().name, "manual");
         assert!(ended.snapshot.queue.manual.is_empty());
         assert_eq!(ended.snapshot.queue.context[0].song.name, "context");
@@ -1988,6 +2046,7 @@ mod tests {
         reducer.apply(PlayerCommand::Repeat(RepeatMode::Track));
         let before = reducer.snapshot().clone();
         let ended = reducer.decoder_eof(token).unwrap();
+        assert_eq!(ended.output, OutputAction::Clear);
         assert_eq!(
             ended.snapshot.current_occurrence(),
             before.current_occurrence()
@@ -2035,6 +2094,7 @@ mod tests {
         let failed = reducer
             .decoder_error(token, "The audio output stopped working".into())
             .unwrap();
+        assert_eq!(failed.output, OutputAction::Clear);
         assert_eq!(failed.snapshot.current_song().unwrap().name, "current");
         assert_eq!(failed.snapshot.queue.context[0].song.name, "next");
         assert_eq!(failed.snapshot.playback(), Playback::Paused);
@@ -2050,10 +2110,15 @@ mod tests {
         let mut reducer = PlaybackReducer::new(1);
         reducer.apply(load(&["a", "b", "c"], true));
         let c = reducer.snapshot().queue.context[1].occurrence_id;
-        reducer.apply(PlayerCommand::SkipTo(c));
+        let skipped = reducer.apply(PlayerCommand::SkipTo(c));
+        assert_eq!(skipped.output, OutputAction::Replace);
         assert_eq!(reducer.snapshot().current_song().unwrap().name, "c");
         assert!(reducer.snapshot().queue.is_empty());
-        reducer.apply(PlayerCommand::Previous);
+        let stale_skip = reducer.apply(PlayerCommand::SkipTo(c));
+        assert_eq!(stale_skip.output, OutputAction::None);
+        assert!(stale_skip.decode.is_none());
+        let previous = reducer.apply(PlayerCommand::Previous);
+        assert_eq!(previous.output, OutputAction::Replace);
         assert_eq!(reducer.snapshot().current_song().unwrap().name, "b");
         assert_eq!(reducer.snapshot().queue.context[0].song.name, "c");
     }
@@ -2107,6 +2172,7 @@ mod tests {
         let old = loaded.decode.unwrap().token;
         let play_instance = loaded.snapshot.play_instance_id;
         let seek = reducer.apply(PlayerCommand::Seek(30_000));
+        assert_eq!(seek.output, OutputAction::Clear);
         assert!(seek.receipt.decode_generation > old.generation);
         assert_eq!(seek.snapshot.position.elapsed_ms, 30_000);
         assert_eq!(seek.snapshot.play_instance_id, play_instance);
@@ -2120,6 +2186,7 @@ mod tests {
         let play_instance = loaded.snapshot.play_instance_id;
         reducer.apply(PlayerCommand::Seek(PREVIOUS_RESTART_MS + 1));
         let restarted = reducer.apply(PlayerCommand::Previous);
+        assert_eq!(restarted.output, OutputAction::Replace);
         assert_eq!(restarted.snapshot.current_song().unwrap().name, "a");
         assert_eq!(restarted.snapshot.play_instance_id, play_instance);
         assert_eq!(restarted.snapshot.position.elapsed_ms, 0);
@@ -2133,12 +2200,14 @@ mod tests {
         let play_instance = loaded.snapshot.play_instance_id;
 
         let stopped = reducer.apply(PlayerCommand::Stop);
+        assert_eq!(stopped.output, OutputAction::Clear);
         assert_eq!(stopped.snapshot.current_occurrence(), occurrence);
         assert_eq!(stopped.snapshot.play_instance_id, play_instance);
         assert_eq!(stopped.snapshot.playback(), Playback::Stopped);
         assert_eq!(stopped.snapshot.position.elapsed_ms, 0);
 
         let resumed = reducer.apply(PlayerCommand::Play);
+        assert_eq!(resumed.output, OutputAction::Clear);
         assert_eq!(resumed.snapshot.current_occurrence(), occurrence);
         assert!(resumed.snapshot.play_instance_id > play_instance);
         assert_eq!(resumed.snapshot.playback(), Playback::Loading);
@@ -2170,8 +2239,10 @@ mod tests {
             let occurrence = loaded.snapshot.current_occurrence();
             let play_instance = loaded.snapshot.play_instance_id;
 
-            reducer.apply(PlayerCommand::Pause);
+            let paused = reducer.apply(PlayerCommand::Pause);
+            assert_eq!(paused.output, OutputAction::Clear);
             let resumed = reducer.apply(resume);
+            assert_eq!(resumed.output, OutputAction::Clear);
             assert_eq!(resumed.snapshot.current_occurrence(), occurrence);
             assert_eq!(resumed.snapshot.play_instance_id, play_instance);
             assert_eq!(resumed.snapshot.playback(), Playback::Loading);

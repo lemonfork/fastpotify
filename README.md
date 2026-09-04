@@ -14,8 +14,9 @@ everyday use, and connection details.
 ## Features
 
 - **Local playback.** Stream from the active server with play, pause, seek,
-  next, previous, shuffle, repeat, volume, and output-device controls. Windows
-  also offers an output-buffer control.
+  next, previous, shuffle, repeat, volume, and output-device controls. Explicit
+  song changes use short output fades to soften abrupt cuts while the queue
+  updates immediately. Windows also offers an output-buffer control.
 - **Authoritative local queue.** Manually queued songs play before the current
   album or playlist. Duplicate occurrences remain distinct, and stale stream
   or decoder work cannot roll the queue back.
